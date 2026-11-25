@@ -46,6 +46,7 @@ import { llmCommandJudge } from './workspace-order-command.ts'
 import { liaisonSurfaceContext } from '../core/workspace-product.ts'
 import { WorkspaceStaffStore } from './workspace-staff-store.ts'
 import { createExperienceLearning } from './workspace-experience-learning.ts'
+import { commandExperienceEvidence } from './workspace-experience-evidence.ts'
 import { NativeExperience } from './workspace-native-experience.ts'
 import { isRosterGroup, workspaceScope, WorkspaceV2Store } from './workspace-v2-store.ts'
 import { workspaceCalendarRoutes } from './workspace-calendar.ts'
@@ -147,8 +148,10 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
       try { return liaisonSelection(settings.get(), ctx.get('agentDefaultModel')?.currentSelection()) } catch { return undefined }
     }
     const learning = createExperienceLearning({ root, scope: brainScope, staff: staffStore, llm: () => ctx.get('llm'),
-      model: liaisonModel, writable: id => { workspaceStore.writable(id) },
+      model: liaisonModel, timeZone, writable: id => { workspaceStore.writable(id) },
       workspaces: () => workspaceStore.list().filter(row => !workspaceArchived(row)).map(row => row.id),
+      verifyOriginal: (evidence, audience) => v2Routes.verifyLearningOriginal(evidence, audience),
+      resolveOriginals: (evidence, audience) => v2Routes.resolveLearningOriginals(evidence, audience),
       verifyEvidence(evidence) {
         const {workspaceId, sessionId, orderId} = evidence
         if (workspaceId && workspaceArchived(workspaceStore.workspace(workspaceId))) return false
@@ -165,6 +168,9 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
         }
         if (!workspaceId || !sessionId || order && order.sessionId !== sessionId) return false
         const session = workspaceStore.session(workspaceId,sessionId)
+        if (evidence.kind === 'artifact' || evidence.kind === 'tool' || evidence.kind === 'test') {
+          return !!v2Routes.verifyLearningOriginal(evidence, {staffId: evidence.staffId})
+        }
         if (evidence.kind === 'owner' && evidence.id.startsWith('group:')) {
           const seq = Number(evidence.messageId?.slice(2))
           const rows = groupHost.loaded(session.id)?.ledger.all() ?? readGroupLedger(join(groupHost.paths(session).dir,GROUP_LEDGER_FILE))
@@ -184,7 +190,8 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
           return !!formal && memberCompletionEvidenceId(sessionId, line, true) === evidence.id
         }
         if (evidence.kind === 'delivery' && evidence.version) {
-          return workspaceStore.resultNotices().some(row=>row.id === evidence.id && row.sessionId === sessionId && row.version === evidence.version)
+          return workspaceStore.resultNotices().some(row=>row.id === evidence.id && row.workspaceId === workspaceId
+            && row.sessionId === sessionId && row.orderId === orderId && row.messageId === evidence.messageId && row.version === evidence.version)
         }
         return true
       } })
@@ -845,17 +852,18 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
     const dialogue = createV2DialogueSource({ ctx, root, scope: brainScope, codex: opts.codex, gate, internalDirectories: [chiefHome], experience,
       onCodingResult(result) {
         const {workspaceId, sessionId, orderId, turnId} = result
-        const where = {workspaceId, sessionId, orderId}
-        const evidence: ExperienceEvidence[] = result.messages.filter(message => message.text.trim()).slice(-6).map(message => ({
+        const original = dialogue.experienceSource?.(workspaceStore.session(workspaceId, sessionId), turnId)
+        if (!original) return
+        const staffId = original.staffId
+        const where = {workspaceId, sessionId, orderId, staffId}
+        const commands = result.commands.slice(-8)
+        const messages = result.messages.filter(item => item.text.trim()).reverse().slice(0, Math.min(6, 8 - commands.length)).reverse()
+        const evidence: ExperienceEvidence[] = messages.map(message => ({
           kind: 'delivery', id: message.id, messageId: message.id, ...where}))
-        for (const {itemId, command, exitCode, outputTail} of result.commands.slice(-8)) {
-          const test = /^\s*(?:(?:pnpm|npm|yarn|bun|cargo|go)\s+test\b|(?:pnpm\s+exec\s+)?(?:vitest|pytest)\b|node\s+--test\b)/.test(command)
-          evidence.push({kind: test ? 'test' : 'tool', id: itemId, ...where,
-            quote: `${command.slice(0, 300)}（退出码 ${exitCode}）${outputTail ? '\n' + outputTail.slice(-500) : ''}`})
-        }
+        for (const command of commands) evidence.push(commandExperienceEvidence({...where, turnId}, command.itemId, command))
         const summary = result.messages.map(message => message.text).join('\n').trim().slice(-8000) ||
           evidence.flatMap(item => item.quote ? [item.quote] : []).join('\n').slice(-8000)
-        if (summary && evidence.length) void learning.settle({id: 'coding:' + sessionId + ':' + turnId, ...where, turnId,
+        if (summary && evidence.length) void learning.settle({id: 'coding-evidence:' + sessionId + ':' + turnId, ...where, turnId, sourceExperienceRefs: original.refs,
           kind: result.recovered ? 'recovery' : 'delivery', summary,
           evidence}).catch(learningProblem)
       }, staff:{

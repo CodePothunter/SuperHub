@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { WorkspaceStaffStore } from '../src/dsh/workspace-staff-store.ts'
 import { workspaceFingerprint } from '../src/dsh/superhub-goals.ts'
-import { renderExperience } from '../src/core/workspace-experience.ts'
+import { renderExperience, type ExperienceEvidence, type ExperienceSupport } from '../src/core/workspace-experience.ts'
 
 const roots: string[] = []
 afterEach(()=>{ for (const directory of roots.splice(0)) rmSync(directory,{recursive:true,force:true}) })
@@ -267,5 +267,98 @@ describe('共享智能体经验',()=>{
     apply('restore',3,{restoreVersion:1})
     expect(f.open().selectExperience({workspaceId:'alpha',task:'复测登录缺陷'}).entries)
       .toMatchObject([{id:source.id,version:4,text:source.text}])
+  })
+})
+
+describe('自动维护的经验版本',()=>{
+  const memory = (f: ReturnType<typeof setup>) => f.open().experienceMemories('alpha')[0]!
+  const task = {workspaceId:'alpha',task:'核对访谈引文时间戳'}
+  const artifact = (id: string, orderId: string, version = 'v1'): ExperienceEvidence => ({
+    kind:'artifact',id,orderId,workspaceId:'alpha',sessionId:'interview',fileId:'transcript',resultId:'result-' + id,version,quote:'00:04 原始引文',
+  })
+  const operate = (f: ReturnType<typeof setup>, action: string, extra: Record<string,unknown>) =>
+    f.store.apply('alpha',{action,audience:'shared',requestId:randomUUID(),...extra},true)
+
+  it('在第二份独立工单原件到达后自动采纳，并在同一批次保存依据和历史',()=>{
+    const f = setup()
+    const candidate = operate(f,'learn',{text:'访谈引文保留时间戳',proposed:true}).sharedExperiences![0]!
+    const support = (orderId: string, origin: string): ExperienceSupport => ({orderId,origin,evidence:[artifact(orderId,orderId)]})
+    const batch = (id: string, supports: ExperienceSupport[]) => ({id,changes:[{
+      action:'support',audience:'shared',memoryId:candidate.id,version:1,supports,supportsComplete:true,
+    }]})
+    f.store.applyExperienceBatch('alpha',batch('first',[support('interview-a','original-a')]))
+    f.store.applyExperienceBatch('alpha',batch('followup',[support('interview-a','original-a'),support('interview-a','followup-a')]))
+    expect(f.store.selectExperience(task).entries).toEqual([])
+    f.store.applyExperienceBatch('alpha',batch('copies',[support('interview-a','original-a'),support('interview-b','original-a')]))
+    expect(f.store.selectExperience(task).entries).toEqual([])
+    expect(f.store.view('alpha',true).sharedExperiences?.[0]).toMatchObject({version:1,status:'proposed',supportCount:1})
+    expect(f.store.view('alpha',true).sharedExperiences?.[0]).not.toHaveProperty('supports')
+    const privateSupport = {...support('private','private-origin'),evidence:[{...artifact('private','private'),staffId:'researcher'}]}
+    expect(()=>f.store.applyExperienceBatch('alpha',batch('private',[privateSupport]))).toThrow('本范围')
+    expect(()=>operate(f,'accept',{memoryId:candidate.id,version:1,actor:'system'})).toThrow('只接受主人操作')
+    const verified = batch('second',[support('interview-a','original-a'),support('interview-b','original-b')])
+    f.open().applyExperienceBatch('alpha',verified)
+    expect(f.open().hasExperienceBatch('alpha',verified.id,verified.changes)).toBe(true)
+    expect(f.open().applyExperienceBatch('alpha',verified)).toBe('duplicate')
+    expect(memory(f)).toMatchObject({version:2,status:'active',maintenance:{actor:'system',action:'accept'},
+      evidence:[{orderId:'interview-a',fileId:'transcript'},{orderId:'interview-b',fileId:'transcript'}]})
+    expect(f.open().experienceVersion('alpha',candidate.id,1,true)).toMatchObject({status:'proposed',supportCount:1})
+    expect(f.open().selectExperience(task).entries).toMatchObject([{id:candidate.id,version:2}])
+    expect(f.open().selectExperience({...task,workspaceId:'beta'}).entries).toEqual([])
+  })
+
+  it('过期立即影响执行和旧版恢复，修改期限以新版本恢复，低频只提醒',()=>{
+    const f = setup()
+    const expiring = operate(f,'learn',{text:'核对访谈引文时间戳',experienceExpiresAt:'2026-11-21T09:00:00+08:00'}).sharedExperiences![0]!
+    const prior = f.store.selectExperience(task)
+    expect(prior.entries).toMatchObject([{id:expiring.id,version:1}])
+    f.at('2026-11-21T01:00:00Z')
+    expect(()=>f.open().assertExperienceCurrent(prior)).toThrow('使用授权已经变化')
+    const expired = memory(f)
+    expect(expired).toMatchObject({version:2,status:'retired',expiresAt:'2026-11-21T01:00:00.000Z',
+      maintenance:{actor:'system',action:'expire',at:'2026-11-21T01:00:00.000Z'}})
+    expect(()=>operate(f,'restore',{memoryId:expiring.id,version:2,restoreVersion:1})).toThrow('有效期')
+    operate(f,'revise',{memoryId:expiring.id,version:2,experienceExpiresAt:null})
+    expect(f.open().selectExperience(task).entries).toMatchObject([{id:expiring.id,version:3}])
+    f.at('2027-02-20T01:00:00Z')
+    expect(f.open().view('alpha',true).sharedExperiences?.[0]).toMatchObject({version:3,status:'active',reviewSuggested:true})
+    const current = f.store.selectExperience(task)
+    f.store.recordExperienceDelivery(current,{sessionId:'conversation',executorId:'liaison',turnId:'conversation-1'})
+    expect(f.open().view('alpha',true).sharedExperiences?.[0]?.reviewSuggested).toBeUndefined()
+    expect(f.open().selectExperience(task).entries).toHaveLength(1)
+  })
+
+  it('自动纠正替代材料后旧前提不能恢复，冲突暂停可由主人裁决',()=>{
+    const f = setup()
+    const original = artifact('template-old','template-order')
+    const replacement = artifact('template-new','template-order-2','v2')
+    f.store.applyExperienceBatch('alpha',{id:'learn',changes:[{action:'learn',audience:'shared',
+      text:'访谈引文使用原模板',situation:'访谈引文',source:'observation',evidence:[original],premise:original}]})
+    const {id:memoryId} = memory(f)
+    const live = f.store.selectExperience(task)
+    expect(live.entries).toHaveLength(1)
+    f.store.holdReplacedExperience('alpha',undefined,[{id:memoryId,version:1}])
+    expect(()=>f.open().assertExperienceCurrent(live)).toThrow('使用授权已经变化')
+    expect(memory(f)).toMatchObject({version:1,status:'active',replacementPending:true})
+    expect(f.open().view('alpha',true).sharedExperiences?.[0]).toMatchObject({replacementPending:true})
+    const revise = {action:'revise',audience:'shared',memoryId,version:1,text:'访谈引文使用新模板',evidence:[replacement],
+      premise:replacement,supersedes:true}
+    f.store.applyExperienceBatch('alpha',{id:'revise',changes:[revise]})
+    expect(memory(f)).toMatchObject({version:2,text:revise.text,maintenance:{actor:'system',action:'revise'}})
+    expect(()=>operate(f,'restore',{memoryId,version:2,restoreVersion:1})).toThrow('材料已失效')
+    const conflict = artifact('alternate','alternate-order')
+    const batch = {id:'pause',changes:[{action:'pause',audience:'shared',memoryId,version:2,evidence:[replacement,conflict]}]}
+    f.store.applyExperienceBatch('alpha',batch)
+    expect(f.store.selectExperience(task).entries).toEqual([])
+    expect(memory(f)).toMatchObject({version:3,status:'retired',maintenance:{actor:'system',action:'pause'},conflict:[replacement,conflict]})
+    operate(f,'restore',{memoryId,version:3,restoreVersion:2})
+    expect(f.store.applyExperienceBatch('alpha',batch)).toBe('duplicate')
+    expect(memory(f)).toMatchObject({version:4,status:'active',maintenance:{actor:'manual',action:'restore'}})
+    expect(memory(f)).not.toHaveProperty('conflict')
+    expect(f.open().selectExperience(task).entries).toMatchObject([{id:memoryId,version:4}])
+    f.store.applyExperienceBatch('alpha',{id:'source-expired',changes:[{action:'expire',audience:'shared',memoryId,version:4,
+      reason:'访谈模板已废止',evidence:[artifact('notice','template-order-3')]}]})
+    expect(memory(f)).toMatchObject({version:5,status:'retired',maintenance:{actor:'system',action:'expire',reason:'访谈模板已废止'}})
+    expect(()=>operate(f,'restore',{memoryId,version:5,restoreVersion:4})).toThrow('材料已失效')
   })
 })

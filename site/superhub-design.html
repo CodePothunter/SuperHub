@@ -537,7 +537,7 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
   <h2><span class="no">图 6</span>经验怎样成为可用记忆</h2>
   <figure>
     <div class="scroll" tabindex="0" role="region" aria-label="经验与记忆机制图">
-      <svg class="dg" viewBox="0 0 960 470" role="img" aria-label="主人明确的长期约定可直接成为已采纳经验。交付、阶段回报和失败恢复经整理、核对来源后通常成为待采纳候选；你可以采纳，完全匹配的直接工具或测试证据也可能使其自动采纳。工作区共同经验在经验页，具名幕僚经验在成员成长记录；只有已生效且相关的条目才按权限提供给后续任务。">
+      <svg class="dg" viewBox="0 0 960 575" role="img" aria-label="你明确提出的长期要求立即生效。一次可核实的结果支持限定事实，两个独立工单支持的做法可以自动采纳。条目到期或前提失效时退出后续任务，有明确改法时自动更正，证据冲突时暂停等你裁决。你能在工作区经验页和个人成长记录核对理由、证据和历史版本。">
         <defs>
           <marker id="f6a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="mk-a" d="M0,1 L10,5 L0,9 z"/></marker>
         </defs>
@@ -562,38 +562,47 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
         <rect class="box-l" x="480" y="80" width="190" height="130" rx="10"/>
         <text class="tb" x="495" y="110">待采纳</text>
         <text class="ts" x="495" y="137">保留来源、情境与边界</text>
-        <text class="ts" x="495" y="158">供你审阅与更正</text>
-        <text class="tl" x="495" y="179">搁置不会自动生效</text>
+        <text class="ts" x="495" y="158">核对已有依据和缺项</text>
+        <text class="tl" x="495" y="179">证据不足时继续待采纳</text>
 
         <rect class="box-ok" x="710" y="80" width="230" height="130" rx="10"/>
         <text class="tb" x="725" y="110">已采纳</text>
-        <text class="ts" x="725" y="137">你采纳，或严格证据匹配</text>
-        <text class="ts" x="725" y="158">更正、停用均留版本</text>
-        <text class="ts" x="725" y="179">可恢复历史版本</text>
+        <text class="ts" x="725" y="137">一份原件核实限定事实</text>
+        <text class="ts" x="725" y="158">两个独立工单支持做法</text>
+        <text class="ts" x="725" y="179">你也可手动采纳候选</text>
 
         <line class="ln-a" x1="210" y1="145" x2="247" y2="145" marker-end="url(#f6a)"/>
         <line class="ln-a" x1="440" y1="145" x2="477" y2="145" marker-end="url(#f6a)"/>
         <line class="ln-a" x1="670" y1="145" x2="707" y2="145" marker-end="url(#f6a)"/>
 
-        <!-- 同一状态规则，按归属展示在不同页面 -->
-        <text class="tl" x="20" y="250">按归属审查</text>
-        <rect class="box" x="20" y="265" width="440" height="88" rx="10"/>
-        <text class="tb" x="38" y="292">工作区共同经验</text>
-        <text class="ts" x="38" y="315">工作区「经验」页查看状态、依据与旧版本</text>
-        <text class="ts" x="38" y="337">跨区复用只共享你授权的摘录</text>
+        <rect class="box" x="20" y="235" width="292" height="74" rx="10"/>
+        <text class="tb" x="35" y="262">自动过期</text>
+        <text class="ts" x="35" y="286">期限已到或适用前提已被替代</text>
+        <rect class="box" x="334" y="235" width="292" height="74" rx="10"/>
+        <text class="tb" x="349" y="262">自动更正</text>
+        <text class="ts" x="349" y="286">新证据确定改法，保留旧版本</text>
+        <rect class="box-l" x="648" y="235" width="292" height="74" rx="10"/>
+        <text class="tb" x="663" y="262">暂停使用 · 待裁决</text>
+        <text class="ts" x="663" y="286">同一条件的证据冲突，等你决定</text>
 
-        <rect class="box" x="500" y="265" width="440" height="88" rx="10"/>
-        <text class="tb" x="518" y="292">幕僚专属经验</text>
-        <text class="ts" x="518" y="315">「幕僚」→ 成员卡 →「成长记录」</text>
-        <text class="ts" x="518" y="337">按具名成员核对来源与适用范围</text>
+        <text class="tl" x="20" y="355">在原页面核对</text>
+        <rect class="box" x="20" y="370" width="440" height="88" rx="10"/>
+        <text class="tb" x="38" y="397">工作区共同经验</text>
+        <text class="ts" x="38" y="420">进工作区「经验」页核对操作标识、依据和历史</text>
+        <text class="ts" x="38" y="442">跨区复用只共享你授权的摘录</text>
+
+        <rect class="box" x="500" y="370" width="440" height="88" rx="10"/>
+        <text class="tb" x="518" y="397">幕僚专属经验</text>
+        <text class="ts" x="518" y="420">「幕僚」→ 成员卡 →「成长记录」</text>
+        <text class="ts" x="518" y="442">按具名成员核对来源与适用范围</text>
 
         <!-- 共享行为层按任务选择生效经验 -->
-        <rect class="box-l" x="20" y="380" width="920" height="76" rx="10"/>
-        <text x="35" y="408"><tspan class="tb">共享智能体行为层</tspan><tspan class="ts" dx="12">只把已生效且与当前任务相关的条目按权限提供给主智能体和执行成员</tspan></text>
-        <text class="ts" x="35" y="434">跨区使用还须核对接收对象、用途与授权有效期；有效期控制接收方使用，不会自动停用来源条目。</text>
+        <rect class="box-l" x="20" y="485" width="920" height="76" rx="10"/>
+        <text x="35" y="513"><tspan class="tb">提供给后续任务</tspan><tspan class="ts" dx="12">按权限把当前有效且与任务相关的版本提供给主智能体和执行成员</tspan></text>
+        <text class="ts" x="35" y="539">跨区分享另有接收对象、用途和授权期限。授权到期时，来源区仍按条目有效期管理。</text>
       </svg>
     </div>
-    <figcaption>工作结果通常先整理成带来源的待采纳候选；候选搁置时不会被后续任务使用。主人明确的长期约定可以直接生效，候选也可能在出现完全匹配的直接工具或测试证据后自动采纳。已提供给工单的经验若遇到可核对的直接反证，整理流程可更正或停用，并保留旧版本。经验条目目前没有通用的自动过期规则；跨区共享的使用授权可以设置有效期。</figcaption>
+    <figcaption>新交付可以触发经验整理，你也可以点击「现在整理」或使用已开启的每周 Dream。候选带着依据等待，满足采纳条件后才进入后续任务。自动过期不必等到下一次 Dream。低频经验只提示复核，你仍可手动更正、停用或恢复有效的旧版本。</figcaption>
     <div class="src">src/dsh/workspace-experience-learning.ts · src/dsh/workspace-staff-store.ts · src/dsh/runtime.ts · src/client/workspace-staff.tsx</div>
   </figure>
 </section>

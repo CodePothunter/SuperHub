@@ -4,14 +4,31 @@ export interface ExperienceRef {
 }
 
 export interface ExperienceEvidence {
-  kind: 'owner' | 'group' | 'delivery' | 'tool' | 'test' | 'model-review' | 'owner-acceptance' | 'order'
+  kind: 'owner' | 'group' | 'delivery' | 'artifact' | 'tool' | 'test' | 'model-review' | 'owner-acceptance' | 'order'
   id: string
   workspaceId?: string
   sessionId?: string
   orderId?: string
   messageId?: string
+  turnId?: string
+  fileId?: string
+  staffId?: string
+  resultId?: string
   version?: string
   quote?: string
+}
+
+export interface ExperienceSupport {
+  orderId: string
+  origin: string
+  evidence: ExperienceEvidence[]
+}
+
+export interface ExperienceMaintenance {
+  action: 'learn' | 'accept' | 'revise' | 'retire' | 'expire' | 'pause' | 'restore'
+  actor: 'manual' | 'owner' | 'system'
+  at: string
+  reason?: string
 }
 
 export interface ExperienceMemory extends ExperienceRef {
@@ -26,6 +43,7 @@ export interface ExperienceMemory extends ExperienceRef {
   source?: 'owner' | 'suggestion' | 'observation'
   orderId?: string
   lastUsed?: { workspaceId: string; orderId: string; at: string }
+  lastDeliveredAt?: string
   situation?: string
   boundary?: string
   domains?: string[]
@@ -35,6 +53,15 @@ export interface ExperienceMemory extends ExperienceRef {
   reason?: string
   feedback?: ExperienceFeedback[]
   previousVersions?: number[]
+  expiresAt?: string
+  maintenance?: ExperienceMaintenance
+  conflict?: ExperienceEvidence[]
+  premise?: ExperienceEvidence
+  /** Internal source records. Owner-facing projections show the count and the evidence of decisions. */
+  supports?: ExperienceSupport[]
+  supportCount?: number
+  reviewSuggested?: boolean
+  replacementPending?: boolean
 }
 
 export interface ExperienceQuery {
