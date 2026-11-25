@@ -19,6 +19,9 @@
  const outcome=()=>message('接口人','sprout','<b>已有结论</b>：材料支持旧配置是原因。<br><b>还缺什么</b>：新接入点当前是否可用，待验证。<br><b>下一步</b>：可先做只读核对，实际配置保持不变。'+receipt(),false,true);
  const reply=()=>message('你','plane','按这个方向继续只读核对。实际配置暂不改。',true,true);
  function interviews(step=0){return `<div class="stage-page interview-page">${spaceTop('客户访谈','访谈提纲 · 第一轮反馈','execution')}<div class="group-layout"><div class="group-aside"><h3>会话</h3><div class="thread selected">下一轮访谈提纲<small>工单 · 核对首轮假设</small></div><div class="thread">原话与访谈记录<small>本区材料</small></div></div><div class="group-conversation"><div class="conversation-head"><h3>下一轮访谈提纲</h3><div class="roster"><span>${art('compass')}研究员</span><span>${art('fan')}访谈顾问</span><span>客户访谈 · 本区对话</span></div></div><div class="messages">${message('研究员','compass','首轮有两位受访者在邀请同事时中断。还不能判断：是入口不明显，还是权限说明不清楚。')}${step>=1?message('你','plane','下一轮先核对：他们是否看见入口，以及在哪一步不敢继续。',true):''}${step>=2?message('你','plane','把这两个问题放在提纲前面。先问经历，再问判断。',true):''}</div><div class="composer">继续整理访谈问题…<div class="composer-bottom"><span>＋　添加文件或图片</span><span class="send">↑</span></div></div></div></div></div>`;}
+ const scheduleAsk=()=>message('你','plane','每周一到周五上午 9:00，提醒我各工作区尚未关闭的工单。',true);
+ const scheduleReceipt=()=>message('接口人','sprout','已建立「未关闭工单提醒」：工作日 09:00。下一次 11 月 26 日 周四 09:00。到点会在这里提醒你，同时推送到手机。可在「设置 → 定时安排」查看、停用或删除。');
+ const scheduleNotice=()=>message('接口人','sprout','各工作区未关闭的工单共 3 张：<br><b>产品研发</b>　接入修复方案 · 执行中<br><b>客户访谈</b>　下一轮访谈提纲 · 等你验收<br><b>研究周报</b>　本周数据整理 · 已接手<span class="schedule-source">— 来自定时安排「未关闭工单提醒」· 工作日 09:00<span><u>停用这条安排</u><u>在设置中查看</u></span></span>',false,true);
  const frames=[
   {title:'先决定，今天把注意力放在哪。',copy:'从「今天」看见项目和资料。你选择先整理客户访谈，临时的接入排查也有地方交出去。',icon:'hub-small',view:'today',render:()=>home()},
   {title:'临时冒出的事，先交出去。',copy:'告诉接口人目标和边界，同时说清自己要继续客户访谈。交办不必变成一次漫长的工作切换。',icon:'sprout',view:'today',render:()=>home()+modal('接口人',request(),'一句话交办',false,true)},
@@ -31,6 +34,7 @@
   {title:'腾出注意力，再打开汇报。',copy:'先看结论、缺口和下一步，需要细节再进原工单。打开后未读标记消退，不表示任务自动完成。',icon:'sprout',view:'workspace',render:()=>interviews(2)+modal('接口人',outcome(),'来自产品研发的汇报',false,true)},
   {title:'补一句方向，把细节交回去。',copy:'「继续只读核对，配置暂不改」回到原工单。你做取舍，团队接着处理具体问题。',icon:'plane',view:'workspace',render:()=>interviews(2)+modal('接口人',outcome().replace('fresh','')+reply(),'继续原工单',false,true)},
   {title:'回来时，刚才的思路还在。',copy:'关闭汇报，回到同一份访谈提纲。原话、问题和最后一句都在，不需要把研发过程重新装进脑中。',icon:'recorder',view:'workspace',canvas:'interview-2',render:()=>interviews(2)},
+  {title:'到点提醒，也回到同一个入口。',copy:'说一句「工作日 9 点提醒我未关闭的工单」，回执写明下一次时间和提醒位置。到点后汇总出现在接口人对话里，所有安排集中在「设置 → 定时安排」。',icon:'sprout',view:'today',render:()=>home(true)+modal('接口人',scheduleAsk()+scheduleReceipt()+scheduleNotice(),'定时安排',false,true)},
   {title:'再抬头，回到全局。',copy:'「今天」保留项目和成果入口。你可以查看报告，再选择下一步；什么时候深入，什么时候抬头，都由你安排。',icon:'hub-small',view:'today',render:()=>home(true)}
  ];
  const scene = $('#story-scene');
