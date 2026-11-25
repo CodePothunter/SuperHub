@@ -1,0 +1,11 @@
+DS Bot
+Copyright 2026 Fei2411 and the DS Bot contributors
+Licensed under the Apache License, Version 2.0.
+
+Adapted in SuperHub: the DeepSeek light/dark color palette and selected
+bubble/pill surface rules from ds-bot/src/client/themes.js and styles.js,
+revision 5e9b7da8882da3b68d8a0624342708c2150a9156.
+Changes: namespaced tokens, DSH theme integration, a task board layout,
+original role avatars, and simpler reduced-motion interactions.
+Source: https://github.com/Fei2411/DS-Bot
+The upstream runtime, graphics and other third-party modules are not included.

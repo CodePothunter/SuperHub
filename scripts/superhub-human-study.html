@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>SuperHub 使用验收</title>
+<style>
+:root{color-scheme:light dark;--bg:light-dark(#f5f6fa,#17181d);--card:light-dark(#fff,#23252d);--text:light-dark(#202431,#edeef5);--muted:light-dark(#616675,#b5bac9);--line:light-dark(#e1e4ed,#3b3f4c);--action:light-dark(#4f46e5,#b0a9ff);--on:light-dark(#fff,#191537)}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}main{max-width:760px;padding:32px 20px;margin:auto}h1{font-size:26px;letter-spacing:-.5px;margin:0 0 8px}h2{font-size:19px;margin:0 0 12px}p{margin:8px 0 14px}small,.muted{color:var(--muted)}.card{border:1px solid var(--line);border-radius:16px;padding:22px;background:var(--card);margin-bottom:16px}.eyebrow{font-size:12px;font-weight:700;letter-spacing:1px;color:var(--action);margin-bottom:10px}.row{display:flex;gap:12px;align-items:end;flex-wrap:wrap}.row>*{flex:1;min-width:160px}label{display:block;margin:12px 0 5px;font-size:14px;font-weight:600}input,select,textarea,button{font:inherit;border:1px solid var(--line);border-radius:9px;color:var(--text);background:var(--card);padding:10px 12px;max-width:100%}input,select,textarea{width:100%}textarea{resize:vertical;min-height:65px}button{cursor:pointer;font-weight:600;white-space:nowrap}button.primary{background:var(--action);border-color:var(--action);color:var(--on)}button:disabled{opacity:.5;cursor:wait}button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid var(--action);outline-offset:2px}.check{display:flex;gap:9px;align-items:center;font-weight:400}.check input{width:18px;height:18px;flex:none}#message{color:light-dark(#a12d36,#ffb4b7);white-space:pre-wrap}#toast{position:fixed;z-index:5;bottom:15px;left:50%;transform:translateX(-50%);padding:9px 15px;background:var(--text);color:var(--card);max-width:90%;border-radius:9px}ol{padding-left:22px}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}.badge{display:inline-block;padding:2px 9px;border-radius:999px;background:var(--bg);font-size:12px}.clock-code{font-size:30px;letter-spacing:5px;font-variant-numeric:tabular-nums;font-weight:700}#lab{height:100dvh;display:flex;flex-direction:column}#bar{flex:none;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--card);font-size:13px}#bar strong{font-size:16px}#bar button{font-size:13px;padding:6px 12px}#timer{font-variant-numeric:tabular-nums;color:var(--action);margin-left:8px}#frame{width:100%;flex:1;min-height:0;border:0;background:var(--card)}#answer{position:fixed;inset:0;background:#14182799;z-index:3;display:flex;align-items:center;justify-content:center;padding:16px}#answer .card{max-width:640px;width:100%;max-height:95dvh;overflow:auto;margin:0}.modal-actions{display:flex;justify-content:space-between;gap:10px;margin-top:16px}[hidden]{display:none!important}#resumeResult{white-space:pre-wrap}.instructions{border-left:3px solid var(--action);padding-left:13px}#preparing{padding:18px;background:var(--bg);border-radius:10px}.compact{font-size:13px}@media(max-width:600px){main{padding:20px 12px}.card{padding:17px}#bar{padding:8px 10px;gap:6px}#bar strong{font-size:14px}h1{font-size:23px}.row>*{min-width:130px}}
+</style></head>
+<body>
+<main id="home">
+  <div class="eyebrow">SUPERHUB · 使用验收</div><h1>把真正的使用过程记下来</h1>
+  <p class="muted">使用独立练习空间，不会影响你的日常任务。只记录匿名设备信息、操作用时和这次练习的回答。</p>
+  <section id="login" class="card"><h2>进入练习空间</h2><form id="loginForm"><label for="accessCode">主持人提供的访问口令</label><input id="accessCode" type="password" autocomplete="off" required><div class="actions"><button class="primary">进入</button></div></form></section>
+  <section id="registration" class="card" hidden><h2>先认识一下你的设备</h2><form id="registerForm">
+    <label for="participantCode">参与者代号</label><input id="participantCode" maxlength="24" pattern="[A-Za-z0-9_-]+" placeholder="例如 A，电脑和手机填同一个代号" required><small>不用真实姓名。同一个人换设备时沿用代号，首次使用者另用一个代号。</small>
+    <div class="row"><div><label for="device">这是什么设备？</label><select id="device"><option value="desktop">电脑</option><option value="phone">手机</option></select></div>
+    <div><label for="experience">用过 SuperHub 吗？</label><select id="experience"><option value="familiar">已经使用过</option><option value="new">第一次使用</option></select></div></div>
+    <label class="check"><input id="physical" type="checkbox" required>这是一台实际设备，不是浏览器的手机模拟</label>
+    <p class="muted compact">浏览器自动操作会单独标记为预检，不能计入真人样本。</p><button class="primary">准备好了</button>
+  </form></section>
+  <section id="choices" class="card" hidden><div class="row"><h2>选择这次练习</h2><span id="participant" class="badge"></span></div>
+    <p>主持人会告诉你先做哪一项。首次使用者请先做「快速定位」，操作时独立寻找答案。</p>
+    <div class="actions"><button id="prepareLocate" class="primary">快速定位</button><button id="prepareReview">五分钟局势校准</button><button id="openClock">两台设备同步</button></div>
+  </section>
+  <section id="ready" class="card" hidden><h2 id="taskTitle"></h2><div id="taskInstructions" class="instructions"></div>
+    <p class="muted">点击开始后显示练习场景并计时。准备与等待时间不算入操作用时。不要请主持人代找答案；如需帮助，会如实记录。</p>
+    <button id="start" class="primary">开始练习</button>
+  </section>
+  <section id="preparing" hidden role="status">正在准备独立场景，尚未计时…</section>
+  <section id="finished" class="card" hidden><h2>本次操作已记录</h2><p id="resultText"></p><p class="muted">主持人还会核对答案、选中的证据和下一步。这条记录不会自动标记为验收通过。</p>
+    <div class="actions"><button id="resume" class="primary" hidden>开始复工练习</button><button id="again">回到练习选择</button></div>
+  </section>
+  <section id="clock" class="card" hidden><h2>两台设备同步</h2><p>电脑和手机都先点「采集本机时间」。然后电脑生成同步码，手机输入这个码并回应。请保持电脑页面打开。</p>
+    <button id="sampleClock" class="primary">采集本机时间</button><p id="clockSampleResult" class="muted"></p>
+    <hr><button id="reserveClock">在此设备生成同步码</button><p id="clockCode" class="clock-code"></p>
+    <form id="respondClockForm"><label for="pairCode">另一台设备上的同步码</label><div class="row"><input id="pairCode" maxlength="6" autocomplete="off" placeholder="六位同步码" required><button>回应另一台设备</button></div></form>
+    <p id="clockStatus" role="status"></p><p class="muted compact">不会修改系统时间。先产生的消息会暂存在电脑上，等手机回应到达后才补传，用来检验真实乱序到达。时钟偏差会连同网络延迟范围记录。</p>
+    <button id="closeClock">回到练习选择</button>
+  </section>
+  <p id="message" role="alert"></p>
+</main>
+<section id="lab" hidden><header id="bar"><div><strong id="barTitle"></strong><span id="timer">0:00</span></div><div><button id="answerButton">填写答案</button> <button id="cancelAttempt">结束练习</button></div></header><iframe id="frame" title="SuperHub 练习空间"></iframe></section>
+<section id="answer" hidden><form id="answerForm" class="card"><h2>记录你找到的答案</h2><p class="muted compact">填写和修改答案的时间也会计入本次操作。可以返回界面继续查找。</p>
+  <div id="locateAnswers"><label for="answerOwner">目标的负责人是谁？</label><input id="answerOwner" autocomplete="off"><label for="answerBlocker">目标还被哪项条件卡住？</label><textarea id="answerBlocker"></textarea><label for="answerWaiting">关联工单在等谁做什么？</label><textarea id="answerWaiting"></textarea></div>
+  <div id="resumeAnswers" hidden><label for="answerResume">回来后你会从哪一步继续？</label><textarea id="answerResume"></textarea></div>
+  <label class="check"><input id="assisted" type="checkbox">过程中有人提示了答案或替我操作</label>
+  <div class="modal-actions"><button id="backToApp" type="button">继续查看</button><button class="primary">提交本次记录</button></div>
+</form></section><div id="toast" role="status" hidden></div>
+<script src="/study-client.js"></script></body></html>

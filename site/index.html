@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SuperHub · 从一句交办，到一份交付</title>
+<meta name="description" content="让 AI 分头忙，让你专心做主。在 SuperHub 一句话交办，按项目组织 AI 协作，按自己的节奏接回汇报。">
+<link rel="icon" href="assets/hub-small.svg" type="image/svg+xml">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="nav bound"><a class="brand" href="#"><img src="assets/hub-small.svg" alt="">SuperHub</a><nav class="navlinks"><a href="#after-demo">设计理念</a><a href="#story-sequence">工作演示</a><a href="#workspaces">工作区</a><a href="#portability">导入导出</a><a href="#faq">常见问题</a></nav><a class="button primary" href="#start">开始使用 ↗</a></header>
+<main>
+<section class="hero bound">
+ <div class="hero-copy"><div class="eyebrow">让 AI 分头忙，让你专心做主。</div><h1>从一句交办，<br>到一份<em>交付。</em></h1><p>把事情交出去，继续你眼前的主线。<br>过程留在工作区，汇报集中回来，何时接回由你决定。</p><div class="cta"><a class="button primary" href="#start">了解如何开始 <span>↗</span></a><a class="button" href="#story-sequence">滚动看一次完整协作 <span>↓</span></a></div><div class="techline"><span>基于 DeepSeek Harness</span><i></i><span>可接入 Codex / Claude Code</span><i></i><span>MIT 开源</span></div></div>
+ <div class="hero-art"><img src="assets/hub-fold.webp" alt="SuperHub 的 H 标志：左侧对话气泡，通过薄荷色箭头连接右侧成果页"><div class="handoff"><span><b>01</b> 提出交办</span><i>→</i><span><b>02</b> 团队接手</span><i>→</i><span><b>03</b> 带回成果</span></div></div>
+</section>
+<section class="story-sequence bound" id="story-sequence" aria-label="SuperHub 动态工作演示"><div class="story-sticky" tabindex="0" aria-label="动态演示。向下滚动或按右方向键前进，向上滚动或按左方向键回看，Escape 跳过。"><div class="story-intro"><div><h2>你专心做一件事，其他工作各自推进。</h2><p>把临时的排查交出去，继续访谈，再从汇报接回决定。</p></div><a class="skip-story" id="skip-story" href="#after-demo">跳过演示 ↓</a></div><div class="story-shell" id="story-scene"><noscript><p class="story-noscript">启用 JavaScript 可播放演示。</p></noscript></div><div class="story-caption"><img class="caption-icon" id="story-caption-icon" src="assets/hub-small.svg" alt=""><div aria-live="polite"><b id="story-title"></b><p id="story-copy"></p></div><span class="story-count" id="story-count"></span></div><div class="story-progress" aria-hidden="true"><span id="story-fill"></span></div><div class="story-hint"><span>滚轮推进 · ← → 逐条切换 · 向上回看 · Esc 跳过</span><span>通用样例演示</span></div></div></section>
+<section class="section bound attention-section" id="after-demo" tabindex="-1">
+ <div class="section-title"><div><div class="kicker">YOUR ATTENTION, YOUR CHOICE</div><h2>事情可以并行，<br>注意力由你安排。</h2></div><p>全局有入口，细节有归属，回来有线索。你决定何时深入一件事，何时抬头看全局。</p></div>
+ <div class="attention-proof" aria-label="演示中的两条并行线：你继续客户访谈，产品研发推进排查，在你主动查看时交接汇报。">
+  <div class="proof-heading"><b>交办之后，两条线各自向前。</b><span>一条是你的关注，一条是工作的进展。</span></div>
+  <div class="parallel-row human-row"><div class="lane-label"><img src="assets/plane.svg" alt="">你的注意力</div><div class="lane-steps"><div class="mainline-node"><small>专心做</small><b>整理访谈提纲</b></div><div class="mainline-node"><small>仍在专心做</small><b>写完眼前一句</b></div><div class="return-node"><small>主动接回</small><b>读结论，定方向</b></div><div class="mainline-node"><small>接着做</small><b>回到访谈提纲</b></div></div></div>
+  <div class="parallel-row work-row"><div class="lane-label"><img src="assets/prototype.svg" alt="">产品研发</div><div class="lane-steps"><div><small>过程留在本区</small><b>核对材料</b></div><div class="report-node"><small><span class="inline-unread">1</span> 留在统一入口</small><b>汇报已回</b></div><div><small>通过接口人交接</small><b>收到补充方向</b></div><div><small>收到新方向</small><b>继续只读核对</b></div></div></div>
+  <p class="proof-point">红点出现时，访谈还在继续。<strong>何时打开汇报，由你决定。</strong></p>
+ </div>
+ <div class="attention-principles">
+  <article><span class="principle-verb">交出去</span><h3>给挂念一个落点。</h3><p>一句话说清目标与边界，回执指向原工单。离开执行对话，也知道这件事交给了谁、回来去哪里找。</p><div class="feature-origin">一句话交办 · 工单回执</div></article>
+  <article><span class="principle-verb">专心做</span><h3>让不同的事各归其位。</h3><p>访谈的原话与追问、研发的依据与验证，各在自己的工作区。对话与项目经验有归属，需要复用的方法可以选定内容再共享。</p><div class="feature-origin">工作区 · Context 与经验范围</div></article>
+  <article><span class="principle-verb">接回来</span><h3>带着线索，接回决定。</h3><p>红点留住未读，汇报带回结论、缺口和原工单。补一句方向，团队接着处理；回到主线，刚才的对话也还在。</p><div class="feature-origin">未读入口 · 集中汇报 · 原对话</div></article>
+ </div>
+ <div class="zoom-out"><img src="assets/hub-small.svg" alt=""><div><h3>深入一件事，也留一个看全局的入口。</h3><p>从「今天」选择关注，进入工作区做具体的事，再回到「今天」查看项目与交付、重新决定下一步。</p></div></div>
+ <details class="design-references" id="research"><summary>为什么这样设计？注意力残留、目标记忆与局势感知。</summary><div class="reference-grid">
+  <article><h4>给任务切换留出边界</h4><p>未完成的任务可能继续占用注意力。设计上，让交办有去处、过程有容器，给离开一件事留下明确的交接点。</p><a href="https://doi.org/10.1016/j.obhdp.2009.04.002">Leroy · 2009 · 注意力残留 ↗</a></article>
+  <article><h4>给回来的人保留线索</h4><p>目标记忆模型讨论目标激活、干扰与提取线索。设计上，保留原话、当前进展与成果，帮助人重新接上原来的工作。</p><a href="https://doi.org/10.1207/s15516709cog2601_2">Altmann &amp; Trafton · 2002 · 目标记忆 ↗</a></article>
+  <article><h4>在深入与全局之间主动切换</h4><p>局势感知关注感知、理解与预判。设计上，用「今天」保留全局入口，帮助人重新选择此刻值得关注的事。</p><a href="https://doi.org/10.1518/001872095779049543">Endsley · 1995 · 局势感知 ↗</a></article>
+ </div><p class="note">以上是研究启发下的设计选择，不代表论文验证了 SuperHub 的效果。红点表示未读，不自动判定紧急程度；Context 边界描述应用中的组织与使用范围。</p></details>
+</section>
+<section class="section bound workspace-section" id="workspaces">
+ <div class="section-title"><div><div class="kicker">A PLACE FOR EACH PROJECT</div><h2>每个项目，<br>都有自己的工作现场。</h2></div><p>目标、对话、工单和成果围绕同一件事组织。换项目时带上它的背景，回来时沿着原会话接着做。</p></div>
+ <div class="workspace-preview" aria-label="可切换项目、查看概览、执行与幕僚的工作区示意">
+  <div class="workspace-preview-bar"><span class="brand"><img src="assets/hub-small.svg" alt="">SuperHub</span><div><span>今天</span><span class="active">工作区</span><span class="optional">人物</span><span class="optional">日历</span></div><span class="story-say">一句话交办</span></div>
+  <div class="workspace-preview-page"><div class="workspace-preview-heading"><div><div class="workspace-preview-name"><img src="assets/prototype.svg" alt="" id="workspace-demo-icon"><h3 id="workspace-demo-name">产品研发</h3></div><p id="workspace-demo-goal">把接入问题整理成可验证的修复方案，实际改动由你确认。</p></div><button id="workspace-switch" class="stage-button" aria-haspopup="dialog">切换工作区 <span>⌄</span></button></div>
+   <div class="workspace-preview-tabs" role="tablist" aria-label="工作区版面"><button role="tab" id="workspace-tab-overview" aria-controls="workspace-panel" aria-selected="true" data-workspace-panel="overview">概览</button><button role="tab" id="workspace-tab-execution" aria-controls="workspace-panel" aria-selected="false" tabindex="-1" data-workspace-panel="execution">执行</button><button role="tab" id="workspace-tab-staff" aria-controls="workspace-panel" aria-selected="false" tabindex="-1" data-workspace-panel="staff">幕僚</button></div>
+   <div id="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-overview"><noscript>启用 JavaScript 可切换样例项目，查看会话与工单、原对话和本区成员。</noscript></div>
+  </div>
+ </div>
+ <p class="workspace-preview-hint">试试切换「产品研发」「客户访谈」「研究周报」，或打开一张工单，看看它的原对话与材料。</p>
+ <div class="workspace-benefits"><article><h3>进入项目，先找回方向。</h3><p>概览保留当前目标与会话、工单。知道这件事为什么做，也能找到正在推进的那一段。</p></article><article><h3>材料和成果，连着来龙去脉。</h3><p>从工单回到负责会话，查看原始交办、依据与交付。文件与讨论的联系一起保留下来。</p></article><article><h3>不同项目，各有自己的上下文。</h3><p>访谈围绕原话与追问，研发围绕依据与验证。项目职责与经验有使用范围，方法可以按需共享。</p></article></div>
+</section>
+<section class="section bound team-section" id="team">
+ <div class="team-copy"><div class="kicker">YOUR TEAM, YOUR WAY</div><h2>你的团队，<br>由你来组。</h2><p>从已有幕僚中邀请成员，也可以为项目创建专属角色。需要怎样的帮手，就给他相应的职责。</p>
+  <div class="team-feature"><h3>用熟悉的成员，接新的工作。</h3><p>从全局名册邀请，在工作区说明这次需要他负责什么。</p></div>
+  <div class="team-feature"><h3>给新问题，加一种视角。</h3><p>创建专属幕僚，自定名字、头像与职责。验收顾问、访谈顾问，都可以是你的选择。</p></div>
+  <div class="team-feature"><h3>把好方法，慢慢积累下来。</h3><p>查看经验的来处，选择采纳、共享或调整，让协作随使用继续成长。</p></div>
+ </div>
+ <div class="team-window" aria-label="产品研发工作区的幕僚配置示意，成员可邀请或自定义">
+  <div class="team-window-head"><div><img src="assets/prototype.svg" alt=""><b>产品研发 <span>/ 幕僚</span></b></div><small>示例配置</small></div>
+  <div class="team-person"><img src="assets/wrench.svg" alt=""><div><div class="team-name"><h3>工程师</h3><span>Codex</span></div><p>核对材料，整理修复方案。</p><small>从全局名册邀请</small></div></div>
+  <div class="team-person"><img src="assets/compass.svg" alt=""><div><div class="team-name"><h3>研究员</h3><span>本区职责</span></div><p>补充方案依据，列出待验证项。</p><small>从全局名册邀请</small></div></div>
+  <div class="team-person custom"><img src="assets/pencil.svg" alt=""><div><div class="team-name"><h3>验收顾问</h3><span>项目专属</span></div><p>检查验证与回退步骤，指出缺少的条件。</p><small>由你创建，职责可调整</small></div></div>
+  <div class="team-window-actions"><span class="stage-button">邀请已有幕僚</span><span class="stage-button primary">＋ 创建专属幕僚</span></div>
+  <p class="team-window-note">名字、头像和职责，都能按你的工作调整。</p>
+ </div>
+</section>
+<section class="section bound portability-section" id="portability">
+ <div class="section-title"><div><div class="kicker">BRING YOUR EXPERIENCE WITH YOU</div><h2>换个工具，<br>默契不用从零开始。</h2></div><p>把你和 AI 已经磨合出的偏好、协作方式与目标带进来。由你核对后继续使用，也能把确认过的部分带回常用工具。</p></div>
+ <div class="memory-transfer" aria-label="从常用助手带回回答，在 SuperHub 核对后采用，再导出给日常助手或本机编程工具">
+  <article class="transfer-source"><div class="transfer-label">导入 · 把已有的了解带进来</div><h3>从熟悉你的助手开始。</h3><div class="tool-chips"><span>ChatGPT</span><span>Claude</span><span>Gemini</span><span>DeepSeek</span><span>Kimi</span><span>豆包</span><span>其他助手</span></div><p>复制 SuperHub 的导入提示词，让助手整理它对你的了解，再把回答贴回来。</p><div class="transfer-step"><span>复制提示词</span><i>→</i><span>贴回回答</span></div></article>
+  <article class="transfer-review"><div class="review-brand"><img src="assets/hub-small.svg" alt=""><b>SuperHub</b><small>核对资料 · 示例</small></div><div class="review-source">来源：常用助手的回答</div><div class="knowledge-item"><span>工作偏好</span><p>日常问题先给结论；复杂方案说明依据与取舍。</p></div><div class="knowledge-item"><span>协作约定</span><p>不确定的地方列出来，需要我决定时说清选项。</p></div><div class="review-options"><span class="selected">采纳</span><span>修改后采纳</span><span>跳过</span></div><p class="transfer-review-note">逐条查看原话与依据，由你决定采用哪种表述。</p></article>
+  <article class="transfer-target"><div class="transfer-label">导出 · 接上常用的工具</div><h3>让新的对话接着懂你。</h3><div class="export-route"><b>ChatGPT · Claude</b><span>可复制的背景与偏好</span><p>带入常用助手的个性化设置、项目说明或新对话。</p></div><div class="export-route"><b>Codex · Claude Code</b><span>指令文件与会话背景</span><p>配置本机同步或会话启动读取，把确认过的内容带到编程工具。</p></div><div class="transfer-step"><span>选择目标</span><i>→</i><span>带去继续用</span></div></article>
+ </div>
+ <div class="portability-bottom"><div><img src="assets/plane.svg" alt=""><p>你和 AI 积累的协作经验，<strong>跟着你走。</strong></p></div><p>导出范围：已确认的本人资料、协作约定与当前有效目标。</p></div>
+</section>
+<section class="mobility bound"><div><div class="kicker">YOUR ATTENTION, ON YOUR TERMS</div><h2>离开电脑，<br>也接得住关键的一句。</h2><p>手机上的接口人与工作区接着同一项工作。看到红点，读汇报、补充方向，再回到自己的节奏。</p><p class="note">手机浏览器入口 · 需登录并能连接运行 SuperHub 的主机</p></div><div class="phone" aria-label="手机端设计示意"><div class="phone-status"><span>09:41</span><span>▮▮▮　▰</span></div><div class="phone-top"><div class="brand"><img src="assets/hub-small.svg" alt="">SuperHub</div><span class="mini-say">一句话交办</span></div><div class="phone-main"><div class="back">‹ 产品研发</div><h3 class="storyphone-title">接口人的新汇报</h3><p class="phone-caption">手机浏览器 · 通用样例</p><div class="msg"><img src="assets/sprout.svg" alt=""><div><div class="by">接口人 <small>09:41</small></div><div class="bubble">修复方案已经交回。新接入点的当前状态还待验证，实际配置没有变更。<button class="file" data-report><img src="assets/report.svg" alt=""><span>接入排查报告.md<small>查看报告与待确认项</small></span><span>↗</span></button></div></div></div><div class="msg own"><img src="assets/plane.svg" alt=""><div><div class="by">你 <small>09:42</small></div><div class="bubble">先继续只读核对。配置暂不改。</div></div></div></div><div class="composer">继续对接口人说…<div class="composer-bottom"><span>＋</span><span class="send">↑</span></div></div></div></section>
+<section class="section bound"><div class="section-title"><div><div class="kicker">A CONTINUING WORKING RELATIONSHIP</div><h2>工作里的关系与积累，<br>也有地方安放。</h2></div><p>项目会继续，人和约定也会继续。把它们保留下来，让下一次交办更容易接上。</p></div><div class="more-functions"><article class="more-function"><img src="assets/recorder.svg" alt=""><h3>人物与关系</h3><p>现实人物有自己的资料入口，与 AI 幕僚分别管理。</p></article><article class="more-function"><img src="assets/report.svg" alt=""><h3>日历与约定</h3><p>查看已登记安排，在工单里记录约定、跟进与周报。</p></article><article class="more-function"><img src="assets/compass.svg" alt=""><h3>让经验有来处</h3><p>看清经验来源和适用工作区，按需采纳、共享、撤回与重置。</p></article></div></section>
+
+<section class="section bound start-grid" id="start"><div><div class="kicker">START WITH ONE TASK</div><h2>从一件具体的事开始。</h2><p>在 DeepSeek Harness 中安装 SuperHub，<br>选择资料目录，再把第一件事交给接口人。</p><div class="cta"><a class="button primary" href="https://github.com/CodePothunter/SuperHub#快速开始">查看安装指南 ↗</a><a class="button" href="https://github.com/CodePothunter/SuperHub">查看项目源码 ↗</a></div></div><div class="install"><div class="install-item"><div><b>准备运行环境</b><p>Node.js 24+ 与 DSH Web。执行工具使用各自已配置的账号。</p></div></div><div class="install-item"><div><b>安装 SuperHub，选择资料目录</b><p>下载 <a href="https://github.com/CodePothunter/SuperHub/releases/download/v0.2.0/SuperHub-0.2.0.tgz">SuperHub 0.2.0 安装包</a>。安装后从 DSH Web 的侧栏进入。</p></div></div><div class="install-item"><div><b>说清目标、材料与完成标准</b><p>从「一句话交办」开始，或进入一个工作区与成员沟通。</p></div></div></div></section>
+<section class="section bound" id="faq"><div class="faqs"><h2>开始之前，你可能想知道。</h2><details open><summary>SuperHub 是什么？</summary><p>SuperHub 是基于 DeepSeek Harness 的个人 AI 工作空间。通过一个接口人交办，按项目配置幕僚与上下文，在工作区协作、从汇报接回决定。当前是 DSH Web 插件，并提供手机浏览器入口。</p></details><details id="team-faq"><summary>幕僚是固定的几个角色吗？</summary><p>你可以创建全局幕僚、邀请它加入工作区并设定本区职责，也可以创建工作区专属幕僚。名称、职责和头像可调整，经验可以采纳、共享、撤回或重置。</p></details><details><summary>工作区的上下文边界是什么？</summary><p>工作区分别组织对话、项目职责与本区经验。通用做法可以复用，跨区经验可由你选择文字、接收人、用途与有效期。这里描述的是应用中的上下文组织和授权，不是独立账号或文件系统沙箱。</p></details><details><summary>红点会只提醒必须立即处理的事吗？</summary><p>目前红点表示接口人的未读回复、讨论回报和提醒。它提供集中回看的入口，不是紧急度分类，也不表示每项都要立刻处理。</p></details><details><summary>怎样把已有 AI 经验带进来、再带出去？</summary><p>把导入提示词发给常用助手，贴回它对你的了解，在 SuperHub 逐条核对、修改或采纳。导出时可以生成给 ChatGPT、Claude 的文字，或用于 Codex、Claude Code 的指令文件区块与会话背景。本机同步需由你配置；导出采用已确认的本人资料、协作约定与有效目标，标记为机密的内容会被过滤。</p></details><details><summary>可以接入哪些执行工具？</summary><p>DSH 模型成员可以与使用 Codex 或 Claude Code 的成员在工作区协作。具体可用工具、模型和账号取决于你的运行环境与成员配置。</p></details><details><summary>资料存在哪里？</summary><p>工作资料保存在运行 SuperHub 的主机及你选择的资料目录中。调用模型时，相关内容按所用模型服务处理，不能把本地保存理解成全程离线。</p></details><details><summary>能完全不干预地持续工作吗？</summary><p>SuperHub 提供分工、进展、跟进和交付入口。实际推进取决于模型、工具与任务情况；缺少信息或需要决定时，仍要由你接话和确认。</p></details></div></section>
+<section class="closing bound"><img src="assets/hub-small.svg" alt=""><h2>把下一件事，交给 SuperHub。</h2><p>让 AI 分头忙，让你专心做主。</p><div class="cta"><a class="button primary" href="#start">了解如何开始 ↗</a><a class="button" href="https://github.com/CodePothunter/SuperHub">查看项目源码 ↗</a></div></section>
+</main>
+<footer><div class="bound"><p>SuperHub · MIT · 独立开源项目，非 DeepSeek 官方产品</p><p><a href="https://github.com/CodePothunter/SuperHub">GitHub ↗</a></p></div></footer>
+<dialog id="report" aria-labelledby="report-title"><h2 id="report-title">接入排查报告</h2><p class="muted">通用演示文稿</p><h3>已知原因</h3><p>发布记录中的接入点已经更换，检查程序仍读取旧配置。因此检查请求指向旧接入点并返回 404。</p><h3>建议改动</h3><p><code>SERVICE_ENDPOINT=endpoint-new</code></p><h3>变更前后如何核对</h3><p>先核实新接入点当前可用，再按发布流程使配置生效。验证实际目标、响应状态和预期内容，保留脱敏记录。</p><h3>仍待确认</h3><p>先确认新接入点当前可用，再决定是否安排变更。</p><button class="button primary" id="close-report">返回对话</button></dialog>
+<dialog id="workspace-picker" aria-labelledby="workspace-picker-title"><div class="ws-dialog-head"><h2 id="workspace-picker-title">切换工作区</h2><button id="workspace-picker-close" aria-label="关闭工作区选择">×</button></div><p class="ws-dialog-note">通用样例 · 切换后查看项目自己的目标、工单与对话。</p><div class="ws-picker-list"><button data-workspace-choice="product" aria-pressed="true"><img src="assets/prototype.svg" alt=""><span><b>产品研发</b><small>整理接入问题的修复与验证方案。</small></span><i>›</i></button><button data-workspace-choice="interviews" aria-pressed="false"><img src="assets/recorder.svg" alt=""><span><b>客户访谈</b><small>核对原话，准备下一轮提纲。</small></span><i>›</i></button><button data-workspace-choice="weekly" aria-pressed="false"><img src="assets/report.svg" alt=""><span><b>研究周报</b><small>汇总发现、出处与待验证问题。</small></span><i>›</i></button></div></dialog>
+<dialog id="workspace-document" aria-labelledby="workspace-document-title"><h2 id="workspace-document-title"></h2><p class="muted">通用演示文稿 · 合成内容</p><p id="workspace-document-copy"></p><button class="button primary" id="workspace-document-close">返回原对话</button></dialog>
+<script src="story.js"></script>
+<script src="workspace-preview.js"></script>
+</body>
+</html>

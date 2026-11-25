@@ -1,0 +1,11 @@
+node_modules
+lib/
+preview/preview.js
+.deploy-tmp/
+artifacts/
+.env
+.env.*
+*.tgz
+screenshots/*
+!screenshots/superhub/
+!screenshots/superhub/*.png

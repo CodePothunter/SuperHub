@@ -1,0 +1,169 @@
+import { useContext, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { type ChatMessage, type DiscussionResult, useChat } from './api.ts'
+import type { SuperhubSurface } from '../core/workspace-product.ts'
+import { DiscussionReply, RoomReceipts } from './chat.tsx'
+import { Markdown } from './markdown.tsx'
+import { V2Client } from './workspace-v2-api.ts'
+import { Issue, readableTime, V2Dialog } from './workspace-v2-elements.tsx'
+import { ChatAvatar, chatAvatarStyle, usePortraitArrivals } from './workspace-chat-avatar.tsx'
+import { liaisonPortrait, ownerPortrait } from '../core/workspace-avatars.ts'
+import { hasPublicReply, liaisonNotice } from '../core/liaison-unread.ts'
+import type { ChatView } from '../dsh/chat.ts'
+import { useMarkLiaisonSeen } from './workspace-liaison-unread.tsx'
+import { ChatComposer, MessageInputAttachments, useChatAttachments } from './chat-attachments.tsx'
+
+interface Links {
+  openProfileImport: (id: string) => void
+  openRoom?: (id: string) => void
+  openWorkspace: (id: string) => void
+  openDelegation?: (workspaceId: string, delegationId: string) => void
+}
+interface Props extends Links {
+  scope: string; surface: SuperhubSurface; selectedId?: string; sessionId?: string; workOrderId?: string; changed: () => void; close: () => void
+  workspace?: { id: string; name: string }
+  pending?: ReactNode
+}
+
+const style = `
+.wv2 .v2-liaison-history { max-height:46dvh; overflow:auto; overscroll-behavior:contain; padding:2px; scrollbar-gutter:stable; }
+.wv2 .v2-liaison .v2-turns { margin:3px 0 10px; }
+.wv2 .v2-liaison .v2-compose { margin:13px 0 0; }
+.wv2 .v2-liaison .wr-room-receipts { display:flex; flex-wrap:wrap; gap:3px 10px; }
+.wv2 .v2-liaison .wr-room-receipts button { color:var(--v-green); font-weight:650; text-align:left; min-height:34px; }
+.wv2 .v2-liaison .wr-room-receipts button { display:flex; align-items:center; gap:5px; }
+.wv2 .v2-liaison .wr-room-receipts small { margin-inline-end:4px; }
+.wv2 .v2-liaison .v2-notice-text { margin:0; white-space:pre-wrap; overflow-wrap:anywhere; }
+.wv2 .v2-liaison .v2-notice-status { display:block; color:var(--v-muted); font-size:13px; margin-top:4px; }
+.wv2 .v2-liaison .v2-turn.settled .v2-notice-text { color:var(--v-muted); }
+`
+
+const speechId = (m: Pick<ChatMessage, 'role' | 'seq' | 'firstSeq'>) => m.role + '-' + (m.firstSeq ?? m.seq)
+type LiaisonSpeech = Pick<ChatMessage, 'role' | 'time' | 'text' | 'discussions' | 'workspaces' | 'profileImports' | 'inputAttachments'>
+type ChatNotice = ChatView['notices'][number]
+
+/** A reminder the liaison sends on its own (an order completed, waits for the owner, or stopped short), as one of its turns. */
+function NoticeBody({ notice, openRoom, openDelegation }: Pick<Links, 'openRoom' | 'openDelegation'> & { notice: ChatNotice }) {
+  return <>
+    <p className="v2-notice-text">{notice.text}</p>
+    {notice.status && <small className="v2-notice-status">{notice.status}</small>}
+    {notice.order && openDelegation && <button type="button" className="v2-link" onClick={() => openDelegation(notice.order!.workspaceId, notice.order!.orderId)}>打开工单</button>}
+    {notice.roomId && openRoom && <button type="button" className="v2-link" onClick={() => openRoom(notice.roomId!)}>打开讨论</button>}
+  </>
+}
+
+function LiaisonTurn({ message, result, notice, id, scope, sessionId, openProfileImport, openRoom, openWorkspace, openDelegation }: Links & { id?:string; scope: string; sessionId?: string; message: LiaisonSpeech; result?: DiscussionResult; notice?: ChatNotice }) {
+  const mine = message.role === 'you'
+  const at = new Date(message.time).toISOString()
+  return <li data-message-id={id} className={'v2-turn' + (mine ? ' mine' : '') + (notice?.done ? ' settled' : '')}>
+    <ChatAvatar portrait={mine ? ownerPortrait : liaisonPortrait}/>
+    <div className="v2-message"><div className="v2-byline"><strong>{mine ? '我' : '接口人'}</strong><time dateTime={at}>{readableTime(at)}</time></div>
+      <div className="v2-bubble">
+        {notice && <NoticeBody notice={notice} openRoom={openRoom} openDelegation={openDelegation}/>}
+        {result && <DiscussionReply result={result} open={openRoom} className="v2-markdown"/>}
+        {message.text && <Markdown text={message.text} className="v2-markdown"/>}
+        <MessageInputAttachments scope={scope} target={sessionId ? {sessionId} : undefined} attachments={message.inputAttachments}/>
+        <RoomReceipts discussions={message.discussions} open={openRoom}/>
+        {message.workspaces?.map(({id, name, delegationId, delegationTitle}) =>
+          delegationId && openDelegation ? <button key={id + '/' + delegationId} className="v2-link" onClick={() => openDelegation(id, delegationId)}>
+            {delegationTitle ? '打开工单「' + delegationTitle + '」' : '打开工单'}</button>
+            : <button key={id} className="v2-link" onClick={() => openWorkspace(id)}>打开工作区「{name}」</button>)}
+        {message.profileImports?.map(({importId}) => <button type="button" key={importId} className="v2-link" onClick={() => openProfileImport(importId)}>核对资料</button>)}
+      </div>
+    </div>
+  </li>
+}
+
+export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, openWorkspace, openDelegation, workspace, surface, selectedId, sessionId, workOrderId, changed, pending }: Props) {
+  const { revoke } = useContext(V2Client)
+  const chat = useChat(changed, scope, revoke)
+  const key = 'superhub-v2:draft:' + scope + ':liaison:' + (['people','calendar'].includes(surface) ? surface + ':' + (selectedId ?? '') : workspace?.id ?? '')
+  const [draft, setDraft] = useState(() => { try { return sessionStorage.getItem(key) ?? '' } catch { return '' } })
+  const latestDraft = useRef(draft)
+  latestDraft.current = draft
+  const destination = JSON.stringify([key, sessionId, workOrderId, chat.sessionId])
+  const files = useChatAttachments(scope, chat.sessionId ? {sessionId:chat.sessionId} : undefined, destination, revoke)
+  const openDestination = useRef<string | undefined>(destination)
+  useLayoutEffect(() => {
+    openDestination.current = destination
+    return () => { openDestination.current = undefined }
+  }, [destination])
+  const [sending, setSending] = useState(false)
+  const [delivered, setDelivered] = useState(false)
+  const active = useRef(false)
+  const history = useRef<HTMLDivElement>(null)
+  const following = useRef(true)
+  const messages = chat.messages.filter(hasPublicReply)
+  const live = chat.live
+  const livePublic = live && hasPublicReply(live)
+  const liveId = live?.firstSeq !== undefined ? 'liaison-' + live.firstSeq : undefined
+  const results = chat.discussionResults ?? []
+  const notices = chat.notices.filter(liaisonNotice)
+  const feed: { id: string | undefined; message: LiaisonSpeech; result?: DiscussionResult; notice?: ChatNotice }[] = messages.map(message => ({ id: speechId(message), message }))
+  for (const result of results) feed.push({ id: result.id, result, message: { role: 'liaison', text: '', time: Date.parse(result.at) } })
+  for (const notice of notices) feed.push({ id: 'notice-' + notice.key, notice, message: { role: 'liaison', text: '', time: Date.parse(notice.at) } })
+  if (live && livePublic) feed.push({ id: liveId, message: { ...live, role: 'liaison', time: live.firstSpokenAt ?? live.since } })
+  feed.sort((a, b) => a.message.time - b.message.time)
+  const timeline = chat.confirmedMessages.filter(hasPublicReply)
+    .map(m => ({id:speechId(m), at:m.time}))
+  for (const result of results) timeline.push({ id: result.id, at: Date.parse(result.at) })
+  for (const notice of notices) timeline.push({ id: 'notice-' + notice.key, at: Date.parse(notice.at) })
+  if (liveId && livePublic) timeline.push({id:liveId, at:live!.firstSpokenAt ?? live!.since})
+  usePortraitArrivals(history, chat.sessionId, timeline, chat.observedAt)
+  useLayoutEffect(() => {
+    const element = history.current
+    if (element && following.current) element.scrollTop = element.scrollHeight
+  }, [messages.length, messages.at(-1)?.seq, results.length, results.at(-1)?.id, notices.length, notices.at(-1)?.key, live?.text, live?.discussions?.length, live?.workspaces?.length, live?.profileImports?.length])
+  // What the owner sees here is read: on opening, and whenever the newest message (or a reminder) changes.
+  // A reply still being written is not counted as unread, so it is marked when it lands.
+  useMarkLiaisonSeen(chat.observedAt, feed.filter(row => !live || row.id !== liveId).map(row => row.id + (row.notice?.done ? '!' : '')).join('|'))
+
+  function edit(value: string) {
+    setDraft(value)
+    setDelivered(false)
+    try { if (value) sessionStorage.setItem(key, value); else sessionStorage.removeItem(key) } catch { /* The draft remains in this window. */ }
+  }
+  async function send() {
+    if (active.current || !chat.sessionId || !files.canSend(draft)) return
+    active.current = true
+    setSending(true)
+    setDelivered(false)
+    following.current = true
+    try {
+      if (await chat.say(draft, 'auto', {surface, ...(selectedId && {selectedId}),
+        ...(surface === 'workspace' && sessionId && {sessionId, ...(workOrderId && {workOrderId})})}, files.ready)) {
+        if (openDestination.current !== destination) {
+          try { if (sessionStorage.getItem(key) === draft) sessionStorage.removeItem(key) } catch { /* Optional in embedded hosts. */ }
+          return
+        }
+        if (draft && latestDraft.current.startsWith(draft)) edit(latestDraft.current.slice(draft.length).trimStart())
+        files.sent()
+        setDelivered(true)
+      }
+    } finally {
+      active.current = false
+      setSending(false)
+    }
+  }
+
+  return <V2Dialog title="接口人" meta={workspace?.name} close={close}>
+    <style>{style + chatAvatarStyle}</style><div className="v2-liaison">
+      {pending && <div className="v2-liaison-actions">{pending}</div>}
+      <div className="v2-liaison-history" ref={history} onScroll={event => {
+        const el = event.currentTarget
+        following.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60
+      }}>
+        {feed.length > 0 && <ol className="v2-turns" aria-label="接口人对话">
+          {feed.map(({ id, message, result, notice }) => <LiaisonTurn key={id ?? 'liaison-live'} id={id} scope={scope} sessionId={chat.sessionId} message={message} result={result} notice={notice} openProfileImport={openProfileImport} openRoom={openRoom} openWorkspace={openWorkspace} openDelegation={openDelegation}/>)}
+        </ol>}
+      </div>
+      <form className="v2-compose" onSubmit={event => { event.preventDefault(); void send() }}>
+        <ChatComposer draft={files} text={draft} sending={sending} disabled={!chat.sessionId}
+          status={chat.busy ? '正在等待接口人回复…' : delivered && !draft && !files.items.length ? '已送达接口人' : !chat.sessionId && !chat.error ? '正在连接接口人…' : ''}>
+          <textarea rows={1} aria-label="对接口人说" maxLength={40_000} value={draft} placeholder="你想交办什么事？" onChange={event => edit(event.target.value)}
+            onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }}/>
+        </ChatComposer>
+        <Issue text={chat.error} retry={chat.refresh}/>
+      </form>
+    </div>
+  </V2Dialog>
+}

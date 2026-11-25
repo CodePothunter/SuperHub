@@ -1,0 +1,7 @@
+SuperHub includes adapted DS Bot theme and interface surface rules.
+DS Bot: Copyright 2026 Fei2411 and the DS Bot contributors, Apache-2.0.
+See third_party/DS-Bot/NOTICE and third_party/DS-Bot/LICENSE.
+
+The server bundle includes ical.js 2.2.1 under MPL-2.0.
+Source: https://github.com/kewisch/ical.js/tree/v2.2.1
+See third_party/ical.js/LICENSE.

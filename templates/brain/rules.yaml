@@ -1,0 +1,25 @@
+# 时钟规则：到点产生一条事件，交给研判官研判（时区见作战台"设置"）。
+# when 写法：daily HH:MM / weekdays HH:MM / weekly sun HH:MM（可写 mon,thu）/ every 30m
+# 不想要某条规则时写 enabled: false。也可以直接跟接口人说"把早报改到 9 点"。
+
+# level=write 的工单只能修改这些工作区（例如你的代码仓库）。相对路径以第二大脑为根。
+workspaces: []
+
+rules:
+  - id: morning-brief
+    when: weekdays 08:30
+    text: >-
+      早报。对照 goals.md、在办工单和最近两天的 journal，写出今天最重要的 3 件事、
+      需要找谁确认什么、以及一个今天值得学的东西。交给研究员，产出 brief.md，不需要我验收。
+
+  - id: evening-review
+    when: weekdays 21:30
+    text: >-
+      晚间复盘。整理今天各工单的产出与主人的投递，写进当天 journal：做成了什么、卡在哪里、
+      明天第一件事。由书记官用 note 记录即可，不必开工单。
+
+  - id: weekly-dream
+    when: weekly sun 20:00
+    text: >-
+      每周整理（dreaming）。由书记官回顾本周 journal、结束的工单和 decisions，找出过时、矛盾或缺失的长期知识，
+      以及 goals.md 中"本周"一节的更新建议，写成 proposal.md 交主人验收。只提案，不直接修改。

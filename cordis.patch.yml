@@ -1,0 +1,15 @@
+# SuperHub 组合包层：挂载幕僚团插件。
+# 设置（第二大脑的位置、时区、手机访问等）不在这里：第一次打开作战台时接口人会问，之后在作战台的"设置"里改。
+- insert:
+    - id: dsh-chief
+      name: dsh-chief
+
+# Native DSH services own Team membership, peer inboxes, shared tasks and continuations.
+- insert:
+    - id: agent-team
+      name: '@deepseek-ai/dsh-experimental-agent-team'
+    - id: tool-agent-team
+      name: '@deepseek-ai/dsh-experimental-tool-agent-team'
+      config:
+        freshProvider: spawn
+        forkProvider: fork

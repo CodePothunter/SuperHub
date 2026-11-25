@@ -1,0 +1,11 @@
+# 工作电脑队列只留在本机，不进 git
+ops/remote/
+ops/.chief.lock
+# 外部助手的原文与待核对条目只留在本机
+ops/profile-imports/
+# 聊天附件的本地访问记录
+ops/chat-input-attachments/
+ops/legacy-order-cleanup/
+ops/legacy-order-cleanup.pending
+*.tmp
+.DS_Store
