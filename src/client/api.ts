@@ -8,6 +8,8 @@ import { reconcilePending, type PendingMessage } from './chat-state.ts'
 import type { WarroomState } from '../dsh/view.ts'
 import type { IntakeReceipt } from '../dsh/superhub.ts'
 import { pendingIntent } from './request-id.ts'
+import { speechCursor } from '../core/paging.ts'
+import { appendNewer, emptyPaged, isPageInfo, mergeTail, pageParams, prependOlder, type EdgeState, type Paged, type PageCursor } from './paged-history.ts'
 
 export type { TicketCard, WarroomState } from '../dsh/view.ts'
 export type { CommitmentRow, LineRow, MeetingRow, PersonRow, PocState } from '../dsh/poc-view.ts'
@@ -115,9 +117,22 @@ import type { ChatMessage, ChatView } from '../dsh/chat.ts'
 /**
  * 和接口人的对话：处理中每 1.5 秒看一次，平时 6 秒。
  * 发出的话先乐观显示；接口人处理完（busy 由真变假）时调用 onSettled，让台面跟着刷新。
+ * 历史分页：轮询只取最近一页并与已加载的部分合并，`loadOlder` 按游标补更早的一页（见 paged-history.ts）。
+ * `following` 说明界面是否停在底部：两次轮询之间新增超过一页时，停在底部就换成最新一页，否则保留阅读位置。
  */
-export function useChat(onSettled: () => void, scope?: string, onDenied?: (message: string) => void) {
+export function useChat(onSettled: () => void, scope?: string, onDenied?: (message: string) => void, following?: () => boolean) {
   const [view, setView] = useState<ChatView>({ messages: [], busy: false, notices: [] })
+  const [paged, setPaged] = useState<Paged<ChatMessage>>(emptyPaged)
+  const pagedRef = useRef(paged)
+  const [edges, setEdges] = useState<{ older: EdgeState; olderError?: string; newer: EdgeState; newerError?: string }>({ older: 'idle', newer: 'idle' })
+  const edgeBusy = useRef({ older: false, newer: false })
+  /** 整体替换已加载范围时加一，旧范围上发出的翻页结果作废。 */
+  const epoch = useRef(0)
+  /** 下一次轮询的结果整体替换已加载的范围（回到最新；读到之前照旧显示，不闪空）。 */
+  const replaceNext = useRef(false)
+  const followRef = useRef(following)
+  followRef.current = following
+  const updatePaged = (next: Paged<ChatMessage>) => { pagedRef.current = next; setPaged(next) }
   const [tick, setTick] = useState(0)
   const [pending, setPending] = useState<PendingMessage[]>([])
   const pendingRef = useRef<PendingMessage[]>([])
@@ -135,27 +150,39 @@ export function useChat(onSettled: () => void, scope?: string, onDenied?: (messa
   const knownScope = useRef(scope)
   knownScope.current = scope
   const updatePending = (next: PendingMessage[]) => { pendingRef.current = next; setPending(next) }
+  const read = useCallback(async (cursor?: PageCursor) => {
+    const next = await api<ChatView>('/chat?' + new URLSearchParams([...scope ? [['scope', scope]] : [], ...new URLSearchParams(pageParams(cursor))]))
+    if (!next || !Array.isArray(next.messages) || !Array.isArray(next.notices) || (scope && !next.sessionId) || (next.page !== undefined && !isPageInfo(next.page))
+      || next.messages.some(row => !row || row.inputAttachments !== undefined && !(Array.isArray(row.inputAttachments) && row.inputAttachments.every(isChatInputAttachment)))) {
+      throw new Error('主机未返回完整的接口人会话，请重新读取。')
+    }
+    return next
+  }, [scope])
   const poll = useCallback(async () => {
     if (!mounted.current || scope !== knownScope.current) return
     clearTimeout(timer.current)
     const request = ++pollId.current
     let busy = wasBusy.current
     try {
-      const next = await api<ChatView>(scope ? `/chat?${new URLSearchParams({ scope })}` : '/chat')
+      const next = await read()
       if (request !== pollId.current) return
-      if (!next || !Array.isArray(next.messages) || !Array.isArray(next.notices) || (scope && !next.sessionId)
-        || next.messages.some(row => !row || row.inputAttachments !== undefined && !(Array.isArray(row.inputAttachments) && row.inputAttachments.every(isChatInputAttachment)))) {
-        throw new Error('主机未返回完整的接口人会话，请重新读取。')
-      }
       if (session.current && next.sessionId && session.current !== next.sessionId) {
         sequence.current = -1
         sendIds.current.clear()
         updatePending([])
+        epoch.current++
+        updatePaged(emptyPaged())
       }
       session.current = next.sessionId
       loaded.current = true
       sequence.current = next.messages.reduce((seq, m) => Math.max(seq, m.seq), sequence.current)
-      updatePending(reconcilePending(pendingRef.current, next.messages))
+      const replace = replaceNext.current
+      replaceNext.current = false
+      const merged = mergeTail(replace ? emptyPaged<ChatMessage>() : pagedRef.current, next.messages, next.page, speechCursor, followRef.current?.() ?? true)
+      const first = (items: ChatMessage[]) => items[0] && speechCursor(items[0])
+      if (merged.items.length < pagedRef.current.items.length || first(merged.items) !== first(pagedRef.current.items)) epoch.current++
+      updatePaged(merged)
+      updatePending(reconcilePending(pendingRef.current, merged.items))
       busy = next.busy || pendingRef.current.length > 0
       setView(next); setError(sendError.current)
       if (wasBusy.current && !busy) onSettled()
@@ -169,7 +196,50 @@ export function useChat(onSettled: () => void, scope?: string, onDenied?: (messa
       setError((e as Error).message)
     }
     if (document.visibilityState === 'visible') timer.current = setTimeout(() => { void poll() }, busy ? 1000 : 6000)
-  }, [onSettled, scope, onDenied])
+  }, [onSettled, scope, onDenied, read])
+  /** 往上补更早的一页，或在没接到最新时往下补一页。`beforeApply` 在写入前调用（记下阅读位置）。 */
+  const edge = useCallback(async (side: 'older' | 'newer', beforeApply?: () => void) => {
+    const state = pagedRef.current
+    const item = side === 'older' ? state.items[0] : state.items.at(-1)
+    if (!item || edgeBusy.current[side] || !mounted.current || (side === 'older' ? !state.hasOlder : !state.hasNewer)) return
+    const round = epoch.current, owner = session.current
+    edgeBusy.current[side] = true
+    setEdges(previous => ({ ...previous, [side]: 'loading', [side + 'Error']: undefined }))
+    let outcome: EdgeState = 'idle', message: string | undefined
+    try {
+      const cursor = speechCursor(item)
+      const next = await read(side === 'older' ? { before: cursor } : { after: cursor })
+      if (!mounted.current || round !== epoch.current || next.sessionId !== owner) return
+      if (next.page) {
+        beforeApply?.()
+        const merged = side === 'older' ? prependOlder(pagedRef.current, next.messages, next.page, speechCursor) : appendNewer(pagedRef.current, next.messages, next.page, speechCursor)
+        updatePaged(merged)
+        updatePending(reconcilePending(pendingRef.current, merged.items))
+      }
+    } catch (e) {
+      if (!mounted.current || round !== epoch.current) return
+      if (e instanceof ApiError && e.status === 410) {
+        // 边上那条消息已不可用：从最新一页重新开始。
+        epoch.current++
+        replaceNext.current = true
+        void poll()
+        return
+      }
+      if (onDenied && e instanceof ApiError && [401, 403, 409].includes(e.status)) { onDenied(e.message); return }
+      outcome = 'error'; message = (e as Error).message
+    } finally {
+      edgeBusy.current[side] = false
+      if (mounted.current) setEdges(previous => ({ ...previous, [side]: outcome, [side + 'Error']: message }))
+    }
+  }, [read, poll, onDenied])
+  const loadOlder = useCallback((beforeApply?: () => void) => edge('older', beforeApply), [edge])
+  const loadNewer = useCallback((beforeApply?: () => void) => edge('newer', beforeApply), [edge])
+  /** 回到最新一页。 */
+  const toLatest = useCallback(async () => {
+    epoch.current++
+    replaceNext.current = true
+    await poll()
+  }, [poll])
   useEffect(() => { if (!view.busy && !pending.length) return; const t = setInterval(() => setTick(n => n + 1), 1000); return () => clearInterval(t) }, [view.busy, pending.length])
   useEffect(() => {
     mounted.current = true
@@ -214,10 +284,13 @@ export function useChat(onSettled: () => void, scope?: string, onDenied?: (messa
     }
     void poll(); return true
   }, [poll, scope, onDenied])
-  const visiblePending = pending.length ? reconcilePending(pending, view.messages) : pending
-  const messages: ChatMessage[] = [...view.messages, ...visiblePending.map(p => ({ seq: Number.MAX_SAFE_INTEGER - p.id, role: 'you' as const, text: p.text, time: p.time,
+  const visiblePending = pending.length ? reconcilePending(pending, paged.items) : pending
+  // 往上翻阅（没接到最新）时，还没确认的发言等回到最新时再显示在末尾。
+  const messages: ChatMessage[] = [...paged.items, ...paged.hasNewer ? [] : visiblePending.map(p => ({ seq: Number.MAX_SAFE_INTEGER - p.id, role: 'you' as const, text: p.text, time: p.time,
     ...(p.inputAttachments && {inputAttachments:p.inputAttachments}) }))]
-  return { sessionId: view.sessionId, messages, confirmedMessages: view.messages, observedAt: view.observedAt, notices: view.notices,
+  return { sessionId: view.sessionId, messages, confirmedMessages: paged.items, observedAt: view.observedAt, notices: view.notices,
     workReplies: view.workReplies, ...(view.discussionResults && { discussionResults: view.discussionResults }),
-    live: view.live, busy: view.busy || pending.length > 0, error, say, refresh: poll, tick }
+    live: view.live, busy: view.busy || pending.length > 0, error, say, refresh: poll, tick,
+    hasOlder: paged.hasOlder, hasNewer: paged.hasNewer, loadOlder, loadNewer, toLatest,
+    loadingOlder: edges.older === 'loading', olderError: edges.olderError, loadingNewer: edges.newer === 'loading', newerError: edges.newerError }
 }

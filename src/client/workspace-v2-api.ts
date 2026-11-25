@@ -3,6 +3,7 @@ import { api, ApiError } from './api.ts'
 import { pendingIntent } from './request-id.ts'
 import { hubRead, type Scoped } from './superhub-api.ts'
 import { hasMutationObject } from './workspace-v2-response.ts'
+import { usePagedHistory, type PagedView } from './paged-history.ts'
 
 export const V2_ROOT = '/v2/workspaces'
 export const segment = encodeURIComponent
@@ -68,6 +69,31 @@ export function useV2Read<T extends Scoped>(resource: string | undefined, valid:
     return () => { stopped = true; clearTimeout(timer) }
   }, [key, refresh, interval, revision])
   return { data: state?.key === key ? state?.data : undefined, error: state?.key === key ? state?.error : undefined, refresh }
+}
+
+/**
+ * A paged conversation read (see paged-history.ts): the newest page, or the page around `anchor`, polled every `interval`;
+ * older and newer pages on demand. Denied or switched brains revoke like `useV2Read`; a missing object clears the view.
+ */
+export function useV2PagedRead<V extends Scoped & PagedView<T>, T extends { id: string }>(resource: string | undefined,
+  valid: (value: Scoped, resource: string) => value is V,
+  options: { interval?: number; anchor?: string; following?: () => boolean; combine?: (previous: V | undefined, next: V) => V } = {}) {
+  const { scope, revoke } = useContext(V2Client)
+  const read = useCallback(async (query: string) => {
+    if (!resource) throw new Error('没有可读的对话')
+    const data = await hubRead<Scoped>(scope, scopedResource(scope, resource + '?' + query))
+    if (!valid(data, resource)) throw new Error('工作区返回的内容不完整，请重新读取。')
+    return data
+  }, [scope, resource, valid])
+  return usePagedHistory<V, T>({
+    key: resource && scope + '\n' + resource, read, id: item => item.id, ...options,
+    failed: error => {
+      const status = error instanceof ApiError ? error.status : undefined
+      if (status === 401 || status === 403 || status === 409) { revoke(messageOf(error)); return 'stop' }
+      return status === 404 ? 'clear' : 'keep'
+    },
+    message: messageOf,
+  })
 }
 
 export function useV2Write(validReceipt = hasMutationObject, persistIntent = true) {

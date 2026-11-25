@@ -135,6 +135,8 @@ export function isSessionView(value: Scoped, resource: string): value is Session
     && (value.portraits === undefined || isSpeakerPortraits(value.portraits))
     && (value.working === undefined || typeof value.working === 'boolean')
     && (value.waiting === undefined || record(value.waiting) && strings(value.waiting, 'sessionId', 'title') && optionalText(value.waiting.workOrderId))
+    && (value.page === undefined || record(value.page) && typeof value.page.older === 'boolean' && typeof value.page.newer === 'boolean')
+    && (value.pinned === undefined || Array.isArray(value.pinned) && value.pinned.every(message))
 }
 export function isAttachmentView(value: Scoped, resource: string): value is FileView {
   if (!record(value) || !record(value.attachment) || !fileRef(value.attachment)) return false

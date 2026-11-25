@@ -1,3 +1,4 @@
+import type { PageInfo } from './paging.ts'
 import type { EngagementReporting } from './workspace-engagement.ts'
 import type { SpeakerPortraits } from './workspace-avatars.ts'
 import type { ChatInputAttachment } from './chat-attachments.ts'
@@ -245,6 +246,21 @@ export interface V2Transcript {
   working?: boolean
   /** The next turn of this session waits for another turn in the same project directory; owner words join it. */
   waiting?: V2DirectoryWait
+  /** Present on a paged read (`limit`/`before`/`after`/`around`): whether messages exist before / after this window. */
+  page?: PageInfo
+  /**
+   * On a paged read: messages outside this window whose choices still wait for the owner (see `awaitingChoice`), so a
+   * pending choice is never hidden by paging. Absent when there are none.
+   */
+  pinned?: V2Message[]
+}
+/** A liaison message whose choices still wait for the owner: none taken yet, and more than an optional undo. */
+export const awaitingChoice = (actions: readonly V2MessageAction[] | undefined) =>
+  !!actions?.length && !actions.some(action => action.done) && actions.some(action => action.kind !== 'reopen')
+/** Messages of `all` outside the returned window with choices still waiting for the owner. */
+export function pinnedOutside<T extends Pick<V2Message, 'id' | 'actions'>>(all: readonly T[], window: readonly T[]): T[] {
+  const shown = new Set(window.map(message => message.id))
+  return all.filter(message => !shown.has(message.id) && awaitingChoice(message.actions))
 }
 export interface V2WorkspaceView {
   scope: string

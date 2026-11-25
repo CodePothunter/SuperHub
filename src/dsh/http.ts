@@ -28,6 +28,7 @@ import type { commandApprovals } from './approvals.ts'
 import type { SuperhubIntake } from './superhub.ts'
 import type { Llm } from './ports.ts'
 import { canonicalSelection, modelCatalog } from './models.ts'
+import { pageQuery } from '../core/paging.ts'
 
 export const API_PREFIX = '/chief/api'
 const MAX_BODY = 256 * 1024
@@ -263,7 +264,7 @@ export function runtimeRoutes(deps: StateDeps & { requestRoomExecution?: Request
         return content === undefined ? json(res, 404, { error: '文件不可读' }) : json(res, 200, { content }), true
       }
       if (seg[0] === 'tickets' && seg[1] && seg[2] === 'document') return json(res, 200, documentView(deliveryDocument(engine, brain, seg[1], url.searchParams.get('path') ?? '', url.searchParams.get('version') || undefined))), true
-      if (path === '/chat') return json(res, 200, await deps.chat.view()), true
+      if (path === '/chat') return json(res, 200, await deps.chat.view(pageQuery(url.searchParams))), true
       // 「一句话交办」的红点：上次看过之后接口人的新消息数（网页与手机共用服务端的已读点）
       if (path === '/chat/unread' && deps.liaisonSeen) {
         deps.superhub?.checkScope(url.searchParams.get('scope'))

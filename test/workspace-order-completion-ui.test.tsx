@@ -1,5 +1,6 @@
 import { renderToStaticMarkup } from 'react-dom/server'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { pagedReadsFromV2Read } from './paged-read-mock.ts'
 import type { V2Delegation, V2Message, V2Session, V2WorkspaceView } from '../src/core/workspace-v2.ts'
 import type { Scoped } from '../src/client/superhub-api.ts'
 import * as api from '../src/client/workspace-v2-api.ts'
@@ -32,6 +33,7 @@ function mockReads(messages: V2Message[]) {
 const page = (job: V2Delegation) => renderToStaticMarkup(<WorkOrderPage job={job} view={view(job)} base="/v2/workspaces/w"
   back={vi.fn()} open={vi.fn()} openOrder={vi.fn()} target={vi.fn()} newOrder={vi.fn()} popup={vi.fn()} changed={async () => {}} initialWide/>)
 afterEach(() => vi.restoreAllMocks())
+beforeEach(() => pagedReadsFromV2Read())
 
 describe('收单的对话与工单页', () => {
   it('marks held words and offers the liaison\'s two choices as keyboard buttons', () => {

@@ -3,7 +3,7 @@ import type { SavedOrderResults } from '../core/workspace-notices.ts'
 import type { ChatInputAttachment } from '../core/chat-attachments.ts'
 import type { ChatAttachments } from './chat-attachments.ts'
 import type { V2Attachment } from '../core/workspace-v2.ts'
-import { LIAISON_AUTHOR, WORKSPACE_ARCHIVED, messageWorkOrder, orderEnded, workspaceArchived, type V2CodingPermission, type V2Delegation, type V2Delivery, type V2DialogueSource, type V2DirectoryWait, type V2Executor, type V2Interjection, type V2Message, type V2PendingApproval, type V2PermissionChange, type V2Session, type V2SteerOutcome, type V2Transcript, type V2WorkDirectory } from '../core/workspace-v2.ts'
+import { LIAISON_AUTHOR, WORKSPACE_ARCHIVED, awaitingChoice, messageWorkOrder, pinnedOutside, orderEnded, workspaceArchived, type V2CodingPermission, type V2Delegation, type V2Delivery, type V2DialogueSource, type V2DirectoryWait, type V2Executor, type V2Interjection, type V2Message, type V2PendingApproval, type V2PermissionChange, type V2Session, type V2SteerOutcome, type V2Transcript, type V2WorkDirectory } from '../core/workspace-v2.ts'
 import { json, type Route } from './http.ts'
 import { workspaceError, workspaceFingerprint } from './superhub-goals.ts'
 import { INTERJECTION_UNKNOWN, UNKNOWN_TURN, WorkspaceV2Store, commandText, mutationKey, assignmentTurn, isRosterGroup, type AcceptanceOutcome, type AssignmentStart, type EngagementJob, type GroupStart, type Mutation, type OwnerCommand } from './workspace-v2-store.ts'
@@ -32,6 +32,7 @@ import { fileVersion, groupResults, WorkspaceResultNotices, type GroupResultLine
 import { directoryLocks, type DirectoryHolder, type DirectoryLocks } from './directory-locks.ts'
 import { directoryKey } from './project-directory.ts'
 import { commandExperienceEvidence, verifyCommandExperience } from './workspace-experience-evidence.ts'
+import { pageQuery, pageWindow, type PageQuery } from '../core/paging.ts'
 
 /** Owner approvals of the command gate (pending cards and decisions). */
 export interface WorkspaceApprovals {
@@ -313,9 +314,9 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     if (memberId === LIAISON_MEMBER_ID) return liaisonSpeakerId(lead)
     return workspaceSpeakerId(lead, 'staff', memberId)
   }
-  function groupMessages(session: V2Session, engine: GroupEngine): GroupMessage[] {
+  function groupMessages(session: V2Session, engine: GroupEngine, lines: readonly GroupLine[] = engine.ledger.all()): GroupMessage[] {
     const members = engine.members().map(({id, name}) => ({id, name}))
-    return engine.ledger.all().map(line => {
+    return lines.map(line => {
       const mentions = line.kind !== 'event' && (line.mentions.length || line.all) ? mentionSegments(line.text, members) : undefined
       const deliveries = line.speakerId === OWNER_ID || line.inputAttachments?.length ? engine.deliveryOf(line.seq) : undefined
       return {
@@ -336,17 +337,26 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     return seq ? engine.ledger.get(Number(seq))?.attachments?.[Number(index)]?.path : undefined
   }
   /** The group's transcript with the board's held words and choices, like the other conversations. */
-  async function groupTranscript(session: V2Session): Promise<{transcript: V2Transcript & {messages: GroupMessage[]}; engine: GroupEngine}> {
+  async function groupTranscript(session: V2Session, paging?: PageQuery): Promise<{transcript: V2Transcript & {messages: GroupMessage[]}; engine: GroupEngine}> {
     const engine = await groupEngine(session)
     // A group opened read-only (archived workspace) gets nothing new; what was not posted goes in once it is restored.
     if (!engine.readOnly) for (const row of store.unpostedCommands()) if (row.workspaceId === session.workspaceId && row.sessionId === session.id) postGroupCommand(session, engine, row.requestId)
-    let messages = groupMessages(session, engine)
+    // A paged read projects only the lines of its window (the ledger is already in memory).
+    const window = paging && pageWindow(engine.ledger.all(), line => lineId(line.seq), paging)
     const choices = store.conversationChoices(session)
-    if (Object.keys(choices.held).length || Object.keys(choices.actions).length) messages = messages.map(message => {
+    const chosen = (messages: GroupMessage[]) => Object.keys(choices.held).length || Object.keys(choices.actions).length ? messages.map(message => {
       const held = choices.held[message.id], actions = message.role === 'agent' ? choices.actions[message.id] : undefined
       return held || actions ? {...message, ...(held && {held}), ...(actions && {actions})} : message
-    })
-    return {transcript: {messages}, engine}
+    }) : messages
+    const messages = chosen(groupMessages(session, engine, window?.items))
+    // Choices still waiting for the owner on lines outside the window come along, so paging never hides them.
+    const shown = new Set(messages.map(message => message.id))
+    const waiting = window ? Object.entries(choices.actions).flatMap(([id, actions]) => {
+      const line = !shown.has(id) && awaitingChoice(actions) ? engine.ledger.get(Number(/^g-(\d+)$/.exec(id)?.[1])) : undefined
+      return line ? [line] : []
+    }) : []
+    const pinned = waiting.length ? chosen(groupMessages(session, engine, waiting)).filter(message => awaitingChoice(message.actions)) : []
+    return {transcript: {messages, ...(window && {page: window.page}), ...(pinned.length && {pinned})}, engine}
   }
   function groupView(session: V2Session, engine: GroupEngine) {
     const view = engine.view()
@@ -1927,10 +1937,12 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       }
       if (child === 'sessions' && childId) {
         const session = store.session(workspaceId, childId)
+        // Paging (`limit`, `before`, `after`, `around`): one window of the ordered messages; without them, the whole transcript.
+        const paging = seg.length === 5 ? pageQuery(url.searchParams) : undefined
         if (seg.length === 5 && roster(session)) {
           const observedAt = Date.now()
-          const {transcript, engine} = await groupTranscript(session)
-          const portraits = store.speakerPortraits(workspaceId, childId, [...new Set([...transcript.messages.flatMap(m => m.speakerId ? [m.speakerId] : []),
+          const {transcript, engine} = await groupTranscript(session, paging)
+          const portraits = store.speakerPortraits(workspaceId, childId, [...new Set([...[...transcript.messages, ...transcript.pinned ?? []].flatMap(m => m.speakerId ? [m.speakerId] : []),
             ...engine.members().map(member => groupSpeaker(session, member.id))])], staff)
           const group = groupView(session, engine)
           return ok({ ...transcript, session: store.session(workspaceId, childId), portraits, observedAt, group,
@@ -1939,9 +1951,12 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         if (seg.length === 5) {
           const observedAt = Date.now()
           const transcript = await read(session)
-          const portraits = store.speakerPortraits(workspaceId, childId, transcript.messages.flatMap(m => m.speakerId ? [m.speakerId] : []),staff)
+          const window = paging && pageWindow(transcript.messages, message => message.id, paging)
+          const messages = window ? window.items : transcript.messages
+          const pinned = window ? pinnedOutside(transcript.messages, messages) : []
+          const portraits = store.speakerPortraits(workspaceId, childId, [...messages, ...pinned].flatMap(m => m.speakerId ? [m.speakerId] : []),staff)
           const flight = flights.get(childId)
-          return ok({ ...transcript, session: store.session(workspaceId, childId), portraits, observedAt, ...(flight && !flight.waiting && {working: true}),
+          return ok({ ...transcript, messages, ...(window && {page: window.page}), ...(pinned.length && {pinned}), session: store.session(workspaceId, childId), portraits, observedAt, ...(flight && !flight.waiting && {working: true}),
             ...(flight?.waiting && {waiting: waitingView(flight)}) })
         }
         if (seg.length === 6 && action === 'execution') {

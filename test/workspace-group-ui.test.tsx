@@ -1,6 +1,7 @@
 import { isValidElement, type ReactElement, type ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { pagedReadsFromV2Read } from './paged-read-mock.ts'
 import type { SpeakerPortraits } from '../src/core/workspace-avatars.ts'
 import type { V2Delegation, V2PendingApproval, V2Session, V2WorkspaceView } from '../src/core/workspace-v2.ts'
 import type { GroupMemberState } from '../src/dsh/workspace-v2.ts'
@@ -51,6 +52,7 @@ const sessionPath = '/v2/workspaces/w/sessions/g'
 const sessionView = { scope:'brain', session, messages:lines, portraits, observedAt:Date.parse('2026-11-24T08:06:00Z'), group, working:true }
 
 afterEach(() => vi.restoreAllMocks())
+beforeEach(() => pagedReadsFromV2Read())
 
 function mockReads(responses: Record<string, Scoped & Record<string, unknown>>) {
   vi.spyOn(api, 'useV2Read').mockImplementation((resource, valid) => {
@@ -162,6 +164,37 @@ describe('群聊对话', () => {
     expect(html).not.toMatch(/另一[个张]|当前不可读/)
     expect(render({sourceMessage:source.id, origin:order.id})).toContain('这条工单原话当前不可读')
     expect(render({session:{...session, closed:true}}, [item])).not.toContain('待你回应')
+  })
+
+  it('keeps questions and choices anchored outside the loaded pages at the end, and only inline once their message is loaded', () => {
+    const question = '哪位同事有最终签字权？'
+    const source = {...lines[2]!, text:question, mentions:undefined, workOrderId:undefined}
+    const item = {id:'question', workspaceId:'w', sessionId:'g', messageId:source.id, question, at, workspaceName:view.workspace.name, sessionTitle:session.title}
+    const note = {id:'g-9', seq:9, kind:'message' as const, role:'agent' as const, author:'接口人', speakerId:id('a'), at, workOrderId:'d', text:'这句话是要收单吗？',
+      actions:[{kind:'complete' as const, label:'确认收单'}, {kind:'forward' as const, label:'继续交给执行者', messageId:'g-8'}]}
+    // Only the newest page is loaded: the question's line and the liaison's note are further up.
+    pagedReadsFromV2Read({hasOlder:true})
+    mockReads({[sessionPath]: {...sessionView, messages:[lines[3]!], pinned:[note]}})
+    const partial = render({}, [item])
+    const block = partial.slice(partial.indexOf('等你处理'))
+    expect(partial).toMatch(/<\/ol><section class="v2-pending-elsewhere"/)
+    expect(block).toMatch(/data-pending-for="g-9".*这句话是要收单吗？.*定位到原话.*确认收单.*继续交给执行者/s)
+    expect(block).toMatch(/data-pending-for="g-3".*定位到原话.*待你回应.*哪位同事有最终签字权？.*答复<\/button>/s)
+    expect(partial.match(/待你回应/g)).toHaveLength(1)
+    // Everything loaded and nothing more to load: inline only, no block.
+    pagedReadsFromV2Read({hasOlder:true})
+    mockReads({[sessionPath]: {...sessionView, messages:[source, note, lines[3]!]}})
+    const loaded = render({}, [item])
+    expect(loaded).not.toContain('<section class="v2-pending-elsewhere"')
+    expect(loaded.match(/待你回应/g)).toHaveLength(1)
+    expect(loaded.match(/确认收单/g)).toHaveLength(1)
+    expect(loaded).toMatch(/data-message-id="g-3".*待你回应.*data-message-id="g-9".*确认收单/s)
+    // A stale pinned copy of a loaded message is not shown twice; a whole conversation has no block at all.
+    mockReads({[sessionPath]: {...sessionView, messages:[source, note, lines[3]!], pinned:[note]}})
+    expect(render({}, [item]).match(/确认收单/g)).toHaveLength(1)
+    pagedReadsFromV2Read()
+    mockReads({[sessionPath]: {...sessionView, messages:[lines[3]!], pinned:[note]}})
+    expect(render({}, [item])).not.toContain('<section class="v2-pending-elsewhere"')
   })
 
   it('reopens input files with the owning message’s order even when reading a different order in the same group', () => {
