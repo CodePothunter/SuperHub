@@ -1,4 +1,4 @@
-import type { V2Acceptance, V2Attachment, V2AttachmentRef, V2CommandRecord, V2Decision, V2Delegation, V2ExecutionView, V2Message, V2PendingApproval, V2PermissionChange, V2RunRecord, V2Session, V2SessionView, V2Workspace, V2WorkspaceView, WorkOrderOutput } from '../core/workspace-v2.ts'
+import type { V2Acceptance, V2Attachment, V2AttachmentRef, V2CommandRecord, V2Decision, V2Delegation, V2ExecutionView, V2Message, V2PendingApproval, V2PermissionChange, V2RunRecord, V2Session, V2SessionView, V2Workspace, V2WorkspaceView, WorkOrderOutput, WorkspaceOutput } from '../core/workspace-v2.ts'
 import type { MentionSegment } from '../core/mentions.ts'
 import { isChatInputAttachment } from '../core/chat-attachments.ts'
 import type { GroupDeliveryState, GroupMemberState, GroupMessage, GroupPauseState } from '../dsh/workspace-v2.ts'
@@ -234,6 +234,17 @@ export function isOrderOutputs(value: unknown, resource: string): value is Scope
     && sameOrderPath(resource, value.workspaceId, value.delegationId, '/outputs') && Array.isArray(value.outputs)
     && value.outputs.every(row => record(row) && strings(row, 'sessionId', 'messageId') && !!row.sessionId && !!row.messageId
       && fileRef(row.attachment) && !!row.attachment.id && !!row.attachment.label.trim())
+}
+
+/** `GET …/:w/outputs`: the workspace's delivered files, each with the orders (tags) and speakers that delivered it. */
+export function isWorkspaceOutputs(value: unknown, resource: string): value is Scoped & {workspaceId: string; outputs: WorkspaceOutput[]; issue?: string} {
+  const named = (row: unknown) => record(row) && strings(row, 'id', 'name') && !!row.id
+  return record(value) && typeof value.scope === 'string' && typeof value.workspaceId === 'string' && optionalText(value.issue)
+    && resource === '/v2/workspaces/' + encodeURIComponent(value.workspaceId) + '/outputs' && Array.isArray(value.outputs)
+    && value.outputs.every(row => record(row) && strings(row, 'key', 'label', 'at', 'sessionId', 'messageId')
+      && !!row.key && !!row.sessionId && !!row.messageId && fileRef(row.attachment) && !!row.attachment.id && !!String(row.label).trim()
+      && Array.isArray(row.orders) && row.orders.length > 0 && row.orders.every(order => record(order) && strings(order, 'id', 'title') && !!order.id)
+      && Array.isArray(row.deliveredBy) && row.deliveredBy.every(named))
 }
 
 /** `GET …/:w/directory?path=`: directories to offer while the owner types a project directory. */

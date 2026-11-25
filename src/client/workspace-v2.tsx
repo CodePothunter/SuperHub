@@ -17,6 +17,7 @@ import { WorkspaceProfileImports } from './workspace-profile-import.tsx'
 import { WorkspacePeople } from './workspace-people.tsx'
 import { WorkspaceCalendar } from './workspace-calendar.tsx'
 import { OrderOutputs } from './workspace-coding-delivery.tsx'
+import { OutputsBoard, RecentOutputs } from './workspace-outputs.tsx'
 import { OrderFollowup } from './workspace-followup.tsx'
 import { OrderExecution, OrderPermission, PendingCommandApprovals, usePendingApprovals } from './workspace-execution.tsx'
 import { DirectoryDialog, directoryText, ProjectDirectory } from './workspace-directory.tsx'
@@ -31,10 +32,10 @@ import { WorkspaceSettings } from './workspace-settings.tsx'
 import { WORKSPACE_V2_STYLE } from './workspace-v2-style.ts'
 
 interface Props { scope: string; native?: () => void; configure: boolean; reloadBrain: () => Promise<void> }
-type Place = { view: SuperhubSurface | 'profile'; workspace?: string; panel?: 'execution' | 'staff'; delegation?: string; session?: string; message?: string; item?: string; date?: string }
+type Place = { view: SuperhubSurface | 'profile'; workspace?: string; panel?: 'execution' | 'outputs' | 'staff'; delegation?: string; session?: string; message?: string; item?: string; date?: string }
 type Popup = 'new-space' | 'switch-space' | 'delegate' | 'new-session' | 'narrow' | 'cancel' | 'liaison' | 'import' | 'export'
 
-function readPlace(scope: string): Place {
+export function readPlace(scope: string): Place {
   if (!location.hash.startsWith('#v2?')) return { view: 'today' }
   const params = new URLSearchParams(location.hash.slice(4))
   if (params.get('scope') !== scope) return { view: 'today' }
@@ -44,7 +45,8 @@ function readPlace(scope: string): Place {
   if (view === 'settings') return {view,panel:staffPanel,item:staffPanel && id('item')}
   if (view === 'calendar') return {view,date:id('date')}
   if (view === 'people' || view === 'history' || view === 'profile') return {view,item:id('item')}
-  if (view === 'workspace') return {view,workspace:id('workspace'),panel:params.get('panel') === 'execution' ? 'execution' : staffPanel,item:staffPanel && id('item'),
+  const workPanel = params.get('panel') === 'execution' ? 'execution' : params.get('panel') === 'outputs' ? 'outputs' : staffPanel
+  if (view === 'workspace') return {view,workspace:id('workspace'),panel:workPanel,item:staffPanel && id('item'),
     delegation:id('order') ?? id('delegation'),session:id('session'),message:id('message')}
   return {view:'today',workspace:id('workspace')}
 }
@@ -171,6 +173,11 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
   }
   function newOrder(sessionId?: string, staff?: StaffMember) { setOrderStaff(staff); setOrderSession(sessionId); setPopup('delegate') }
   const staffPanel = place.panel === 'staff'
+  const outputsPanel = place.panel === 'outputs'
+  const openOutputs = () => go({view:'workspace',workspace:chosenId,panel:'outputs'})
+  // Outputs are re-read while an order can still deliver, and whenever the orders change (a turn spent, a new order).
+  const outputsFeed = {live: !archived && !!view?.orders.some(order => !orderEnded(order) && !order.paused),
+    revision: view?.orders.reduce((sum, order) => sum + order.remainingTurns + 1, 0)}
   const selecting = place.view === 'workspace' && !!workspace
   const reading = selecting && panel && !!place.session
   const liaisonSession = selecting && view?.sessions.find(s => s.id === (panel ? visibleSession : delegation?.sessionId))
@@ -245,6 +252,7 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
       {selecting && <nav className="v2-subnav" aria-label="工作区版面">
         <button aria-current={!place.panel ? 'page' : undefined} onClick={() => openWorkspace(chosenId)}><V2Icon name="work"/>概览</button>
         <button aria-current={panel ? 'page' : undefined} onClick={() => go({ view: 'workspace', workspace: chosenId, panel: 'execution' })}><V2Icon name="chat"/>执行</button>
+        <button aria-current={outputsPanel ? 'page' : undefined} onClick={openOutputs}><V2Icon name="box"/>产物</button>
         <button aria-current={staffPanel ? 'page' : undefined} onClick={() => go({view:'workspace',workspace:chosenId,panel:'staff'})}><V2Icon name="group"/>幕僚</button>
       </nav>}
       {selecting && archived && shown && <ArchivedBanner workspace={shown} restored={async () => { await reread(); setNotice('已恢复「' + shown.name + '」。') }}/>}
@@ -288,6 +296,7 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
             target={(id,orderId) => openSession(id,orderId)} newOrder={newOrder}
             back={() => go({ view: 'workspace', workspace: chosenId, panel: 'execution' }, 'session-' + place.session)}
             openDelegation={openDelegation} create={() => setPopup('new-session')} changed={current.refresh}/>
+            : outputsPanel ? <OutputsBoard key={view.workspace.id} base={base} feed={outputsFeed}/>
             : staffPanel ? <StaffBoard key={view.workspace.id+'/'+(place.item ?? 'list')} workspace={view} spaces={spaces} selected={place.item}
               select={item => go({view:'workspace',workspace:chosenId,panel:'staff',item})}
               openOrder={(workspace,delegation) => go({view:'workspace',workspace,delegation})}
@@ -301,6 +310,7 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
               popup={setPopup} changed={current.refresh}/>
               : null
             : <><ProjectDirectory key={view.workspace.id} workspace={view.workspace} changed={current.refresh}/>
+              <RecentOutputs key={'outputs-' + view.workspace.id} base={base} feed={outputsFeed} showAll={openOutputs}/>
               <Overview view={view} openJob={openDelegation} openSession={openSession} delegate={() => newOrder()} create={() => setPopup('new-session')}/>
               <ArchiveWorkspace key={view.workspace.id} workspace={view.workspace} personalId={personalId} done={async () => {
                 const name = view.workspace.name
