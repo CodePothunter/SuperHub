@@ -3,11 +3,13 @@ import type { StaffMember, StaffView } from '../core/workspace-staff.ts'
 import type { ExperienceEvidence, ExperienceMemory } from '../core/workspace-experience.ts'
 import { workspaceArchived, type V2Workspace, type V2WorkspaceView } from '../core/workspace-v2.ts'
 import { ARCHIVED_NOTE, Issue, readableTime, useArchived, V2Dialog, V2Icon } from './workspace-v2-elements.tsx'
-import { useV2Read, useV2Write } from './workspace-v2-api.ts'
+import { segment, useV2Read, useV2Write } from './workspace-v2-api.ts'
 import { defaultStaffPortrait } from '../core/workspace-avatars.ts'
 import { ChatAvatar } from './workspace-chat-avatar.tsx'
 import { StaffPortraitPicker } from './workspace-staff-portrait.tsx'
 import { isExperienceVersion, isSharedExperienceVersion, isStaffImpact, isStaffRecipients, isStaffView, staffPath } from './workspace-staff-response.ts'
+import { isAttachmentView } from './workspace-v2-response.ts'
+import { V2AttachmentContent } from './workspace-v2-talk.tsx'
 
 interface Props {
   workspace?: V2WorkspaceView
@@ -27,6 +29,39 @@ type Save = (body:Record<string,unknown>,message:string,path?:string)=>Promise<b
 
 function formData(event:FormEvent<HTMLFormElement>) { event.preventDefault(); return new FormData(event.currentTarget) }
 const field = (data:FormData,key:string) => String(data.get(key) ?? '').trim()
+
+function expiryDay(expiresAt: string, timeZone?: string) {
+  const last = new Date(Date.parse(expiresAt) - 1)
+  const parts = new Intl.DateTimeFormat('en-CA',{timeZone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(last)
+  return ['year','month','day'].map(type=>parts.find(part=>part.type===type)?.value).join('-')
+}
+
+function dateExpired(memory: ExperienceMemory) {
+  return memory.status === 'retired' && memory.maintenance?.action === 'expire'
+    && memory.expiresAt === memory.maintenance.at
+}
+
+function experienceState(memory: ExperienceMemory) {
+  if (memory.conflict?.length) return memory.status === 'proposed' ? '待采纳 · 待裁决' : '暂停使用 · 待裁决'
+  if (memory.replacementPending) return '来源已更新 · 暂停使用'
+  if (memory.status === 'proposed') return '待采纳'
+  return memory.status === 'retired' ? '已停用' : '已采纳'
+}
+
+function maintenanceLabel(memory: ExperienceMemory) {
+  const operation = memory.maintenance
+  if (!operation) return '历史未记录操作方式'
+  if (operation.actor === 'owner') return '按本人指示'
+  if (operation.action === 'accept' || operation.actor === 'system' && operation.action === 'learn' && memory.status === 'active') {
+    return operation.actor === 'system' ? '自动采纳' : '手动采纳'
+  }
+  if (operation.action === 'expire') return '自动过期'
+  if (operation.action === 'pause') return '自动暂停'
+  if (operation.action === 'revise') return operation.actor === 'system' ? '自动更正' : '手动更正'
+  if (operation.action === 'restore') return '手动恢复'
+  if (operation.action === 'retire') return operation.actor === 'system' ? '自动停用' : '手动停用'
+  return operation.actor === 'system' ? '自动整理' : '手动添加'
+}
 
 export function StaffBoard(props:Props) {
   const {workspace,spaces,selected,experience,select,openMembership,openOrder,openGlobal,openEvidence,assign} = props
@@ -73,24 +108,33 @@ export function StaffBoard(props:Props) {
     const identity = shared ? {audience:'shared'} : {staffId:memory.staffId}
     const command = (action: string, text: string, extra?: Record<string,unknown>) =>
       void save({action,...identity,memoryId:memory.id,version:memory.version,...extra},text)
-    const state = memory.status === 'proposed' ? '待采纳' : memory.status === 'retired' ? '已停用' : '已采纳'
+    const needsDecision = !!memory.conflict?.length
     const shares = view?.shares.filter(s=>s.memoryId === memory.id) ?? []
     return <article key={memory.id} className="v2-card v2-staff-memory">
-      <small>{state} · {memory.workspaceId ? label(memory.workspaceId) : '全局'} · {readableTime(memory.at)}</small>
+      <div className="v2-experience-meta">
+        <strong>{experienceState(memory)}</strong>
+        <small>{maintenanceLabel(memory)}</small>
+        <small>{memory.workspaceId ? label(memory.workspaceId) : '全局'} · <time dateTime={memory.maintenance?.at ?? memory.at}>
+          {readableTime(memory.maintenance?.at ?? memory.at)}</time></small>
+      </div>
       <p>{memory.text}</p>
-      <ExperienceDetails memory={memory} openEvidence={openEvidence}/>
+      <ExperienceDetails memory={memory} openEvidence={openEvidence} timeZone={view?.timeZone}/>
       <div className="v2-actions">{memory.orderId && memory.workspaceId && <button className="v2-link" onClick={()=>openOrder(memory.workspaceId!,memory.orderId!)}>查看来源工单</button>}
         {memory.lastUsed && <button className="v2-link" onClick={()=>openOrder(memory.lastUsed!.workspaceId,memory.lastUsed!.orderId)}>最近提供给工单 · {readableTime(memory.lastUsed.at)}</button>}</div>
-      {editable && memory.status !== 'retired' && <div className="v2-actions">
-        {memory.status === 'proposed' && <button className="v2-button" disabled={write.busy} onClick={()=>command('accept','已采纳经验。')}>采纳</button>}
-        {workspaceId && memory.status === 'active' && <button className="v2-link" onClick={()=>open('share',memory,shared)}>共享经验</button>}
-        <button className="v2-link" onClick={()=>open('revise',memory,shared)}>更正</button>
-        <button className="v2-link" disabled={write.busy} onClick={()=>command('retire','这条经验已停用。')}>停用</button>
+      {editable && (memory.status !== 'retired' || needsDecision || dateExpired(memory)) && <div className="v2-actions">
+        {memory.status === 'proposed' && !memory.replacementPending && <button className="v2-button" disabled={write.busy} onClick={()=>command('accept','已采纳经验。')}>
+          {needsDecision ? '采纳当前版本' : '采纳'}</button>}
+        {workspaceId && memory.status === 'active' && !needsDecision && !memory.replacementPending
+          && <button className="v2-link" onClick={()=>open('share',memory,shared)}>共享经验</button>}
+        <button className="v2-link" onClick={()=>open('revise',memory,shared)}>{dateExpired(memory) ? '更新期限' : '更正'}</button>
+        {(memory.status !== 'retired' || needsDecision) && <button className="v2-link" disabled={write.busy}
+          onClick={()=>command('retire','这条经验已停用。')}>{needsDecision ? '确认停用' : '停用'}</button>}
       </div>}
       {!shared && !editable && memory.workspaceId && memory.workspaceId !== workspaceId && memory.staffId &&
         <button className="v2-link" onClick={()=>openMembership(memory.workspaceId!,memory.staffId!)}>到来源工作区管理</button>}
       {!!memory.previousVersions?.length && <ExperienceVersions memory={memory} editable={editable && !write.busy}
-        openEvidence={openEvidence} sharedOnly={experience} restore={version=>command('restore','已恢复所选经验版本。',{restoreVersion:version})}/>}
+        openEvidence={openEvidence} sharedOnly={experience} timeZone={view?.timeZone}
+        restore={version=>command('restore','已恢复所选经验版本。',{restoreVersion:version})}/>}
       {shares.map(s=><div className="v2-staff-share" key={s.id}>
         <strong>已共享给{label(s.targetWorkspaceId)}{s.targetStaffName ? ' · '+s.targetStaffName : s.targetAudience === 'shared' ? ' · 本区成员' : ''}</strong><p>{s.text}</p>
         {s.purpose && <small>用途 · {s.purpose}</small>}{s.expiresAt && <small>有效期至 {readableTime(s.expiresAt)}</small>}
@@ -192,49 +236,97 @@ function showBorrowed(share: NonNullable<StaffView['sharedReceived']>[number]) {
 
 const evidenceLabels: Record<ExperienceEvidence['kind'], string> = {
   owner:'主人原话', group:'群消息', delivery:'交付', tool:'工具结果', test:'测试结果',
-  'model-review':'模型评议', 'owner-acceptance':'主人验收', order:'来源工单',
+  'model-review':'模型评议', 'owner-acceptance':'主人验收', order:'来源工单', artifact:'交付原件',
 }
-function ExperienceDetails({memory, openEvidence}: {memory:ExperienceMemory; openEvidence?:Props['openEvidence']}) {
+function artifactPath(source: ExperienceEvidence) {
+  if (source.kind === 'artifact' && source.resultId && source.fileId) {
+    return '/v2/notices/' + segment(source.resultId) + '/attachments/' + segment(source.fileId)
+  }
+}
+
+function ExperienceSources({sources, openEvidence}: {sources:ExperienceEvidence[]; openEvidence?:Props['openEvidence']}) {
+  const [selected,setSelected] = useState<string>()
+  const artifact = selected ? sources.find(source=>artifactPath(source) === selected) : undefined
+  const document = useV2Read(artifact ? selected : undefined,isAttachmentView)
+  const original = document.error ? undefined : document.data?.attachment
+  return <>{sources.map(source=>{
+    const path = artifactPath(source)
+    return <div key={JSON.stringify([source.kind,source.id,source.version,source.quote])}>
+      <strong>{evidenceLabels[source.kind]}</strong>
+      <div><small>来源编号 · {source.id}{source.version && ' · 来源版本 '+source.version}</small></div>
+      {source.quote && <p>{source.quote}</p>}
+      <div className="v2-actions">
+        {path && <button className="v2-link" onClick={()=>setSelected(path)}>查看交付原件</button>}
+        {openEvidence && source.workspaceId && (source.messageId && source.sessionId || source.orderId)
+          && <button className="v2-link" onClick={()=>openEvidence(source)}>打开来源</button>}
+      </div>
+    </div>
+  })}
+    {artifact && <V2Dialog title={original?.label ?? '交付原件'} meta={artifact.version && '来源版本 ' + artifact.version} close={()=>setSelected(undefined)}>
+      <Issue text={document.error} retry={document.refresh}/>
+      {original && <V2AttachmentContent item={original}/>}
+      {!original && !document.error && <p role="status">正在读取交付原件…</p>}
+    </V2Dialog>}
+  </>
+}
+
+function ExperienceDetails({memory, openEvidence, timeZone}: {
+  memory:ExperienceMemory; openEvidence?:Props['openEvidence']; timeZone?:string
+}) {
+  const reason = memory.maintenance?.reason ?? memory.reason
+  const count = memory.supportCount ?? 0
+  const note = count ? `已有 ${count} 个独立工单支持` : '尚缺可核对的独立工单'
   return <>
-    <small>{memory.source === 'suggestion' ? '幕僚建议' : memory.source === 'observation' ? '结果观察' : '本人指示'} · 版本 {memory.version}
+    <small>{memory.source === 'suggestion' ? '幕僚建议' : memory.source === 'observation' ? '结果观察' : memory.source === 'owner' ? '本人指示' : '来源未注明'} · 版本 {memory.version}
       {memory.recordedAt ? ' · 登记于 '+readableTime(memory.recordedAt) : ''}
       {memory.adoptedAt && memory.adoptedAt !== memory.recordedAt ? ' · 采纳于 '+readableTime(memory.adoptedAt) : ''}</small>
     {memory.situation && <p>适用情境 · {memory.situation}</p>}
     {memory.boundary && <p>适用边界 · {memory.boundary}</p>}
     {!!memory.domains?.length && <p>领域 · {memory.domains.join('、')}</p>}
     {!!memory.taskTypes?.length && <p>任务类型 · {memory.taskTypes.join('、')}</p>}
-    {memory.reason && <p>{memory.reason}</p>}
+    {memory.expiresAt && <p>有效期至 <time dateTime={memory.expiresAt}>{expiryDay(memory.expiresAt,timeZone)}</time> 当天结束</p>}
+    {memory.replacementPending && <p className="v2-quiet">正在核对替代材料及适用范围。</p>}
+    {memory.status === 'proposed' && !memory.conflict?.length && !memory.replacementPending
+      && <p className="v2-quiet">{note}。待采纳期间不会提供给后续任务。</p>}
+    {memory.reviewSuggested && !memory.replacementPending && <p className="v2-quiet">建议复核 · 长期未提供给任务，仍可使用。</p>}
+    {reason && <p>{reason}</p>}
+    {!!memory.conflict?.length && <details>
+      <summary>查看冲突依据</summary>
+      <p>这条经验暂不提供给任务。你可以更正、恢复仍有效的历史版本或确认停用。</p>
+      <ExperienceSources sources={memory.conflict} openEvidence={openEvidence}/>
+    </details>}
     <details>
       <summary>查看依据</summary>
       <small>经验编号 · {memory.id}</small>
       {!memory.evidence?.length && <p>暂无可定位的原始记录。</p>}
-      {memory.evidence?.map(source=><div key={source.kind + ':' + source.id}>
-        <strong>{evidenceLabels[source.kind]}</strong>
-        <div><small>来源编号 · {source.id}{source.version && ' · 来源版本 '+source.version}</small></div>
-        {source.quote && <p>{source.quote}</p>}
-        {openEvidence && source.workspaceId && (source.messageId && source.sessionId || source.orderId)
-          && <button className="v2-link" onClick={()=>openEvidence(source)}>打开来源</button>}
-      </div>)}
+      {!!memory.evidence?.length && <ExperienceSources sources={memory.evidence} openEvidence={openEvidence}/>}
       {memory.feedback?.map(feedback=><p key={feedback.id}>版本 {feedback.memory.version} · {evidenceLabels[feedback.evidence.kind]}
         {feedback.evidence.quote && ' · '+feedback.evidence.quote}</p>)}
     </details>
   </>
 }
 
-function ExperienceVersions({memory,editable,sharedOnly,restore,openEvidence}: {
-  memory:ExperienceMemory; editable:boolean; sharedOnly?:boolean; restore:(version:number)=>void; openEvidence?:Props['openEvidence']
+function ExperienceVersions({memory,editable,sharedOnly,restore,openEvidence,timeZone}: {
+  memory:ExperienceMemory; editable:boolean; sharedOnly?:boolean; restore:(version:number)=>void; openEvidence?:Props['openEvidence']; timeZone?:string
 }) {
   const [version,setVersion] = useState<number>()
   const path = version === undefined ? undefined : staffPath(memory.workspaceId) + '?' +
     new URLSearchParams({memory:memory.id,version:String(version),...(sharedOnly && {experience:'shared'})})
   const query = useV2Read(path,sharedOnly ? isSharedExperienceVersion : isExperienceVersion)
-  const previous = !query.error && query.data?.memory.version === version && query.data?.memory.id === memory.id ? query.data?.memory : undefined
+  const record = query.data?.memory
+  const previous = !query.error && record?.version === version && record?.id === memory.id && record.workspaceId === memory.workspaceId
+    && record.staffId === memory.staffId && record.audience === memory.audience ? record : undefined
+  const expired = !!previous?.expiresAt && Date.parse(previous.expiresAt) <= Date.now()
   return <details><summary>历史版本</summary>
     <div className="v2-actions">{[...(memory.previousVersions ?? [])].reverse().map(number=><button type="button" key={number}
       aria-pressed={version === number} className="v2-link" onClick={()=>setVersion(number)}>版本 {number}</button>)}</div>
     <Issue text={query.error} retry={query.refresh}/>
-    {previous && <><p>{previous.text}</p><ExperienceDetails memory={previous} openEvidence={openEvidence}/>
-      {editable && previous.status !== 'retired' && <button className="v2-link" onClick={()=>restore(previous.version)}>恢复这个版本</button>}</>}
+    {previous && <><small>{experienceState(previous)} · {maintenanceLabel(previous)}
+      {previous.maintenance && <> · <time dateTime={previous.maintenance.at}>{readableTime(previous.maintenance.at)}</time></>}</small>
+      <p>{previous.text}</p><ExperienceDetails memory={previous} openEvidence={openEvidence} timeZone={timeZone}/>
+      {expired && <p className="v2-quiet">这版的有效期已结束。{editable && dateExpired(memory) && '可以在当前条目中更新期限。'}</p>}
+      {editable && !expired && !memory.replacementPending && previous.status !== 'retired' && !previous.conflict?.length &&
+        <button className="v2-link" onClick={()=>restore(previous.version)}>恢复这个版本</button>}</>}
   </details>
 }
 
@@ -269,6 +361,7 @@ function StaffForm(props:FormProps) {
   const target = targetMembers.find(m=>m.id === (recipient || member?.id))
   const targetName = spaces.find(w=>w.id === destination)?.name
   const resetScope = workspace ? workspace.workspace.name : '所有工作区和通用经验'
+  const originalExpiryDay = memory?.expiresAt ? expiryDay(memory.expiresAt,view.timeZone) : ''
   const submit = (event:FormEvent<HTMLFormElement>) => {
     const data = formData(event)
     const identity = shared ? {audience:'shared'} : {staffId:member?.id}
@@ -279,9 +372,11 @@ function StaffForm(props:FormProps) {
       void save({action:'join',staffId:id,duty:field(data,'duty')},action === 'duty' ? '已保存本区职责。' : '幕僚已加入工作区。',action === 'join' ? staffPath(field(data,'workspace')) : path)
     } else if (action === 'learn' || action === 'revise') {
       const orderId = field(data,'order')
+      const expiresOn = field(data,'expiresOn')
       const tags = (key:string) => field(data,key).split(/[,，]/).map(tag=>tag.trim()).filter(Boolean)
       void save({action,...identity,text:field(data,'text'),situation:field(data,'situation'),boundary:field(data,'boundary'),
         domains:tags('domains'),taskTypes:tags('taskTypes'),...(orderId && {orderId}),
+        ...(expiresOn !== originalExpiryDay && {expiresOn:expiresOn || null}),
         ...(memory && {memoryId:memory.id,version:memory.version})},'已保存经验。')
     } else if (action === 'leave') {
       void save({action,...identity},'已移出工作区。')
@@ -315,6 +410,8 @@ function StaffForm(props:FormProps) {
         <label>适用边界（选填）<input name="boundary" maxLength={500} defaultValue={memory?.boundary}/></label>
         <label>领域（用逗号分隔）<input name="domains" maxLength={500} defaultValue={memory?.domains?.join('，')}/></label>
         <label>任务类型（用逗号分隔）<input name="taskTypes" maxLength={500} defaultValue={memory?.taskTypes?.join('，')}/></label>
+        <label>有效期至（选填）<input name="expiresOn" type="date" defaultValue={originalExpiryDay}/>
+          <small>含当天，按工作区时区{view.timeZone && `（${view.timeZone}）`}计算。留空表示不限日期。</small></label>
         {action === 'learn' && sourceOrders.length > 0 && <label>经验来源<select name="order" defaultValue=""><option value="">本人指示</option>
           {sourceOrders.map(o=><option key={o.id} value={o.id}>{o.title}</option>)}</select></label>}
         {action === 'learn' && !workspace && <p>{shared ? '本脑各工作区的相关任务可使用这条共同经验。' : '通用做法会随这位幕僚用于它参与的工作区。'}</p>}

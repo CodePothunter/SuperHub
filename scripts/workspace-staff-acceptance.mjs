@@ -1,7 +1,7 @@
 /** Exercise both real owner transports and the scoped model input before and after reset and restart. */
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { copyFileSync, mkdirSync, readdirSync, readFileSync } from 'node:fs'
+import { copyFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { acceptanceHost, until } from './acceptance-host.mjs'
@@ -19,6 +19,9 @@ const builtInPortraits = [
 const method = '访谈结束复述约定'
 const sourceOnly = '甲的虚构访谈对象'
 const independent = '乙的独立经验'
+const timedMethod = '访谈阶段要在每次核对时标明原始出处。'
+const shanghaiDay = offset => new Date(Date.now() + 8 * 3_600_000 + offset * 86_400_000).toISOString().slice(0,10)
+const shanghaiCutoff = day => new Date(Date.parse(day + 'T00:00:00+08:00') + 86_400_000).toISOString()
 let browser, pageUnderTest
 async function capturePicker(picker, label) {
   assert.ok(await picker.evaluate(el => el.scrollWidth <= el.clientWidth+1))
@@ -48,6 +51,7 @@ try {
   const workspace = id => '/v2/workspaces/' + id
   const staff = id => workspace(id) + '/staff'
   const cardUrl = (base, id, staffId) => base + '/#v2?' + new URLSearchParams({scope,view:'workspace',workspace:id,panel:'staff',...(staffId && {item:staffId})})
+  const experienceUrl = (base,id) => base + '/#v2?' + new URLSearchParams({scope,view:'workspace',workspace:id,panel:'experience'})
   browser = await chromium.launch({headless:true,...process.env.CHIEF_CHROMIUM_PATH && {executablePath:process.env.CHIEF_CHROMIUM_PATH}})
   const desktop = await browser.newPage({viewport:{width:1440,height:900},locale:'zh-CN'})
   pageUnderTest = desktop
@@ -129,7 +133,9 @@ try {
   await confirmLiaison(source,'（甲区）','已收到本区共同经验。')
   await confirmLiaison(target,'（乙区）','本轮没有这条共同经验。')
   const storedStaff = join(host.brain,'ops','superhub-staff')
-  const deliveries = Object.values(JSON.parse(readFileSync(join(storedStaff,readdirSync(storedStaff).find(name=>name.endsWith('.json'))),'utf8')).deliveries)
+  const staffFile = join(storedStaff,readdirSync(storedStaff).find(name=>name.endsWith('.json')))
+  const readLedger = () => JSON.parse(readFileSync(staffFile,'utf8'))
+  const deliveries = Object.values(readLedger().deliveries)
   assert.ok(deliveries.some(row=>row.workspaceId===source && row.executorId==='liaison' &&
     row.entries.some(entry=>entry.id===common.id && entry.version===common.version)))
   assert.ok(!deliveries.some(row=>row.workspaceId===target && row.entries.some(entry=>entry.id===common.id)))
@@ -187,7 +193,23 @@ try {
   assert.ok(sharedReply.includes(independent) && sharedReply.includes(method) && !sharedReply.includes(sourceOnly))
   console.log('PASS 收到预览选定的文字并用于实际执行，来源原文未随共享带入')
 
-  const mobile=await browser.newPage({isMobile:true,hasTouch:true,viewport:{width:320,height:740},colorScheme:'dark'})
+  const expiryDate = shanghaiDay(2)
+  await desktop.goto(experienceUrl(host.base,source))
+  await button(desktop,'添加共同经验').click()
+  const expiryForm = desktop.getByRole('dialog',{name:'添加经验'})
+  await expiryForm.getByLabel('经验内容',{exact:true}).fill(timedMethod)
+  await expiryForm.locator('input[type=date]').fill(expiryDate)
+  await button(expiryForm,'保存经验').click()
+  const timed = await until(async () => (await api(staff(source))).sharedExperiences?.find(memory=>memory.text===timedMethod),'已保存有期限的经验')
+  assert.equal(timed.expiresAt,shanghaiCutoff(expiryDate))
+  assert.deepEqual([timed.maintenance.action,timed.maintenance.actor],['learn','manual'])
+  const deliveredTo = (order,version) => Object.values(readLedger().deliveries).some(row=>row.orderId===order.id &&
+    row.entries.some(entry=>entry.id===timed.id && entry.version===version))
+  const timedOrder = await assign(source)
+  await replies(source,timedOrder,1)
+  assert.ok(deliveredTo(timedOrder,timed.version),'期限内经验应已提供给实际执行者')
+
+  const mobile=await browser.newPage({isMobile:true,hasTouch:true,viewport:{width:320,height:740},colorScheme:'dark',timezoneId:'America/Los_Angeles'})
   pageUnderTest=mobile
   await mobile.goto(host.mobileBase)
   await mobile.getByLabel('密码').fill(password)
@@ -218,6 +240,13 @@ try {
   const commonRegion = mobile.getByRole('region',{name:'本区共同经验'})
   const commonCard = commonRegion.getByRole('article').filter({hasText:'先核对原始录音'})
   await commonCard.waitFor()
+  await commonCard.getByText('按本人指示',{exact:true}).waitFor()
+  const mobileTimed = commonRegion.getByRole('article').filter({hasText:timedMethod})
+  await mobileTimed.getByText('手动添加',{exact:true}).waitFor()
+  await button(mobileTimed,'更正').click()
+  const mobileExpiry = mobile.getByRole('dialog',{name:'更正经验'})
+  assert.equal(await mobileExpiry.locator('input[type=date]').inputValue(),expiryDate)
+  await button(mobileExpiry,'关闭详情').click()
   assert.ok(await mobile.locator('.v2-page').evaluate(el=>el.scrollWidth<=el.clientWidth+1))
   const sharedProjection = await api(staff(source)+'?experience=shared')
   assert.deepEqual(sharedProjection.members,[])
@@ -251,6 +280,11 @@ try {
   await confirm.click()
   await until(async () => !(await api(staff(target))).received.length,'重置收回派生共享')
   await host.stop()
+  // A stopped, isolated fixture crosses the deadline without depending on the wall clock or waiting for Dream.
+  const ledger = readLedger()
+  const expiredAt = shanghaiCutoff(shanghaiDay(-2))
+  ledger.memories.find(memory=>memory.id===timed.id).expiresAt = expiredAt
+  writeFileSync(staffFile,JSON.stringify(ledger)+'\n')
   await host.start()
   assert.deepEqual(await currentPortrait(),chosen)
   assert.deepEqual((await api('/v2/staff')).members.find(row=>row.id===native.id)?.defaultPortrait,native.defaultPortrait)
@@ -264,6 +298,29 @@ try {
   assert.ok(targetView.memories.some(m=>m.text===independent))
   console.log('PASS 手机预览并重置甲，重启后乙在原工单续办，已撤回经验不会从旧回复恢复，主人仍能打开原记录')
   await signIn(desktop,host)
+  const afterExpiry = await assign(source)
+  await replies(source,afterExpiry,1)
+  assert.equal(deliveredTo(afterExpiry,timed.version),false,'到期版本不应进入新的实际执行')
+  await desktop.goto(experienceUrl(host.base,source))
+  const expired = desktop.getByRole('region',{name:'本区共同经验'}).getByRole('article').filter({hasText:timedMethod})
+  await expired.getByText('自动过期',{exact:true}).waitFor()
+  assert.equal(await expired.locator('.v2-experience-meta time').getAttribute('datetime'),expiredAt)
+  await expired.getByText('历史版本',{exact:true}).click()
+  await button(expired,'版本 '+timed.version).click()
+  await expired.getByText(/^这版的有效期已结束/).waitFor()
+  assert.equal(await button(expired,'恢复这个版本').count(),0)
+  await button(expired,'更新期限').click()
+  const renewal = desktop.getByRole('dialog',{name:'更正经验'})
+  await renewal.locator('input[type=date]').fill(expiryDate)
+  await button(renewal,'保存更正').click()
+  await expired.getByText('手动更正',{exact:true}).waitFor()
+  const renewed = (await api(staff(source))).sharedExperiences.find(memory=>memory.id===timed.id)
+  assert.equal(renewed.status,'active')
+  assert.equal(renewed.expiresAt,shanghaiCutoff(expiryDate))
+  const afterRenewal = await assign(source)
+  await replies(source,afterRenewal,1)
+  assert.ok(deliveredTo(afterRenewal,renewed.version),'延期后的新版本应提供给实际执行者')
+  console.log('PASS 双端使用工作区日期，到期阻止实际送达，历史保留原因并可更新期限')
   await desktop.goto(host.base + '/#v2?' + new URLSearchParams({scope,view:'settings',panel:'staff',item:staffId}))
   await button(desktop,'重置全部记忆').click()
   await button(desktop,'确认重置').click()

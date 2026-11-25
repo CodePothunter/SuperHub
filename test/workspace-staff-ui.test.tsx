@@ -2,9 +2,10 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { afterEach, expect, it, vi } from 'vitest'
 import { StaffPortraitPicker } from '../src/client/workspace-staff-portrait.tsx'
 import { StaffBoard } from '../src/client/workspace-staff.tsx'
-import { isSharedExperienceVersion, isStaffImpact, isStaffView, staffPath } from '../src/client/workspace-staff-response.ts'
+import { isExperienceVersion, isSharedExperienceVersion, isStaffImpact, isStaffView, staffPath } from '../src/client/workspace-staff-response.ts'
 import * as api from '../src/client/workspace-v2-api.ts'
 import type { StaffView } from '../src/core/workspace-staff.ts'
+import type { ExperienceEvidence, ExperienceMaintenance } from '../src/core/workspace-experience.ts'
 import type { V2WorkspaceView } from '../src/core/workspace-v2.ts'
 
 const space = {id:'customer',name:'客户访谈',owner:'本人',goal:'准备访谈',createdAt:'2026-11-20'}
@@ -77,6 +78,38 @@ it('reads and manages shared experience from a dedicated workspace projection',(
   expect(isStaffView({...staff,retiredMemories:[{...local.memories[0]!,audience:'staff',status:'retired'}]},path)).toBe(false)
   expect(isSharedExperienceVersion({scope:'b',memory:current})).toBe(true)
   expect(isSharedExperienceVersion({scope:'b',memory:{...local.memories[0]!,audience:'staff'}})).toBe(false)
+})
+
+it('identifies maintenance, accumulates candidate proof, and leaves paused and expired growth records manageable',()=>{
+  const expiresAt = '2026-11-25T16:00:00.000Z'
+  const maintenance = (action:ExperienceMaintenance['action'],actor:ExperienceMaintenance['actor'],reason?:string) => ({action,actor,at:expiresAt,reason})
+  const artifact: ExperienceEvidence = {kind:'artifact',id:'source-1',workspaceId:space.id,orderId:'first',resultId:'result-first',
+    fileId:'quote-1',version:'revision-1',quote:'是按段号引用'}
+  const second: ExperienceEvidence = {...artifact,id:'source-2',orderId:'second',quote:'是按行号引用'}
+  const record = {...local.memories[0]!,audience:'staff' as const,version:2}
+  const staff: StaffView = {...local,timeZone:'Asia/Shanghai',memories:[
+    {...record,text:'已经核实的做法',maintenance:maintenance('accept','system'),evidence:[artifact]},
+    {...record,id:'candidate',status:'proposed',text:'还在核对的做法',supportCount:1},
+    {...record,id:'old',text:'很少提供的做法',reviewSuggested:true,maintenance:maintenance('accept','manual')},
+    {...record,id:'corrected',text:'本次采用段号',previousVersions:[1],maintenance:maintenance('revise','system','按新规范更正')},
+    {...record,id:'replacement',text:'稍后确认的新摘录方式',replacementPending:true},
+  ],retiredMemories:[
+    {...record,id:'paused',status:'retired',text:'有争议的引用方式',conflict:[artifact,second],
+      previousVersions:[1],maintenance:maintenance('pause','system')},
+    {...record,id:'expired',status:'retired',text:'试行期旧规则',expiresAt,maintenance:maintenance('expire','system','到达有效期')},
+  ]}
+  const html = card(staff,view)
+  for (const text of ['自动采纳','手动采纳','已有 1 个独立工单支持','仍可使用','自动更正','按新规范更正','历史版本',
+    '暂停使用 · 待裁决','查看冲突依据','确认停用','是按段号引用','是按行号引用','查看交付原件','自动过期','更新期限','到达有效期',
+    '来源已更新 · 暂停使用','正在核对替代材料及适用范围。',
+    'dateTime="2026-11-25T16:00:00.000Z">2026-11-25</time> 当天结束']) expect(html).toContain(text)
+  const path = staffPath(space.id)
+  expect(isStaffView(staff,path)).toBe(true)
+  expect(isStaffView({...staff,timeZone:'invalid/time-zone'},path)).toBe(false)
+  expect(isStaffView({...staff,memories:[{...record,supportCount:-1}]},path)).toBe(false)
+  expect(isStaffView({...staff,memories:[{...record,maintenance:{action:'accept',actor:'unknown',at:expiresAt}}]},path)).toBe(false)
+  expect(isExperienceVersion({scope:'b',memory:staff.retiredMemories?.[0]})).toBe(true)
+  expect(isExperienceVersion({scope:'b',memory:{...record,expiresAt:'昨天晚上'}})).toBe(false)
 })
 
 it('offers the approved ten objects and seven colors with a static saved portrait in the owner view',()=>{

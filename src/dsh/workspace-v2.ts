@@ -19,17 +19,19 @@ import { ORIGINAL_LABEL } from './workspace-v2-dialogue.ts'
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { extname, join, sep } from 'node:path'
+import { slotKey, zonedInstant } from '../core/clock.ts'
 import { completionCandidate, judgeCommand, type CommandJudge } from './workspace-order-command.ts'
 import { ACCEPTANCE_TIMEOUT_MS, ORIGINAL_LIMIT, RESULTS_LIMIT, type AcceptanceReviewer } from './workspace-acceptance.ts'
 import { publishedOutputs, workspaceOutputs, type OutputSource } from './workspace-outputs.ts'
 import type { OrderBrief } from './workspace-order-brief.ts'
 import type { WorkspaceStaffStore } from './workspace-staff-store.ts'
 import type { ExperienceEvidence } from '../core/workspace-experience.ts'
-import type { ExperienceLearning } from './workspace-experience-learning.ts'
+import type { ExperienceLearning, VerifiedExperienceOriginal } from './workspace-experience-learning.ts'
 import { WorkspaceFollowup } from './workspace-followup.ts'
 import { fileVersion, groupResults, WorkspaceResultNotices, type GroupResultLine, type StoredResult } from './workspace-notices.ts'
 import { directoryLocks, type DirectoryHolder, type DirectoryLocks } from './directory-locks.ts'
 import { directoryKey } from './project-directory.ts'
+import { commandExperienceEvidence, verifyCommandExperience } from './workspace-experience-evidence.ts'
 
 /** Owner approvals of the command gate (pending cards and decisions). */
 export interface WorkspaceApprovals {
@@ -169,18 +171,66 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     return source.staffSources?.(store.session(order.workspaceId,order.sessionId),order.id,token) ?? new Set<string>()
   })
   const notices = new WorkspaceResultNotices(store, source, current, now, () => runAcceptances(),
-    groups && {collect: () => collectGroupResults(), attachment: (notice, fileId) => groupResultFile(notice, fileId)})
+    groups && {collect: () => collectGroupResults(), attachment: (notice, fileId) => groupResultFile(notice, fileId)},
+    result => learnResult(result))
   const reviews = new AbortController()
   const reviewing = new Set<string>()
+  function submitLearning(signal: Parameters<ExperienceLearning['settle']>[0], deferred: boolean) {
+    if (!learning) return
+    if (deferred) {
+      try { learning.observe(signal) } catch (error) { learningProblem?.(error) }
+    } else void learning.settle(signal).catch(error => learningProblem?.(error))
+  }
+
   function learnResult(result: StoredResult, deferred = false) {
     if (!learning || result.at < learning.startedAt || !result.text.trim() || result.kind === 'weekly') return
     const evidence: ExperienceEvidence = {kind: 'delivery', id: result.id, workspaceId: result.workspaceId,
       sessionId: result.sessionId, orderId: result.orderId, messageId: result.messageId, version: result.version}
     const signal = {id: 'delivery:' + result.id, workspaceId: result.workspaceId, sessionId: result.sessionId,
       orderId: result.orderId, kind: 'delivery' as const, summary: result.text, evidence: [evidence]}
-    if (deferred) {
-      try { learning.observe(signal) } catch (error) { learningProblem?.(error) }
-    } else void learning.settle(signal).catch(error => learningProblem?.(error))
+    submitLearning(signal, deferred)
+    if (!result.attachments.length) return
+    try {
+      const session = store.session(result.workspaceId, result.sessionId)
+      const original = !roster(session) && result.requestId ? source.experienceSource?.(session, result.requestId) : undefined
+      learnArtifacts(result, deferred, original?.staffId)
+    } catch (error) { learningProblem?.(error) }
+  }
+
+  function learnArtifacts(result: StoredResult, deferred: boolean, staffId?: string) {
+    const proofs = result.attachments.slice(0, 8).flatMap(file => {
+      const evidence = artifactEvidence(result, file, staffId)
+      const verified = evidence && verifyLearningOriginal(evidence, {staffId})
+      return evidence && verified ? [{evidence, verified}] : []
+    })
+    if (!proofs.length) return
+    const replaced = new Set(proofs.flatMap(proof => proof.verified.replacementOf ?? []))
+    if (replaced.size && staff) staff.holdReplacedExperience(result.workspaceId, staffId,
+      staff.experienceMemories(result.workspaceId).filter(memory => memory.staffId === staffId && memory.premise
+        && replaced.has(artifactSource(memory.premise))))
+    const session = store.session(result.workspaceId, result.sessionId)
+    const evidence = proofs.map(proof => proof.evidence)
+    const lines = roster(session) ? learningGroupLines(session).filter(line => evidence.some(proof => proof.messageId === lineId(line.seq))
+      || result.messageId === lineId(line.seq)) : []
+    const turnIds = lines.flatMap(line => line.memberCallId ?? line.engagement?.callId ?? [])
+    const nativeTurn = !roster(session) && result.requestId ? source.experienceSource?.(session, result.requestId) : undefined
+    submitLearning({workspaceId: result.workspaceId, sessionId: result.sessionId, orderId: result.orderId, staffId,
+      ...(nativeTurn && {turnId: result.requestId}),
+      sourceTurnIds: turnIds,
+      sourceExperienceRefs: nativeTurn?.refs ?? lines.flatMap(line => line.experienceRefs ?? []),
+      id: 'artifact:' + workspaceFingerprint([result.id, result.version, staffId, evidence.map(proof => proof.id)]),
+      kind: 'delivery', summary: result.text, evidence}, deferred)
+  }
+
+  function expirationDate(value: unknown) {
+    if (value === null) return null
+    const match = typeof value === 'string' && /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
+    if (!match) return workspaceError(400, '请选择有效的经验截止日期')
+    const [year, month, day] = match.slice(1).map(Number) as [number, number, number]
+    const midday = zonedInstant(year, month, day, 12 * 60, timeZone)
+    if (slotKey(midday, timeZone).slice(0, 10) !== value) return workspaceError(400, '请选择有效的经验截止日期')
+    const next = new Date(Date.UTC(year, month - 1, day + 1))
+    return zonedInstant(next.getUTCFullYear(), next.getUTCMonth() + 1, next.getUTCDate(), 0, timeZone).toISOString()
   }
   function learnOwnerWords(session: V2Session, line: GroupLine) {
     if (!learning || line.at < learning.startedAt || !line.text.trim()) return
@@ -428,6 +478,18 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         // Advance the scan only after the source has a durable learning receipt or a pending record.
         learning.observe(signal)
         if (!deferred) void learning.settle(signal).catch(error => learningProblem?.(error))
+        const result = formal.get(lineId(line.seq))
+        if (result?.attachments.length) {
+          try { learnArtifacts(result, deferred, line.speakerId) } catch (error) { learningProblem?.(error) }
+        }
+        if (groups && line.memberCompleted) {
+          const commands = readCommandLog(join(groups.paths(session).dir, GROUP_COMMANDS_FILE), line.workOrderId ?? null).commands
+          const proofs = commands.flatMap(command => command.memberId === line.speakerId && command.turnId.startsWith(callId + '.')
+            && command.endedAt && !command.unmatched && !command.unfinished && typeof command.exitCode === 'number'
+            ? [commandExperienceEvidence({workspaceId, sessionId, orderId: line.workOrderId,
+              turnId: command.turnId, staffId: line.speakerId}, command.id, {...command, exitCode: command.exitCode})] : []).slice(-8)
+          if (proofs.length) submitLearning({...signal, id: 'group-command:' + id, evidence: proofs}, deferred)
+        }
       }
     }
     memberLearningScanned.set(sessionId, last)
@@ -536,6 +598,144 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     try { base = realpathSync(groups.workDir(session)) } catch { return }
     const read = file && readGroupFile(base, file)
     return read && fileVersion(read) === ref.version ? {id: ref.id, label: ref.label, ...read} : undefined
+  }
+
+  function learningGroupLines(session: V2Session) {
+    if (!groups) return []
+    return groups.loaded(session.id)?.ledger.all() ?? readGroupLedger(join(groups.paths(session).dir, GROUP_LEDGER_FILE))
+  }
+
+  function learningRefsAllowed(workspaceId: string, refs: readonly {id: string; version: number}[] | undefined, staffId?: string, replacementOf?: string) {
+    if (!refs?.length) return true
+    if (!staff) return false
+    const local = [...staff.experienceMemories(workspaceId), ...staff.experienceMemories()]
+    const authorized = staff.selectExperience({workspaceId, staffId, task: ''}).authorized
+    return refs.every(ref => {
+      const memory = local.find(item => item.id === ref.id && (!item.staffId || item.staffId === staffId))
+      if (!memory) return false
+      if (authorized.some(entry => entry.id === ref.id && entry.version === ref.version)) return true
+      if (!replacementOf || memory.workspaceId !== workspaceId) return false
+      // Only a file that is itself the replacement can still reference the version it supersedes.
+      if (memory.version === ref.version) {
+        return memory.status === 'active' && !!memory.premise && replacementOf === artifactSource(memory.premise)
+      }
+      if (memory.maintenance?.actor !== 'system' || !['revise','expire'].includes(memory.maintenance.action)) return false
+      try {
+        const prior = staff.experienceVersion(workspaceId, ref.id, ref.version)
+        return prior.status === 'active' && !!prior.premise && replacementOf === artifactSource(prior.premise)
+      } catch { return false }
+    })
+  }
+
+  function fileFromResult(result: StoredResult, fileId: string) {
+    const ref = result.attachments.find(item => item.id === fileId)
+    if (!ref) return
+    if (result.messageId?.startsWith('g-')) return groupResultFile(result, fileId)
+    try { return notices.attachment(result.id, fileId) } catch { return }
+  }
+
+  function artifactEvidence(result: StoredResult, ref: StoredResult['attachments'][number], staffId?: string, file = fileFromResult(result, ref.id)): ExperienceEvidence | undefined {
+    if (!file || fileVersion(file) !== ref.version) return
+    const quote = file.content.slice(0, 3000).trim()
+    if (!quote) return
+    const messageId = /^g-\d+-\d+$/.test(ref.id) ? ref.id.slice(0, ref.id.lastIndexOf('-')) : result.messageId
+    return {kind: 'artifact', id: workspaceFingerprint([result.id, ref.id, ref.version]), resultId: result.id,
+      fileId: ref.id, version: ref.version, workspaceId: result.workspaceId, sessionId: result.sessionId,
+      orderId: result.orderId, messageId, staffId, quote}
+  }
+
+  function artifactLine(lines: readonly GroupLine[], result: StoredResult, fileId: string) {
+    const match = /^g-(\d+)-(\d+)$/.exec(fileId)
+    if (!match) return
+    const line = lines.find(item => item.seq === Number(match[1]) && item.workOrderId === result.orderId)
+    const path = line?.attachments?.[Number(match[2])]?.path
+    if (line && path && line.speakerId !== OWNER_ID && line.speakerId !== HOST_ID) return {line, path}
+  }
+
+  function artifactSource(evidence: Pick<ExperienceEvidence, 'workspaceId' | 'sessionId' | 'orderId' | 'fileId' | 'version'>) {
+    const {workspaceId, sessionId, orderId, fileId, version} = evidence
+    return workspaceFingerprint(['artifact-source', workspaceId, sessionId, orderId, fileId, version])
+  }
+
+  function resolveLearningOriginals(evidence: ExperienceEvidence, audience: {staffId?: string}): ExperienceEvidence[] {
+    const {workspaceId, sessionId, orderId, messageId, staffId} = evidence
+    if (!workspaceId || !sessionId || !orderId || !messageId || staffId && staffId !== audience.staffId) return []
+    const groupMember = audience.staffId && evidence.kind === 'group'
+      && evidence.id === 'group-member:' + sessionId + ':' + lineSeq(messageId) + ':' + audience.staffId
+    if (!groupMember && (evidence.kind !== 'delivery' || !evidence.version)) return []
+    const published = store.resultNotices()
+    const rows = groupMember ? [...store.groupEvidence(orderId), ...published] : published
+    const record = rows.find(row => row.workspaceId === workspaceId && row.sessionId === sessionId && row.orderId === orderId
+      && row.messageId === messageId && (groupMember || (row.id === evidence.id && row.version === evidence.version)))
+    if (!record) return []
+    return record.attachments.slice(0, 8).flatMap(file => artifactEvidence(record, file, audience.staffId) ?? [])
+  }
+
+  // Only the owning workspace can certify an archived source. Identical file versions count once even when forwarded.
+  function verifyLearningOriginal(evidence: ExperienceEvidence, audience: {staffId?: string}): VerifiedExperienceOriginal | undefined {
+    const {workspaceId, sessionId, orderId, staffId, fileId} = evidence
+    if (!workspaceId || !sessionId || staffId !== audience.staffId || archived(workspaceId)) return
+    const session = store.session(workspaceId, sessionId)
+    if (orderId && store.delegation(workspaceId, orderId).sessionId !== sessionId) return
+    if (evidence.kind === 'tool' || evidence.kind === 'test') {
+      if (!roster(session)) {
+        const commands = source.execution?.(session, orderId).commands ?? []
+        const turnId = evidence.turnId ?? commands.find(row => row.id === evidence.id)?.turnId
+        const original = turnId && source.experienceSource?.(session, turnId)
+        if (!original || original.staffId !== staffId || !learningRefsAllowed(workspaceId, original.refs, staffId)) return
+        return verifyCommandExperience(evidence, commands, staffId)
+      }
+      if (!groups || !staffId || !evidence.turnId) return
+      const line = learningGroupLines(session).find(item => item.speakerId === staffId && item.workOrderId === orderId
+        && item.memberCallId && evidence.turnId!.startsWith(item.memberCallId + '.') && item.memberCompleted)
+      if (!line || !learningRefsAllowed(workspaceId, line.experienceRefs, staffId)) return
+      return verifyCommandExperience(evidence, readCommandLog(join(groups.paths(session).dir,GROUP_COMMANDS_FILE), orderId ?? null).commands, staffId)
+    }
+    if (evidence.kind !== 'artifact' || !orderId || !fileId) return
+    const published = store.resultNotices().filter(entry => entry.orderId === orderId && entry.sessionId === sessionId && entry.workspaceId === workspaceId)
+    const eligible = staffId ? [...published, ...store.groupEvidence(orderId)] : published
+    const result = eligible.find(entry => entry.id === evidence.resultId && entry.orderId === orderId
+      && entry.sessionId === sessionId && entry.workspaceId === workspaceId)
+    const ref = result?.attachments.find(file => file.id === fileId && file.version === evidence.version)
+    if (!result || !ref) return
+    const file = fileFromResult(result, fileId)
+    if (!file) return
+    const verified = artifactEvidence(result, ref, staffId, file)
+    if (!verified || evidence.id !== verified.id || evidence.quote !== verified.quote || evidence.messageId !== verified.messageId) return
+    const origin = workspaceFingerprint(['artifact', file.content.replace(/\r\n/g, '\n').trim()])
+    if (!roster(session)) {
+      const original = result.requestId && source.experienceSource?.(session, result.requestId)
+      if (!original || original.staffId !== staffId) return
+      const location = source.resultFileIdentity?.(session, fileId)
+      const authoritative = result.kind === 'report' && !!location
+      const prior = authoritative && published.filter(entry => entry.id !== result.id && entry.kind === 'report' && entry.at < result.at)
+        .sort((a,b) => b.at.localeCompare(a.at))
+        .flatMap(entry => entry.attachments.filter(candidate => source.resultFileIdentity?.(session, candidate.id) === location))[0]
+      const replacementOf = prior && prior.version !== ref.version
+        ? artifactSource({...verified, fileId: prior.id, version: prior.version}) : undefined
+      if (!learningRefsAllowed(workspaceId, original.refs, staffId, replacementOf)) return
+      return {origin, source: artifactSource(verified), replacementOf, authoritative}
+    }
+    const lines = learningGroupLines(session)
+    const attached = artifactLine(lines, result, fileId)
+    if (!attached || (staffId && attached.line.speakerId !== staffId)) return
+    const publishedLine = lines.find(line => line.seq === lineSeq(result.messageId))
+    if (!publishedLine) return
+    const final = (entry: StoredResult, line: GroupLine | undefined) => entry.kind === 'report'
+      && !!(line?.memberCompleted || /^checkpoint:\d+:final$/.test(entry.requestId ?? ''))
+    const authoritative = final(result, publishedLine) && published.some(entry => entry.id === result.id)
+    // A completed publication of a new version at the same path supersedes the previous publication.
+    const prior = authoritative && published.filter(entry => entry.at <= result.at && final(entry, lines.find(line => line.seq === lineSeq(entry.messageId))))
+      .flatMap(entry => entry.attachments.flatMap(file => {
+        const previous = artifactLine(lines, entry, file.id)
+        return previous && previous.line.seq < attached.line.seq && previous.path === attached.path
+          && previous.line.speakerId === attached.line.speakerId ? [{seq: previous.line.seq, file}] : []
+      })).sort((a,b) => b.seq - a.seq)[0]
+    const replacementOf = prior && prior.file.version !== ref.version
+      ? artifactSource({...verified, fileId: prior.file.id, version: prior.file.version}) : undefined
+    if (!learningRefsAllowed(workspaceId, attached.line.experienceRefs, staffId, replacementOf)
+      || !learningRefsAllowed(workspaceId, publishedLine.experienceRefs, staffId, replacementOf)) return
+    return {origin, source: artifactSource(verified), replacementOf, authoritative}
   }
   groups?.attach({
     holdOrderWakes: !!review,
@@ -1442,21 +1642,22 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         if (memoryId) {
           const version = Number(url.searchParams.get('version'))
           if (!Number.isSafeInteger(version) || version < 1) return workspaceError(400, '请选择有效的经验版本')
-          return ok({memory: staff.experienceVersion(local, memoryId, version, sharedOnly)})
+          return ok({memory: staff.experienceVersion(local, memoryId, version, sharedOnly), timeZone})
         }
-        return ok(impact ? {impact:staff.impact(impact,local)} : staff.view(local,sharedOnly))
+        return ok(impact ? {impact:staff.impact(impact,local)} : {...staff.view(local,sharedOnly), timeZone})
       }
       if (local) store.writable(local)
       if (body.action === 'organize') {
         if (!learning) return workspaceError(503, '经验整理服务暂不可用')
         mutationKey(seg, body)
-        const organized = await learning.flush(local)
+        const organized = await learning.flush(local, sharedOnly)
         current()
         groups?.refresh(local)
-        return ok({...staff.view(local,sharedOnly), organized})
+        return ok({...staff.view(local,sharedOnly), organized, timeZone})
       }
       if (sharedOnly && body.audience !== 'shared') return workspaceError(400,'请从幕僚页面管理专属经验')
-      if (['proposed','witnessedToken','evidence','observed','source','discoveredBy','dependencies'].some(key => body[key] !== undefined)) {
+      if (['proposed','witnessedToken','evidence','observed','source','discoveredBy','dependencies','actor',
+        'supports','supportsComplete','premise','maintenance','conflict','supportCount','experienceExpiresAt'].some(key => body[key] !== undefined)) {
         return workspaceError(400, '从经验页面手动保存时，来源为本人操作；请从原会话登记其他证据')
       }
       if (body.orderId !== undefined) {
@@ -1464,10 +1665,17 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         const order = store.delegation(local,body.orderId)
         if (body.audience !== 'shared' && order.staffId !== body.staffId) return workspaceError(409,'这张工单由其他人负责')
       }
-      const applied = staff.apply(local,body,sharedOnly)
+      const {expiresOn, ...operation} = body
+      if (expiresOn !== undefined) {
+        if (operation.action !== 'learn' && operation.action !== 'revise' && operation.action !== 'restore') {
+          return workspaceError(400, '请在编辑或恢复经验时设置有效期')
+        }
+        operation.experienceExpiresAt = expirationDate(expiresOn)
+      }
+      const applied = staff.apply(local,operation,sharedOnly)
       // Joining, leaving or a new duty or experience changes who is in the workspace's groups and what they know.
       groups?.refresh(local)
-      return ok(applied)
+      return ok({...applied, timeZone})
     }
     if (seg[1] === 'notices') {
       const [, , id, command, fileId] = seg
@@ -1813,10 +2021,10 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     }
     return {workspace:store.workspace(workspaceId), delegation, session, state}
   }
-  return Object.assign(route, { assign, follow, followup, notices, recover() {
+  return Object.assign(route, { assign, follow, followup, notices, resolveLearningOriginals, verifyLearningOriginal, recover() {
     if (disposed) return
     if (learning) for (const result of store.resultNotices()) {
-      if (result.messageId?.startsWith('g-') && !archived(result.workspaceId)) learnResult(result, true)
+      if (!archived(result.workspaceId)) learnResult(result, true)
     }
     // Turns a restart cut off: the owner hears it once, then the board forgets the mark.
     const interrupted = store.interruptedTurns()

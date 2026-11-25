@@ -5,7 +5,7 @@ import type { Staff } from '../core/model.ts'
 import type { StaffContext, StaffImpact, StaffMember, StaffMemory, StaffShare, StaffView } from '../core/workspace-staff.ts'
 import { EXPERIENCE_EVIDENCE_LIMIT, matchesExperiencePurpose, relevantExperience, type ExperienceDelivery, type ExperienceDeliveryTarget,
   type ExperienceEntry, type ExperienceEvidence, type ExperienceFeedback, type ExperienceMemory, type ExperienceQuery,
-  type ExperienceRef, type ExperienceSelection } from '../core/workspace-experience.ts'
+  type ExperienceMaintenance, type ExperienceRef, type ExperienceSelection, type ExperienceSupport } from '../core/workspace-experience.ts'
 import { defaultStaffPortrait, isSpeakerPortrait, isStaffAvatarShape, recommendStaffPortrait, type SpeakerPortrait, type SpeakerPortraits } from '../core/workspace-avatars.ts'
 import { WORKSPACE_ARCHIVED } from '../core/workspace-v2.ts'
 import { workspaceSpeakerId } from './workspace-speaker-id.ts'
@@ -28,10 +28,13 @@ interface StaffState {
   deliveries: Record<string, ExperienceDelivery>
   feedback: Record<string, ExperienceFeedback & { workspaceId?: string }>
   versions: Record<string, ExperienceVersion[]>
+  supersededPremises: Record<string, string>
+  pendingPremises: Record<string, string>
 }
 interface ExperienceVersion { memory: ExperienceMemory; dependencies: ExperienceRef[] }
 const empty = (): StaffState => ({schema:2, members:[], native:{}, dependencies:{}, memories:[], shares:[], generations:{},
-  receipts:{}, authority:{}, deliveries:{}, feedback:{}, versions:{}})
+  receipts:{}, authority:{}, deliveries:{}, feedback:{}, versions:{}, supersededPremises:{},pendingPremises:{}})
+const unattendedReviewMs = 90 * 24 * 60 * 60 * 1000
 function field(value: unknown, label: string, max: number) {
   if (typeof value !== 'string' || !value.trim() || value.length > max) return workspaceError(400, '请填写有效的' + label)
   return value.trim()
@@ -47,7 +50,8 @@ function tags(value: unknown, label: string) {
   if (!Array.isArray(value) || value.length > 12) return workspaceError(400, '请选择有效的' + label)
   return [...new Set(value.map(tag => field(tag, label, 80)))]
 }
-const evidenceKinds = new Set(['owner','group','delivery','tool','test','model-review','owner-acceptance','order'])
+const evidenceKinds = new Set(['owner','group','delivery','artifact','tool','test','model-review','owner-acceptance','order'])
+const directKinds = new Set(['artifact','tool','test'])
 function experienceEvidence(value: unknown, workspaceId?: string): ExperienceEvidence[] | undefined {
   if (value === undefined) return undefined
   if (!Array.isArray(value) || value.length > EXPERIENCE_EVIDENCE_LIMIT) return workspaceError(400, '请选择有效的经验依据')
@@ -58,8 +62,52 @@ function experienceEvidence(value: unknown, workspaceId?: string): ExperienceEvi
     return {kind:row.kind as ExperienceEvidence['kind'], id:field(row.id,'依据编号',240),
       workspaceId: optional(row.workspaceId,'依据工作区',160), sessionId:optional(row.sessionId,'依据会话',240),
       orderId:optional(row.orderId,'依据工单',160), messageId:optional(row.messageId,'依据消息',240),
+      turnId:optional(row.turnId,'依据回合',240), fileId:optional(row.fileId,'依据文件',240),
+      staffId:optional(row.staffId,'依据所属幕僚',160), resultId:optional(row.resultId,'依据交付',240),
       version:optional(row.version,'依据版本',240), quote:optional(row.quote,'依据原话',3000)}
   })
+}
+function scopedProof(evidence: ExperienceEvidence, memory: ExperienceMemory) {
+  return evidence.workspaceId === memory.workspaceId && (!evidence.staffId || evidence.staffId === memory.staffId)
+}
+function supportsFor(memory: ExperienceMemory, value: unknown, replace: boolean): ExperienceSupport[] {
+  if (!Array.isArray(value) || value.length > EXPERIENCE_EVIDENCE_LIMIT) return workspaceError(400,'请选择有效的工单支持依据')
+  const incoming = value.map(item => {
+    const record = object(item)
+    if (!record || !memory.workspaceId) return workspaceError(400,'归纳经验需要原工作区的工单依据')
+    const orderId = field(record.orderId,'依据工单',160)
+    const origin = field(record.origin,'原始结果标识',240)
+    const evidence = experienceEvidence(record.evidence,memory.workspaceId)
+    if (!evidence?.length || !evidence.every(item=>scopedProof(item,memory) && item.orderId === orderId && directKinds.has(item.kind))) {
+      return workspaceError(400,'工单支持需要本范围的可核实原件')
+    }
+    return {orderId,origin,evidence}
+  })
+  return [...new Map([...(replace ? [] : memory.supports ?? []),...incoming].map(item=>
+    [workspaceFingerprint([item.orderId,item.origin]),item])).values()].slice(-EXPERIENCE_EVIDENCE_LIMIT)
+}
+function independentSupports(supports: readonly ExperienceSupport[] = []) {
+  for (const [index,first] of supports.entries()) {
+    const other = supports.slice(index + 1).find(second=>first.orderId!==second.orderId && first.origin!==second.origin)
+    if (other) return [first,other]
+  }
+  return supports.slice(0,1)
+}
+function uniqueEvidence(evidence: ExperienceEvidence[]) {
+  const key = (item: ExperienceEvidence) => workspaceFingerprint([item.kind,item.id,item.version,item.quote])
+  return [...new Map(evidence.map(item=>[key(item),item])).values()].slice(0,EXPERIENCE_EVIDENCE_LIMIT)
+}
+function expiresAt(value: unknown, now: string) {
+  if (value === null) return undefined
+  if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d(?:\.\d{3})?)?(?:Z|[+-]\d\d:\d\d)$/.test(value)) {
+    return workspaceError(400,'请选择有效的经验期限')
+  }
+  const timestamp = Date.parse(value)
+  if (!Number.isFinite(timestamp) || timestamp <= Date.parse(now)) return workspaceError(400,'请选择将来的经验期限')
+  return new Date(timestamp).toISOString()
+}
+function premiseKey(premise: ExperienceEvidence, staffId?: string) {
+  return workspaceFingerprint([premise.workspaceId,staffId,premise.kind,premise.resultId,premise.fileId,premise.id,premise.version])
 }
 function experienceRefs(value: unknown): ExperienceRef[] {
   if (!Array.isArray(value) || value.length > 20) return workspaceError(400, '请选择有效的经验依赖')
@@ -125,13 +173,16 @@ function bump(memory: ExperienceMemory, now: string) {
   memory.version++
   memory.at = now
   delete memory.lastUsed
+  delete memory.lastDeliveredAt
 }
-function retire(db: StaffState, memory: ExperienceMemory, now: string, reason: string) {
+function retire(db: StaffState, memory: ExperienceMemory, now: string, change: ExperienceMaintenance) {
   if (memory.status === 'retired') return false
   recordVersion(db,memory)
   bump(memory,now)
   memory.status = 'retired'
-  memory.reason = reason
+  memory.reason = change.reason
+  memory.maintenance = change
+  delete memory.conflict
   advance(db,memory.staffId,memory.workspaceId)
   invalidateShares(db,s=>s.memoryId===memory.id)
   return true
@@ -185,6 +236,8 @@ export class WorkspaceStaffStore {
     db.deliveries ??= {}
     db.feedback ??= {}
     db.versions ??= {}
+    db.supersededPremises ??= {}
+    db.pendingPremises ??= {}
     let retired = false
     for (const member of db.members) {
       const native = db.native['role-' + member.id]
@@ -210,8 +263,9 @@ export class WorkspaceStaffStore {
       member.defaultPortrait = entry.defaultPortrait
       db.native['role-' + entry.id] = {name:entry.name,brief:entry.brief,retired:false}
     }
+    const expired = this.expireDue(db)
     const invalidated = this.invalidateDependencies(db)
-    if (retired || migrated || invalidated) this.save(db)
+    if (retired || migrated || expired || invalidated) this.save(db)
     return db
   }
 
@@ -232,7 +286,8 @@ export class WorkspaceStaffStore {
     if (visited.has(ref.id)) return false
     const memory = db.memories.find(item=>item.id===ref.id)
     if (memory) {
-      if (memory.status!=='active' || memory.version!==ref.version || checkArchive && memory.workspaceId && this.archived(memory.workspaceId)) return false
+      if (memory.status!=='active' || memory.version!==ref.version || this.invalidity(db,memory) || this.replacementPending(db,memory) ||
+        checkArchive && memory.workspaceId && this.archived(memory.workspaceId)) return false
       const next = new Set(visited).add(ref.id)
       return db.dependencies[memory.id]?.every(item=>this.live(db,item,next,checkArchive)) ?? true
     }
@@ -242,15 +297,77 @@ export class WorkspaceStaffStore {
       && this.live(db,{id:share.memoryId,version:ref.version},new Set(visited).add(ref.id),checkArchive)
   }
 
+  private invalidity(db: StaffState, memory: ExperienceMemory) {
+    const replaced = memory.premise && db.supersededPremises[premiseKey(memory.premise,memory.staffId)]
+    if (replaced) return {at:replaced,reason:'这条经验的材料版本已被替代'}
+    if (memory.expiresAt && Date.parse(memory.expiresAt) <= this.now().getTime()) {
+      return {at:memory.expiresAt,reason:'已到这条经验的有效期'}
+    }
+  }
+
+  private replacementPending(db: StaffState, memory: ExperienceMemory) {
+    return !!(memory.premise && db.pendingPremises[premiseKey(memory.premise,memory.staffId)])
+  }
+
+  /** Withhold an exact replaced premise immediately, while keeping the current record for reconciliation. */
+  holdReplacedExperience(workspaceId: string, staffId: string | undefined, references: readonly ExperienceRef[]) {
+    this.workspace(workspaceId)
+    if (!references.length || this.archived(workspaceId)) return
+    const db = this.read()
+    const at = this.now().toISOString()
+    let changed = false
+    for (const memory of db.memories) {
+      if (!memory.premise || memory.status==='retired' || memory.workspaceId!==workspaceId || memory.staffId!==staffId
+        || !references.some(ref=>sameRef(ref,memory))) continue
+      const key = premiseKey(memory.premise,staffId)
+      if (db.pendingPremises[key] || db.supersededPremises[key]) continue
+      db.pendingPremises[key] = at
+      changed = true
+    }
+    if (changed) {
+      this.invalidateDependencies(db)
+      this.save(db)
+    }
+  }
+
+  private supersedePremise(db: StaffState, premise: ExperienceEvidence, staffId: string | undefined, now: string) {
+    const key = premiseKey(premise,staffId)
+    db.supersededPremises[key] = db.pendingPremises[key] ?? now
+    delete db.pendingPremises[key]
+    return db.supersededPremises[key]
+  }
+
+  private expireDue(db: StaffState) {
+    const now = this.now().toISOString()
+    let changed = false
+    for (const memory of db.memories) {
+      const invalid = memory.status !== 'retired' && this.invalidity(db,memory)
+      if (invalid) changed = retire(db,memory,now,{action:'expire',actor:'system',...invalid}) || changed
+    }
+    return changed
+  }
+
   private invalidateDependencies(db: StaffState) {
     const now = this.now().toISOString()
     let changed = false
     for (const memory of db.memories) {
       if (memory.status!=='retired' && db.dependencies[memory.id]?.some(ref=>!this.live(db,ref,new Set<string>(),false))) {
-        changed = retire(db,memory,now,'来源经验或共享授权已失效') || changed
+        changed = retire(db,memory,now,{action:'expire',actor:'system',at:now,reason:'来源经验或共享授权已失效'}) || changed
       }
     }
     return changed
+  }
+
+  private projectMemory<T extends ExperienceMemory>(db: StaffState, memory: T, workspaceId?: string, current = true): T {
+    const {supports,lastDeliveredAt,...publicMemory} = memory
+    const reviewAt = Date.parse(lastDeliveredAt ?? memory.lastUsed?.at ?? memory.at)
+    const replacementPending = current && memory.status!=='retired' && this.replacementPending(db,memory)
+    const reviewSuggested = current && !replacementPending && memory.status === 'active' && this.now().getTime() - reviewAt >= unattendedReviewMs
+    const supporting = memory.status === 'proposed' ? supports?.flatMap(item=>item.evidence) : undefined
+    return {...publicMemory, lastUsed: !workspaceId || memory.lastUsed?.workspaceId === workspaceId ? memory.lastUsed : undefined,
+      ...(supporting?.length && {evidence:uniqueEvidence([...supporting,...memory.evidence ?? []])}),
+      ...(replacementPending && {replacementPending}),
+      ...(supports?.length && {supportCount:independentSupports(supports).length}), ...(reviewSuggested && {reviewSuggested})} as T
   }
 
   private present(db: StaffState, workspaceId?: string, sharedOnly = false): StaffView {
@@ -261,7 +378,7 @@ export class WorkspaceStaffStore {
     const project = <T extends ExperienceMemory>(m: T): T => {
       const reports = feedback.filter(item=>item.workspaceId===m.workspaceId && item.memory.id===m.id)
         .map(({workspaceId: _workspaceId, ...item})=>item)
-      return {...m, lastUsed: !workspaceId || m.lastUsed?.workspaceId === workspaceId ? m.lastUsed : undefined,
+      return {...this.projectMemory(db,m,workspaceId),
         ...(reports.length && {feedback:reports}), ...(db.versions[m.id]?.length && {previousVersions:db.versions[m.id]!.map(item=>item.memory.version)})}
     }
     const scoped = db.memories.filter(m=>!workspaceId || m.workspaceId===workspaceId || !m.workspaceId && m.status==='active')
@@ -336,6 +453,8 @@ export class WorkspaceStaffStore {
   }
 
   apply(workspaceId: string | undefined, body: Body, sharedOnly = false) {
+    if (['actor','supports','supportsComplete','premise','supersedes'].some(key=>body[key]!==undefined)
+      || ['expire','pause','support'].includes(String(body.action))) return workspaceError(400,'这里只接受主人操作')
     if (workspaceId) this.workspace(workspaceId)
     const db = this.read()
     const mutation = mutationKey(['v2','staff',workspaceId ?? ''],body)
@@ -343,12 +462,19 @@ export class WorkspaceStaffStore {
     if (previous && previous !== mutation.hash) return workspaceError(409,'此请求已用于另一项幕僚操作')
     if (!previous) {
       if (workspaceId && this.archived(workspaceId)) return workspaceError(409,WORKSPACE_ARCHIVED)
-      this.change(db,workspaceId,body)
+      const ownerQuote = body.action==='learn' && experienceEvidence(body.evidence,workspaceId)?.some(item=>item.kind==='owner')
+      this.change(db,workspaceId,body,ownerQuote ? 'owner' : 'manual')
       this.invalidateDependencies(db)
       db.receipts[mutation.key] = mutation.hash
       this.save(db)
     }
     return this.present(db,workspaceId,sharedOnly)
+  }
+
+  hasExperienceBatch(workspaceId: string | undefined, id: string, changes: Body[]) {
+    if (workspaceId) this.workspace(workspaceId)
+    const key = 'experience-' + workspaceFingerprint([workspaceId ?? null,id])
+    return this.read().receipts[key]===workspaceFingerprint(changes)
   }
 
   /** The source key and every mutation in a learning change set are committed together. */
@@ -374,22 +500,23 @@ export class WorkspaceStaffStore {
     for (const change of batch.changes) {
       if (change.action === 'feedback') this.addFeedback(db,workspaceId,change.feedback)
       else {
-        if (!['learn','revise','retire','accept','restore'].includes(String(change.action))) return workspaceError(400,'整理只处理经验与反馈')
+        if (!['learn','revise','retire','accept','restore','support','expire','pause'].includes(String(change.action))) return workspaceError(400,'整理只处理经验与反馈')
         if (change.action !== 'learn' && !Number.isSafeInteger(change.version)) return workspaceError(400,'请核对整理所依据的经验版本')
-        this.change(db,workspaceId,change)
+        this.change(db,workspaceId,change,change.actor==='owner' ? 'owner' : 'system')
       }
     }
+    this.expireDue(db)
     this.invalidateDependencies(db)
     db.receipts[key] = hash
     this.save(db)
     return 'applied'
   }
 
-  private change(db: StaffState, workspaceId: string | undefined, body: Body) {
+  private change(db: StaffState, workspaceId: string | undefined, body: Body, actor: ExperienceMaintenance['actor']) {
     const action = body.action
     if (body.audience === 'shared') {
       if (body.staffId !== undefined) return workspaceError(400,'共同经验属于当前范围')
-      return this.changeExperience(db,workspaceId,undefined,body)
+      return this.changeExperience(db,workspaceId,undefined,body,actor)
     }
     if (body.audience !== undefined && body.audience !== 'staff') return workspaceError(400,'请选择经验受众')
     if (action === 'create') {
@@ -455,7 +582,7 @@ export class WorkspaceStaffStore {
       advanceAuthority(db,staff.id,workspaceId)
       return
     }
-    return this.changeExperience(db,workspaceId,staff.id,body)
+    return this.changeExperience(db,workspaceId,staff.id,body,actor)
   }
 
   private sameScopeDependencies(db: StaffState, memory: Pick<ExperienceMemory,'workspaceId' | 'staffId'>, refs: ExperienceRef[]) {
@@ -488,12 +615,33 @@ export class WorkspaceStaffStore {
       memory.source = source
     }
     if (memory.source === 'observation' && memory.status === 'active' && (!memory.situation
-      || !memory.evidence?.some(item => item.kind==='tool' || item.kind==='test'))) {
-      return workspaceError(400,'观察生效前需要已验证的工具或测试依据和适用情境')
+      || !memory.evidence?.some(item => directKinds.has(item.kind)))) {
+      return workspaceError(400,'观察生效前需要已验证的原始结果和适用情境')
     }
   }
 
-  private changeExperience(db: StaffState, workspaceId: string | undefined, staffId: string | undefined, body: Body) {
+  private updatePremise(memory: ExperienceMemory, value: unknown) {
+    if (value === null) { delete memory.premise; return }
+    const premise = experienceEvidence([value],memory.workspaceId)?.[0]
+    if (!premise || premise.kind!=='artifact' || !premise.version || !premise.fileId || !premise.resultId || !scopedProof(premise,memory)) {
+      return workspaceError(400,'请选择已验证的本范围材料版本')
+    }
+    memory.premise = premise
+  }
+
+  private adoptSupported(memory: ExperienceMemory, now: string) {
+    const independent = independentSupports(memory.supports)
+    if (independent.length < 2) return false
+    memory.status = 'active'
+    memory.adoptedAt = now
+    memory.evidence = uniqueEvidence([...independent.flatMap(item=>item.evidence.slice(0,1)),
+      ...(memory.evidence ?? []),...independent.flatMap(item=>item.evidence.slice(1))])
+    memory.maintenance = {action:'accept',actor:'system',at:now,reason:'两个独立工单的原始结果支持这条做法'}
+    return true
+  }
+
+  private changeExperience(db: StaffState, workspaceId: string | undefined, staffId: string | undefined, body: Body,
+    actor: ExperienceMaintenance['actor']) {
     const action = body.action
     const now = this.now().toISOString()
     if (action === 'learn') {
@@ -507,7 +655,17 @@ export class WorkspaceStaffStore {
         source:body.proposed ? 'suggestion' : 'owner',recordedAt:now,adoptedAt:body.proposed ? undefined : now,version:1,at:now,orderId,
         discoveredBy:optional(body.discoveredBy,'经验发现者',160)}
       this.updateContent(memory,body)
+      if (body.experienceExpiresAt !== undefined) memory.expiresAt = expiresAt(body.experienceExpiresAt,now)
+      if (body.premise !== undefined) this.updatePremise(memory,body.premise)
       this.updateSource(memory,body)
+      if (actor !== 'manual' || !body.proposed) {
+        memory.maintenance = {action:actor === 'system' && !body.proposed ? 'accept' : 'learn',actor,at:now,
+          reason:optional(body.reason,'操作原因',500) ?? (actor === 'system' && !body.proposed ? '原始结果支持适用情境内的观察' : undefined)}
+      }
+      if (body.supports !== undefined) {
+        memory.supports = supportsFor(memory,body.supports,true)
+        if (memory.status==='proposed') this.adoptSupported(memory,now)
+      }
       if (body.dependencies !== undefined) {
         db.dependencies[id] = this.sameScopeDependencies(db,memory,experienceRefs(body.dependencies))
       } else if (body.proposed && workspaceId && staffId) {
@@ -518,7 +676,7 @@ export class WorkspaceStaffStore {
         db.dependencies[id] = db.memories.filter(m=>used.has(m.id)).map(m=>({id:m.id,version:m.version}))
       }
       db.memories.push(memory)
-      if (!body.proposed) advance(db,staffId,workspaceId)
+      if (memory.status==='active') advance(db,staffId,workspaceId)
       return
     }
     if (action === 'revoke') {
@@ -556,42 +714,130 @@ export class WorkspaceStaffStore {
       return
     }
     switch (action) {
-      case 'retire': {
+      case 'support': {
+        if (memory.status !== 'proposed' || memory.conflict || this.replacementPending(db,memory)) {
+          return workspaceError(409,'请先核对待采纳经验的状态')
+        }
+        const supports = supportsFor(memory,body.supports,body.supportsComplete===true)
+        if (independentSupports(supports).length < 2) {
+          memory.supports = supports
+          return
+        }
+        recordVersion(db,memory)
+        memory.supports = supports
+        this.adoptSupported(memory,now)
+        bump(memory,now)
+        break
+      }
+      case 'expire': {
+        const reason = optional(body.reason,'过期原因',500) ?? '适用的材料版本已被明确替代'
         const evidence = experienceEvidence(body.evidence,workspaceId)
-        if (retire(db,memory,now,optional(body.reason,'停用原因',500) ?? '已停用') && evidence) memory.evidence = evidence
+        if (!memory.premise || !evidence?.length || !evidence.every(item=>scopedProof(item,memory) && item.kind==='artifact')) {
+          return workspaceError(400,'过期需要本范围内的替代材料')
+        }
+        const at = this.supersedePremise(db,memory.premise,memory.staffId,now)
+        if (retire(db,memory,now,{action:'expire',actor,at,reason})) memory.evidence = evidence
         return
       }
-      case 'revise':
-        if (memory.status === 'retired') return workspaceError(409,'已停用的经验需要从历史版本恢复')
+      case 'pause': {
+        const evidence = uniqueEvidence(experienceEvidence(body.evidence,workspaceId) ?? [])
+        if (memory.status==='retired' || memory.conflict || evidence.length < 2 || evidence.some(item=>!scopedProof(item,memory))) {
+          return workspaceError(400,'暂停使用需要同范围的两份冲突依据')
+        }
+        const reason = optional(body.reason,'暂停原因',500) ?? '相同适用条件下的依据互相冲突，需要裁决'
+        const maintenance = {action:'pause',actor,at:now,reason} as const
+        if (!retire(db,memory,now,maintenance)) return
+        // A candidate remains available for review without becoming selectable.
+        if (db.versions[memory.id]?.at(-1)?.memory.status==='proposed') memory.status = 'proposed'
+        memory.conflict = evidence
+        return
+      }
+      case 'retire': {
+        const evidence = experienceEvidence(body.evidence,workspaceId)
+        const reason = optional(body.reason,'停用原因',500) ?? '已停用'
+        const maintenance = {action:'retire',actor,at:now,reason} as const
+        if (memory.status==='retired' && memory.conflict && actor!=='system') {
+          recordVersion(db,memory)
+          bump(memory,now)
+          memory.maintenance = maintenance
+          memory.reason = reason
+          delete memory.conflict
+        } else if (retire(db,memory,now,maintenance) && evidence) memory.evidence = evidence
+        return
+      }
+      case 'revise': {
+        const previous = db.versions[memory.id]?.at(-1)?.memory
+        const changingElapsedDate = body.experienceExpiresAt !== undefined && memory.maintenance?.action==='expire'
+          && memory.expiresAt === memory.maintenance.at
+        const resume = actor!=='system' && (memory.conflict || changingElapsedDate) && previous?.status
+        if (memory.status==='retired' && (!resume || resume==='retired')) return workspaceError(409,'已停用的经验需要从历史版本恢复')
         recordVersion(db,memory)
+        const originalPremise = memory.premise
+        const originalMeaning = workspaceFingerprint([memory.text,memory.situation,memory.boundary,memory.domains,memory.taskTypes])
         this.updateContent(memory,body)
+        if (body.experienceExpiresAt !== undefined) memory.expiresAt = expiresAt(body.experienceExpiresAt,now)
+        const changedMeaning = originalMeaning!==workspaceFingerprint([memory.text,memory.situation,memory.boundary,memory.domains,memory.taskTypes])
+        if (changedMeaning) {
+          delete memory.supports
+          if (actor!=='system') {
+            memory.source = 'owner'
+            if (body.evidence === undefined) delete memory.evidence
+          }
+        }
+        if (body.premise !== undefined) this.updatePremise(memory,body.premise)
+        else if (changedMeaning && actor!=='system') delete memory.premise
+        if (body.supersedes===true && originalPremise && memory.premise
+          && premiseKey(originalPremise,staffId)!==premiseKey(memory.premise,staffId)) {
+          this.supersedePremise(db,originalPremise,staffId,now)
+        }
+        if (memory.status==='retired' && resume) memory.status = resume
         this.updateSource(memory,body)
         memory.reason = optional(body.reason,'修订原因',500)
+        memory.maintenance = {action:'revise',actor,at:now,reason:memory.reason}
+        delete memory.conflict
         if (body.dependencies !== undefined) {
           const refs = experienceRefs(body.dependencies)
           if (refs.some(ref=>ref.id===memory.id)) return workspaceError(400,'经验不能依赖自身')
           db.dependencies[memory.id] = this.sameScopeDependencies(db,memory,refs)
         }
+        if (this.invalidity(db,memory) || this.replacementPending(db,memory)
+          || memory.status==='active' && db.dependencies[memory.id]?.some(ref=>!this.live(db,ref))) {
+          return workspaceError(409,'经验依据或有效期已变化，请使用当前材料')
+        }
         bump(memory,now)
         break
+      }
       case 'accept':
         if (memory.status==='active') return
         if (memory.status==='retired') return workspaceError(409,'已停用的经验需要从历史版本恢复')
-        if (db.dependencies[memory.id]?.some(ref=>!this.live(db,ref))) return workspaceError(409,'经验依据已变化，请重新核对')
+        if (this.invalidity(db,memory) || this.replacementPending(db,memory)
+          || db.dependencies[memory.id]?.some(ref=>!this.live(db,ref))) return workspaceError(409,'经验依据已变化，请重新核对')
         recordVersion(db,memory)
         if (body.evidence !== undefined) memory.evidence = experienceEvidence(body.evidence,workspaceId)
+        if (body.premise !== undefined) {
+          this.updatePremise(memory,body.premise)
+          if (this.invalidity(db,memory) || this.replacementPending(db,memory)) return workspaceError(409,'经验依据已变化，请重新核对')
+        }
         memory.status = 'active'
         this.updateSource(memory,body)
         bump(memory,now)
         memory.adoptedAt = now
+        memory.maintenance = {action:'accept',actor,at:now,reason:optional(body.reason,'采纳原因',500)}
+        delete memory.conflict
         break
       case 'restore': {
         if (body.version===undefined) return workspaceError(400,'请从当前版本恢复')
         const prior = db.versions[memory.id]?.find(row=>row.memory.version===body.restoreVersion)
         if (!prior || prior.memory.status==='retired') return workspaceError(409,'这个历史版本无法恢复')
+        if (this.invalidity(db,prior.memory) || this.replacementPending(db,prior.memory)) {
+          return workspaceError(409,'历史版本的有效期或材料已失效，请用当前资料更正')
+        }
         const refs = this.sameScopeDependencies(db,prior.memory,prior.dependencies)
         recordVersion(db,memory)
         const restored = {...prior.memory,version:memory.version}
+        restored.maintenance = {action:'restore',actor,at:now,reason:'恢复版本 ' + prior.memory.version}
+        restored.reason = restored.maintenance.reason
+        delete restored.conflict
         bump(restored,now)
         db.memories[db.memories.indexOf(memory)] = restored
         db.dependencies[memory.id] = refs
@@ -642,7 +888,11 @@ export class WorkspaceStaffStore {
     for (const share of db.shares) if (ids.has(share.id)) ids.add(share.memoryId)
     const prior = db.memories.filter(m=>ids.has(m.id))
     if (!prior.length) return
-    for (const m of prior) m.lastUsed = {workspaceId:context.workspaceId,orderId,at:this.now().toISOString()}
+    const at = this.now().toISOString()
+    for (const m of prior) {
+      m.lastUsed = {workspaceId:context.workspaceId,orderId,at}
+      m.lastDeliveredAt = at
+    }
     this.save(db)
   }
 
@@ -734,12 +984,12 @@ export class WorkspaceStaffStore {
     if (!additional.length) return
     const at = this.now().toISOString()
     db.deliveries[key] = {...target,workspaceId,entries:[...previous?.entries ?? [],...additional],at:previous?.at ?? at}
-    if (workspaceId && target.orderId) {
-      const used = new Map(additional.filter(ref=>this.live(db,ref)).map(ref=>[
-        db.shares.find(share=>share.id===ref.shareId)?.memoryId ?? ref.id,ref.version]))
-      for (const memory of db.memories) {
-        if (used.get(memory.id)===memory.version) memory.lastUsed = {workspaceId,orderId:target.orderId,at}
-      }
+    const used = new Map(additional.filter(ref=>this.live(db,ref)).map(ref=>[
+      db.shares.find(share=>share.id===ref.shareId)?.memoryId ?? ref.id,ref.version]))
+    for (const memory of db.memories) {
+      if (used.get(memory.id)!==memory.version) continue
+      memory.lastDeliveredAt = at
+      if (workspaceId && target.orderId) memory.lastUsed = {workspaceId,orderId:target.orderId,at}
     }
     this.save(db)
   }
@@ -757,7 +1007,7 @@ export class WorkspaceStaffStore {
     return db.memories.filter(row=>row.workspaceId===workspaceId).map(memory=>{
       const reports = feedback.filter(item=>item.workspaceId===workspaceId && item.memory.id===memory.id)
         .map(({workspaceId:_workspaceId,...item})=>item)
-      return {...memory,...(reports.length && {feedback:reports})}
+      return {...memory,...(this.replacementPending(db,memory) && {replacementPending:true}),...(reports.length && {feedback:reports})}
     })
   }
 
@@ -768,7 +1018,7 @@ export class WorkspaceStaffStore {
       && (!sharedOnly || row.audience==='shared'))
     const record = current?.version===version ? current : db.versions[memoryId]?.find(row=>row.memory.version===version)?.memory
     if (!current || !record || record.workspaceId!==workspaceId) return workspaceError(404,'此处没有这条经验的对应版本')
-    return record
+    return this.projectMemory(db,record,workspaceId,current===record)
   }
 
   private addFeedback(db:StaffState, workspaceId:string|undefined, input:unknown) {

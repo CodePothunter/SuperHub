@@ -30,6 +30,7 @@ export interface StaffShare {
   purpose?: string
 }
 export interface StaffView {
+  timeZone?: string
   scope: string
   workspaceId?: string
   members: StaffMember[]

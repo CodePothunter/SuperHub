@@ -201,6 +201,8 @@ body[data-ds-dark-theme]:not([data-chief-standalone]) .wv2 { ${darkPalette} }
 .wv2 .v2-staff-brief,.wv2 .v2-staff-memory p { white-space:pre-wrap; }
 .wv2 .v2-staff-memory { padding:14px; margin:8px 0; }
 .wv2 .v2-staff-memory small,.wv2 .v2-staff small { color:var(--v-muted); }
+.wv2 .v2-experience-meta { display:flex; align-items:baseline; flex-wrap:wrap; gap:4px 10px; }
+.wv2 .v2-experience-meta strong { font-size:13px; font-weight:650; }
 .wv2 .v2-staff-share { display:grid; justify-items:start; gap:4px; border-top:1px solid var(--v-line); padding-top:10px; margin-top:8px; }
 .wv2 .v2-dialog form>div:not([hidden])>label { display:grid; min-width:0; gap:5px; margin-bottom:13px; font-size:14px; font-weight:550; }
 .wv2 .v2-settings { max-width:960px; margin:2px 0 28px; }

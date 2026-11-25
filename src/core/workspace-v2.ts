@@ -379,6 +379,10 @@ export interface V2DialogueSource {
   briefEvidence?(session: V2Session, turnId: string, orderId: string): {text?:string; report?:{label?:string;text:string}}
   /** Locally archived final speech for this bound turn, without fetching native history or waking an agent. */
   savedResults?(session: V2Session, requestId: string): SavedOrderResults | undefined
+  /** Experience versions and staff scope carried by a locally completed turn. */
+  experienceSource?(session: V2Session, turnId: string): {refs: readonly {id: string; version: number}[]; staffId?: string} | undefined
+  /** Opaque identity of the published file's location, when the host archived an explicit output link. */
+  resultFileIdentity?(session: V2Session, fileId: string): string | undefined
   /** SuperHub's own working directory for the order (or the discussion) of a coding session; nothing is created. */
   workDirectory?(session: V2Session, workOrderId?: string): string | undefined
   read(session: V2Session): Promise<V2Transcript>

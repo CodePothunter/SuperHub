@@ -94,9 +94,11 @@ export function nativeSessionName(workspace: string | undefined, session: string
   const points = Array.from(name)
   return points.length > 80 ? points.slice(0, 79).join('') + '…' : name
 }
+interface ArchivedAttachment extends V2Attachment { locationId?: string }
+
 interface Journal {
   messages: V2Message[]
-  attachments: V2Attachment[]
+  attachments: ArchivedAttachment[]
   turns: Turn[]
   members: GroupMember[]
   groupLead?: string
@@ -155,8 +157,8 @@ function readSpeakers(session: V2Session, lead: string, journal: Journal): V2Mes
 }
 
 /** Snapshot only explicit output links resolving inside the public agent message's bound directory. */
-function linkedFiles(text: string, messageId: string, work: string): V2Attachment[] {
-  const result: V2Attachment[] = []
+function linkedFiles(text: string, messageId: string, work: string): ArchivedAttachment[] {
+  const result: ArchivedAttachment[] = []
   for (const link of text.matchAll(/\[([^\]\n]{1,160})\]\((?:<([^>\n]+)>|([^()\s]+))\)/g)) {
     if (result.length >= 12) break
     let path: string
@@ -184,7 +186,7 @@ function linkedFiles(text: string, messageId: string, work: string): V2Attachmen
       const content = data.toString('utf8')
       if (!data.equals(Buffer.from(content)) || content.includes('\0')) continue
       const id = 'a-' + dialogueKey(messageId, rel, content).slice(0, 36)
-      if (!result.some(a => a.id === id)) result.push({ id, label: link[1]!, format, content })
+      if (!result.some(a => a.id === id)) result.push({id, label: link[1]!, format, content, locationId: dialogueKey(work, rel)})
     } catch { /* Missing or out-of-scope references stay in the author's original text. */ }
     finally { if (fd !== undefined) closeSync(fd) }
   }
@@ -730,6 +732,13 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
     if (changed) save(location.journal, current)
   }
   return {
+    experienceSource(session, turnId) {
+      const turn = load(files(session).journal).turns.find(row => row.id === turnId && row.state === 'done')
+      if (turn) return {refs: turn.experience ?? [], staffId: turn.experienceStaffId}
+    },
+    resultFileIdentity(session, fileId) {
+      return load(files(session).journal).attachments.find(file => file.id === fileId)?.locationId
+    },
     staffSources(session,orderId,token) {
       const journal = load(files(session).journal)
       const lead = groups.leadId(session.workspaceId,session.id)
@@ -778,7 +787,8 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
         .filter(message => message.role === 'agent' && (!submitted || submitted.has(message.id)) &&
           messageWorkOrder(session, message) === orderId)
       const refs = new Set(messages.flatMap(message => (message.attachments ?? []).map(file => file.id)))
-      return { messages, attachments: journal.attachments.filter(file => refs.has(file.id)) }
+      return { messages, attachments: journal.attachments.filter(file => refs.has(file.id))
+        .map(({locationId: _locationId, ...file}) => file) }
     },
     briefEvidence(session, turnId, orderId) {
       const journal = load(files(session).journal)
@@ -917,7 +927,13 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
     },
     async attachment(session, id) {
       const journal = load(files(session).journal)
-      if (journal.messages.some(m => m.attachments?.some(ref => ref.id === id))) return journal.attachments.find(a => a.id === id)
+      if (journal.messages.some(m => m.attachments?.some(ref => ref.id === id))) {
+        const file = journal.attachments.find(a => a.id === id)
+        if (file) {
+          const {locationId: _locationId, ...attachment} = file
+          return attachment
+        }
+      }
     },
     dispose() { shutdown.abort(); groups.dispose() }
   }

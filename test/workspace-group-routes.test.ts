@@ -109,9 +109,10 @@ function fixture(options: { turnLimit?: number; review?: AcceptanceVerdict[] | '
     host = new WorkspaceGroupHost({ root, scope, store, approvals,
       roster: workspaceId => groupRoster({ workspaceId, staff: staff.view(workspaceId).members, native: NATIVE, defaults: { liaisonPinned: false },
         context: id => staff.context(workspaceId, id), liaisonName: '接口人' }),
-      runners: { dsh, codex } })
+      runners: { dsh, codex }, experience: staff })
     learning = options.llm && createExperienceLearning({root, scope, staff, writable: id => store.writable(id),
-      llm: () => options.llm, model: () => ({provider: 'fixture', model: 'fixture'})})
+      llm: () => options.llm, model: () => ({provider: 'fixture', model: 'fixture'}),
+      verifyOriginal: (evidence, audience) => route.verifyLearningOriginal(evidence, audience)})
     route = workspaceV2Routes({ staff, store, source, approvals, groups: host, learning, inputAttachments: options.inputAttachments, coordinate: options.coordinate, ...options.review && { review }, ...options.judge && { judge: async () => options.judge! },
       remind: (key, text, _order, extra) => reminders.push({ key, text, ...extra?.localOnly && { localOnly: true } }) })
     route.recover()
@@ -725,6 +726,100 @@ describe('工单交付提醒：成员在群里交出成果', () => {
     return { ws, job, dir: f.host().workDir(job.session) }
   }
 
+  it('用原版访谈附件采纳同区做法，复制的文件不能补足第二张工单', async () => {
+    const method = '访谈逐字稿保留时间戳，方便复核引文'
+    const condition = '适用于受访者已同意录音的访谈'
+    const result = '每条抽查引文可按时间戳定位到录音'
+    const proofText = '给引文逐条标上时间戳'
+    const f = fixture({llm: { async *stream(request) {
+      const input = JSON.parse(request.messages[0]!.content[0]!.text) as {
+        evidence?: Array<ExperienceEvidence & {original: boolean}>; existing?: Array<{id: string; text: string}>
+      }
+      const proof = input.evidence?.find(item => item.kind === 'artifact' && item.original && !item.staffId)
+      const known = input.existing?.find(item => item.text === method)
+      const answer = !input.evidence ? {action: 'none'} : {changes: !proof ? [] : [{
+        ...(known ? {action: 'support', id: known.id} : {action: 'learn', text: method, situation: condition, boundary: '仅用于核对引文来源'}),
+        basis: [proof.id], proofs: [{basis: proof.id, method: proofText, condition, result}],
+      }]}
+      yield {type: 'text-delta', text: JSON.stringify(answer)}
+    } }})
+    const ws = await f.workspace()
+    const path = '/' + ws.id + '/staff?experience=shared'
+    const body = (speaker: string) => [condition, proofText, result, '受访者：' + speaker].join('\n')
+    async function deliver(id: string, content: string, count: number, file = '逐字稿.md') {
+      const job = f.route().assign(id, '让研究员复核访谈引文的时间戳', undefined, ws.id, undefined,
+        {title: '访谈引文复核 ' + id, promise: '核对引文与录音'}, 'researcher')
+      await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(count))
+      writeFileSync(join(f.host().workDir(job.session), file), content)
+      f.dsh.answer('researcher', '已经核对访谈引文的时间戳：[逐字稿](' + file + ')')
+      await vi.waitFor(() => expect(f.store().resultNotices().some(row => row.orderId === job.delegation.id)).toBe(true))
+      await f.call(path, {action:'organize', audience:'shared', requestId:f.id()})
+      return job
+    }
+    const first = await deliver('interview-first', body('甲'), 1)
+    const memories = async () => (await f.call<StaffView>(path)).data.sharedExperiences
+    expect(await memories()).toEqual([expect.objectContaining({text:method, status:'proposed', supportCount:1})])
+    expect(f.staff().selectExperience({workspaceId:ws.id, task:'访谈出稿保留时间戳'}).entries).toEqual([])
+    await deliver('interview-copy', body('甲').replace(/\n/g, '\r\n'), 2, '逐字稿.txt')
+    expect(await memories()).toEqual([expect.objectContaining({text:method, status:'proposed', supportCount:1})])
+    const second = await deliver('interview-second', body('乙'), 3)
+    expect(await memories()).toEqual([expect.objectContaining({text:method, status:'active', supportCount:2,
+      maintenance:expect.objectContaining({actor:'system', action:'accept'})})])
+    const [adopted] = (await memories())!
+    const third = f.route().assign('interview-next', '让研究员复核访谈引文的时间戳', undefined, ws.id, undefined,
+      {title:'访谈出稿核对', promise: '访谈逐字稿保留时间戳，核对引文'}, 'researcher')
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(4))
+    expect(f.dsh.last('researcher').call).toMatchObject({workOrderId:third.delegation.id,
+      experience:{entries:[expect.objectContaining({id:adopted!.id, version:adopted!.version})]}})
+    const sources = adopted!.evidence?.filter(item => item.kind === 'artifact').map(item => item.orderId)
+    expect(sources).toEqual(expect.arrayContaining([first.delegation.id, second.delegation.id]))
+  })
+
+  it('新版原件正式交付后马上停用旧前提，整理确认后自动更正同一条经验', async () => {
+    const oldText = '引文定位依据为行号'
+    const newText = '引文定位依据为段号'
+    let finish!: () => void
+    const gate = new Promise<void>(resolve => { finish = resolve })
+    const f = fixture({llm: { async *stream(request) {
+      const input = JSON.parse(request.messages[0]!.content[0]!.text) as {
+        evidence?: Array<ExperienceEvidence & {original: boolean}>; existing?: Array<{id: string; replacement?: string}>
+      }
+      const artifact = input.evidence?.find(item => item.kind === 'artifact' && item.original && !item.staffId)
+      const previous = input.existing?.find(row => row.replacement === artifact?.id)
+      let answer: Record<string, unknown> = input.evidence ? {changes: []} : {action: 'none'}
+      if (artifact?.quote === oldText) answer = {changes:[{action:'learn', text:oldText, claim:'observation', exactEvidenceQuote:oldText,
+        situation:'访谈引文核对', boundary:'只用于当前发布的引用模板', basis:[artifact.id], premise:artifact.id}]}
+      if (artifact?.quote === newText && previous) {
+        await gate
+        answer = {changes:[{action:'revise', id:previous.id, oldQuote:oldText, exactEvidenceQuote:newText, basis:[artifact.id]}]}
+      }
+      yield {type:'text-delta', text:JSON.stringify(answer)}
+    } }})
+    const {ws, job, dir} = await assigned(f)
+    const get = () => f.staff().view(ws.id, true).sharedExperiences?.find(memory => memory.text.includes('引文定位依据'))
+    const file = join(dir, '引用模板.md')
+    writeFileSync(file, oldText)
+    f.dsh.answer('researcher', '正式交付：[引用模板](引用模板.md)')
+    await vi.waitFor(() => expect(get()).toMatchObject({status:'active', text:oldText, version:1}))
+    await f.route().follow('template-update', '项目引用模板改用段号', ws.id, job.delegation.id, '更新原引用模板并交付。')
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(2))
+    const {call, sink} = f.dsh.last('researcher')
+    writeFileSync(file, '正在考虑改用页码')
+    sink.stepped(call.callId, '处理中：[引用模板草稿](引用模板.md)')
+    expect(get()).toMatchObject({status:'active', text:oldText, version:1})
+    expect(get()?.replacementPending).toBeUndefined()
+    writeFileSync(file, newText)
+    f.dsh.answer('researcher', '正式交付更新版：[引用模板](引用模板.md)')
+    await vi.waitFor(() => expect(get()).toMatchObject({text:oldText, replacementPending:true}))
+    expect(f.staff().selectExperience({workspaceId:ws.id, task:'访谈引文核对'}).entries).toEqual([])
+    finish()
+    await vi.waitFor(() => expect(get()).toMatchObject({text:newText, status:'active', version:2,
+      maintenance:{actor:'system',action:'revise'}}))
+    expect(f.staff().selectExperience({workspaceId:ws.id, task:'访谈引文核对'}).entries).toEqual([
+      expect.objectContaining({text:newText, version:2}),
+    ])
+  })
+
   it('链接文件的发言登记一条提醒：绑定工单、群、原话行与附件版本；已读两端共用，重启后不重不丢', async () => {
     const root = mkdtempSync(join(tmpdir(), 'chief-group-notices-'))
     cleanup.push(() => rmSync(root, { recursive: true, force: true }))
@@ -1075,6 +1170,17 @@ describe('续上的成员回合也占着目录', () => {
 })
 
 describe('工作区共同经验入口', () => {
+  it('截止日期按工作区时区解析，拒绝非法日历日期与代填系统操作', async () => {
+    const f = fixture(), ws = await f.workspace()
+    const path = '/' + ws.id + '/staff?experience=shared'
+    const save = (extra: Record<string, unknown>) => f.call<StaffView>(path,
+      {requestId:f.id(), action:'learn', audience:'shared', text:'本区验收方法', ...extra})
+    expect((await save({expiresOn:'2040-02-30'})).status).toBe(400)
+    expect((await save({actor:'system'})).status).toBe(400)
+    expect(await save({expiresOn:'2040-02-29'})).toMatchObject({status:200, data:{timeZone:'Asia/Shanghai',
+      sharedExperiences:[{expiresAt:'2040-02-29T16:00:00.000Z', maintenance:{actor:'manual', action:'learn'}}]}})
+  })
+
   it('列表、写入回执和历史只返回共同经验，幕僚专属仍可在幕僚入口查看', async () => {
     const f = fixture()
     const ws = await f.workspace()

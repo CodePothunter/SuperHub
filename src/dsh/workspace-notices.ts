@@ -97,7 +97,8 @@ export class WorkspaceResultNotices {
     /** Called after results were checked, so new results can be reviewed (the liaison's acceptance). */
     private readonly checked?: () => void,
     /** Results of roster groups (absent: only coding and team sessions publish). */
-    private readonly groups?: GroupResultSource) {}
+    private readonly groups?: GroupResultSource,
+    private readonly recorded?: (result: StoredResult) => void) {}
 
   private present({text, requestId, ...notice}: StoredResult): OrderResultNotice {
     const order = this.store.delegation(notice.workspaceId, notice.orderId)
@@ -121,7 +122,9 @@ export class WorkspaceResultNotices {
         const evidence = this.source.savedResults(session, check.requestId)
         if (!evidence) continue
         if (check.state === 'unknown') this.store.confirmTurn(session, check.requestId)
-        this.store.publishResults(check.requestId, orderResults(this.store.scope, this.store.workspace(order.workspaceId), order, session, check.requestId, evidence))
+        const results = orderResults(this.store.scope, this.store.workspace(order.workspaceId), order, session, check.requestId, evidence)
+        this.store.publishResults(check.requestId, results)
+        for (const result of results) this.recorded?.(result)
       } catch (error) { failures.push(error) }
     }
     this.checked?.()
