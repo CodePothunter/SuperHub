@@ -1,5 +1,5 @@
 /**
- * 运行时：一个第二大脑上的全部装配——文件存储、引擎、执行者、工作电脑队列、花名册、定时器、发件箱、接口人、工具、接口。
+ * 运行时：一个第二大脑上的全部装配——文件存储、引擎、执行者、工作电脑队列、花名册、定时安排、发件箱、接口人、工具、接口。
  *
  * 由 src/index.ts 在第二大脑就绪后创建；换第二大脑、时区或并发数时 dispose 再重建，不重启 DSH。
  * 推送地址每次发送前现读配置，改了立即生效。
@@ -9,14 +9,13 @@ import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { slotKey, zonedInstant } from '../core/clock.ts'
+import { slotKey } from '../core/clock.ts'
 import type { Custom } from '../core/custom.ts'
 import { buildExport, confirmedWorkBehavior, type ExportTarget } from '../core/export.ts'
 import type { ExperienceEvidence, WorkspaceExperiencePort } from '../core/workspace-experience.ts'
 import { IMPORT_PROMPT } from '../core/onboarding.ts'
 import { Engine } from '../core/engine.ts'
 import { FileStore } from '../core/store.ts'
-import { Timers } from '../core/timers.ts'
 import { latestAssignment } from '../core/stage.ts'
 import type { Assignment, Ticket } from '../core/model.ts'
 import { captureUiSource, UI_SOURCE_PROOF_FILENAME } from '../../scripts/ui-source-proof.mjs'
@@ -61,6 +60,7 @@ import { GROUP_LEDGER_FILE, memberCompletionEvidenceId, readGroupLedger } from '
 import { LIAISON_AUTHOR } from '../core/workspace-v2.ts'
 import { acquireLock } from './lock.ts'
 import { makeNotifier, Outbox, type Notice } from './outbox.ts'
+import { ScheduleRunner, scheduleProducer, scheduleRoutes, ScheduleStore } from './schedules.ts'
 import { LIAISON_SEEN_FILE, LiaisonSeen } from './liaison-seen.ts'
 import { enqueueResultNotice, noticeDelivery, resultDelivery } from './result-notices.ts'
 import { situationText } from './poc-view.ts'
@@ -211,22 +211,14 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
     /** 本地时间：now 形如 2026-11-15T09:30，today 是它的日期部分。 */
     const clock = () => { const now = slotKey(new Date(), timeZone); return { now, today: now.slice(0, 10) } }
     const roster = new Roster(root, brain, () => clock().today)
-    const timers = new Timers(join(root, 'ops', 'timers.json'))
     const outbox = new Outbox(join(root, 'ops', 'outbox.json'))
+    // 定时安排：第一次启动时迁入旧 rules.yaml 的 rules 与 ops/timers.json 的跟进（之后不再读取它们）。
+    const schedules = new ScheduleStore(root, { timeZone, takeLegacyRules: save => brain.takeLegacyRules(save), warn: message => ctx.logger.warn('%s', message) })
+    if (schedules.migrated) log('定时安排已初始化：' + schedules.list().map(row => row.title + (row.enabled ? '' : '（停用）')).join('、'))
+    else if (brain.hasLegacyRules()) ctx.logger.warn('rules.yaml 里又出现了 rules：定时规则已不再读取，请改用接口人建立定时安排（「设置 → 定时安排」可查看）。')
     const liaisonSeen = new LiaisonSeen(join(root, 'ops', LIAISON_SEEN_FILE))
     /** 推送地址：设置里的优先，其次是旧版本用的环境变量。每次现读，改了马上生效。 */
     const notifier = () => makeNotifier(settings.get().notifyUrl ?? process.env.CHIEF_NOTIFY_URL)
-    /** 把主人或 agent 写的本地时间（YYYY-MM-DD 或 YYYY-MM-DDTHH:MM）换成时间点；只写日期的按当天 9 点。 */
-    const toInstant = (when: string): Date => {
-      const m = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}))?$/.exec(when.trim())
-      if (!m) return new Date(NaN)
-      return zonedInstant(Number(m[1]), Number(m[2]), Number(m[3]), m[4] ? Number(m[4]) * 60 + Number(m[5]) : 9 * 60, timeZone)
-    }
-    const timerRows = () => timers.list().map(t => ({ id: t.id, at: slotKey(new Date(t.at), timeZone).replace('T', ' '), text: t.text, by: t.by }))
-    const followUps = {
-      set: (when: string, text: string, by: string) => { const t = timers.add({ at: toInstant(when), text, by }, new Date()); return { id: t.id, at: slotKey(new Date(t.at), timeZone).replace('T', ' ') } },
-      cancel: (id: string) => timers.remove(id),
-    }
     brain.extraContext = () => {
       const lines = roster.lines().map(l => `${l.name}${l.health ? `（${l.health}）` : ''}${l.blocker ? `，受阻：${l.blocker}` : ''}`)
       const people = roster.people().map(p => `${p.name}${p.organization || p.role || p.team || p.groups?.length ? `（${[p.organization, p.groups?.join('、'), p.team, p.role].filter(Boolean).join('，')}）` : ''}`)
@@ -602,9 +594,17 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
         : original ? resultDelivery(root, ticket, original) : undefined)
       return { key: notice.key, at: notice.at, text: notice.text, ...notice.ticketId ? { ticketId: notice.ticketId } : {},
         ...notice.kind ? { kind: notice.kind } : {}, ...delivery ? { delivery } : {}, ...notice.order ? { order: notice.order } : {},
-        ...notice.delivery && !delivery ? { deliveryUnavailable: true } : {}, ...noticeState(notice.key, notice.ticketId, notice.order) }
+        ...notice.delivery && !delivery ? { deliveryUnavailable: true } : {}, ...notice.schedule ? { schedule: notice.schedule } : {},
+        ...noticeState(notice.key, notice.ticketId, notice.order) }
     }
     function noticeState(key: string, ticketId?: string, order?: Notice['order']): { status?: string; done?: boolean } {
+      if (key.startsWith('schedule:')) {
+        // The reminder itself stays unread until seen; its line only says what became of the schedule since.
+        const current = schedules.get(key.split(':')[1] ?? '')
+        if (!current) return { status: '这条定时安排已删除' }
+        if (current.at && current.lastRun?.slot === current.at) return { status: '一次性安排，已完成' }
+        return current.enabled ? {} : { status: '已停用' }
+      }
       if (key.startsWith('workspace-approval:')) {
         const status = workspaceApproval(key.split(':')[2] ?? '')
         return status === 'pending' ? {} : { status: status ? WORKSPACE_APPROVAL_LABEL[status] ?? '已处理' : '已结束', done: true }
@@ -679,8 +679,6 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
     const modeOf = (id: typeof ROSTER_SOURCES[number]['id']) => brain.sourceMode(id, ROSTER_SOURCES.find(s => s.id === id)!.fallback)
     const sources = () => [
       { id: 'inbox', name: '你的交办', what: '你对接口人说的、在台面上点的', mode: 'auto' as const, fixed: true },
-      ...brain.rules().map(r => ({ id: r.id, name: `定时：${r.id}`, what: `${r.when}，${r.text.slice(0, 60)}`, mode: 'auto' as const, fixed: true })),
-      { id: 'follow-up', name: '跟进', what: '接口人和幕僚给自己定的回头检查，到点触发', mode: 'auto' as const, fixed: true },
       { id: 'remote', name: '工作电脑回传', what: '外务在工作电脑上办完的事', mode: 'auto' as const, fixed: true },
       ...ROSTER_SOURCES.map(s => ({ id: s.id, name: s.name, what: s.what, mode: modeOf(s.id), fixed: false })),
     ]
@@ -809,7 +807,7 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
     }
     const worklines = new Worklines(engine, brain, roster)
     const discussions = new Discussions(engine, brain, executors, remote)
-    const deps = { rooms, requestRoomExecution, connectors, discussions, worklines, engine, brain, brainScope, remote, roster, available, clock, sources, timers: timerRows, push: () => notifier() !== undefined }
+    const deps = { rooms, requestRoomExecution, connectors, discussions, worklines, engine, brain, brainScope, remote, roster, available, clock, sources, push: () => notifier() !== undefined }
     const custom = new CustomStore(root, (message, paths) => brain.commit(message, { paths }))
     const ui = {
       dev,
@@ -908,12 +906,24 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
       remind: (key, text, order, options) => { outbox.enqueue(key, text, new Date(), undefined, { ...order && { order }, ...options?.localOnly && { localOnly: true } }) } })
     releases.push(() => v2Routes.dispose())
     v2Routes.recover()
-    releases.push(...registerTools(ctx, { ...deps, calendarWeek: day => calendarRoutes.week(day), personDetail:historyRoutes.personDetail, isLiaison, lookup, readOnlyExecution: (id: string) => executors.readOnly(id), executionBinding: (id: string) => executors.binding(id), followUps, ui, control: opts.control, importer, exporter, superhub, modelDefaults, workspaceStore, staffStore, learning, assign: v2Routes.assign, follow: v2Routes.follow, orderFollowup: v2Routes.followup, groups: groupHost, inputAttachments }))
+    releases.push(...registerTools(ctx, { ...deps, calendarWeek: day => calendarRoutes.week(day), personDetail:historyRoutes.personDetail, isLiaison, lookup, readOnlyExecution: (id: string) => executors.readOnly(id), executionBinding: (id: string) => executors.binding(id), schedules: { store: schedules, timeZone }, ui, control: opts.control, importer, exporter, superhub, modelDefaults, workspaceStore, staffStore, learning, assign: v2Routes.assign, follow: v2Routes.follow, orderFollowup: v2Routes.followup, groups: groupHost, inputAttachments }))
     for (const agent of ctx.agents.list?.() ?? []) rooms.attachContext(agent)
-    const legacyRoutes = runtimeRoutes({ ...deps, approvals, chat, liaisonSeen, followUps, custom, exporter, superhub, inputAttachments, llm: () => ctx.get('llm') })
+    const legacyRoutes = runtimeRoutes({ ...deps, approvals, chat, liaisonSeen, custom, exporter, superhub, inputAttachments, llm: () => ctx.get('llm') })
     const workspaceRoutes = superhubWorkspaceRoutes({ scope: brainScope, engine, brain, trace, superhub, goals, saa, rooms, commands: () => approvals.list() })
+    const scheduleRunner = new ScheduleRunner({ store: schedules, outbox, timeZone, warn: message => ctx.logger.warn('%s', message),
+      produce: scheduleProducer({ timeZone, workspaces: workspaceStore, learning, llm: () => ctx.get('llm'), model: liaisonModel, calendarWeek: day => calendarRoutes.week(day) }) })
+    /** 安静时段（22:30 到 8:00，按设置的时区）不推送，攒到早上。 */
+    const quietAt = (instant: Date) => { const hhmm = slotKey(instant, timeZone).slice(11); return hhmm >= '22:30' || hhmm < '08:00' }
+    const schedulesRoute = scheduleRoutes({ scope: brainScope, timeZone, store: schedules, push: () => notifier() !== undefined,
+      // 验收专用的拨钟入口：只有以 CHIEF_ACCEPTANCE_SCHEDULE_CLOCK=1 启动的隔离宿主才有（scripts/schedules-ui-regression.mjs）。
+      ...process.env.CHIEF_ACCEPTANCE_SCHEDULE_CLOCK === '1' && { debugTick: async (now: Date) => {
+        await scheduleRunner.tick(now)
+        const failure = await outbox.dispatch(notifier(), quietAt(now))
+        if (failure) throw Error(failure)
+      } } })
     const routes: Route = async (call, res) => {
       if (call.seg[0] === 'input-attachments') return inputAttachments.route(call, res)
+      if (call.seg[0] === 'v2' && call.seg[1] === 'schedules') return schedulesRoute(call, res)
       if (call.seg[0] === 'v2' && (call.seg[1] === 'calendar' || call.seg[1] === 'connections')) return calendarRoutes(call,res)
       if (call.seg[0] === 'v2' && (call.seg[1] === 'history' || call.seg[1] === 'people')) return historyRoutes(call, res)
       if (call.seg[0] === 'v2' && call.seg[1] === 'profile') return profileImports.route(call, res)
@@ -962,14 +972,6 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
       }
     }
 
-    /** 到点的跟进变成事件。先放进收件箱（按定时器 id 去重），再删记录：中途崩溃也不会重复或丢失。 */
-    const fireTimers = async () => {
-      for (const t of timers.due(new Date())) {
-        await engine.receive({ source: 'timer', dedupe: `timer:${t.id}`, meta: { rule: 'follow-up', by: t.by }, text: `跟进到点了（${t.by}在 ${t.createdAt.slice(0, 10)} 定的）：${t.text}` })
-        timers.remove(t.id)
-      }
-    }
-
     /**
      * 发件箱：待主人决定、工作结果、每天早上一条态势及研判失败的事。
      * 每类都有稳定的 key，同一件事只说一次。安静时段（22:30 到 8:00）不推送，攒到早上。
@@ -1000,21 +1002,17 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
       }
       // 部署结果：每次部署说一次
       if (dev) for (const d of deploys().slice(-10)) outbox.enqueue(`deploy:${d.id}`, d.ok ? `界面已更新：${d.title}。打开着的作战台会自动刷新；不满意跟接口人说"撤销"。` : `界面修改没有上线（${d.title}）：${d.detail.split('\n')[0]}`, now, d.ticket)
-      const quiet = hhmm >= '22:30' || hhmm < '08:00'
-      const failure = await outbox.dispatch(notifier(), quiet)
+      const failure = await outbox.dispatch(notifier(), quietAt(now))
       if (failure) ctx.logger.warn('%s', failure)
     }
 
     const tick = () => {
-      void engine.tickClock((rule, slot) => {
-        if (rule.id === 'weekly-dream') void learning.scheduled(slot).catch(learningProblem)
-      }).catch(e => ctx.logger.warn('时钟检查失败：%s', String(e)))
+      void scheduleRunner.tick().catch(e => ctx.logger.warn('定时安排检查失败：%s', String(e)))
       void v2Routes.followup.tick().catch(e => ctx.logger.warn('工单周报检查失败：%s', String(e)))
       try { v2Routes.notices.collect() } catch (error) { ctx.logger.warn('工单交付提醒待重试：%s', String(error)) }
       void engine.sweepRemote().catch(e => ctx.logger.warn('工作电脑超时检查失败：%s', String(e)))
       void prepMeetings().catch(e => ctx.logger.warn('会议准备检查失败：%s', String(e)))
       void rosterSources().catch(e => ctx.logger.warn('花名册来源检查失败：%s', String(e)))
-      void fireTimers().catch(e => ctx.logger.warn('跟进定时器检查失败：%s', String(e)))
       void notify().catch(e => ctx.logger.warn('发件箱处理失败：%s', String(e)))
     }
     stopEngine = () => engine.stop()

@@ -7,6 +7,7 @@ import { segment, useV2Read, useV2Write } from './workspace-v2-api.ts'
 import { defaultStaffPortrait } from '../core/workspace-avatars.ts'
 import { ChatAvatar } from './workspace-chat-avatar.tsx'
 import { StaffPortraitPicker } from './workspace-staff-portrait.tsx'
+import { DreamScheduleNote } from './workspace-schedules.tsx'
 import { isExperienceVersion, isSharedExperienceVersion, isStaffImpact, isStaffRecipients, isStaffView, staffPath } from './workspace-staff-response.ts'
 import { isAttachmentView } from './workspace-v2-response.ts'
 import { V2AttachmentContent } from './workspace-v2-talk.tsx'
@@ -21,6 +22,8 @@ interface Props {
   openOrder:(workspace:string,order:string)=>void
   openEvidence?:(source:ExperienceEvidence)=>void
   openGlobal?:(id?:string)=>void
+  /** 「设置 → 定时安排」：每周经验整理在那里开关。 */
+  openSchedules?:()=>void
   assign?:(member:StaffMember)=>void
 }
 type Action = 'create' | 'invite' | 'join' | 'duty' | 'edit' | 'leave' | 'learn' | 'revise' | 'share' | 'reset'
@@ -64,7 +67,7 @@ function maintenanceLabel(memory: ExperienceMemory) {
 }
 
 export function StaffBoard(props:Props) {
-  const {workspace,spaces,selected,experience,select,openMembership,openOrder,openGlobal,openEvidence,assign} = props
+  const {workspace,spaces,selected,experience,select,openMembership,openOrder,openGlobal,openEvidence,openSchedules,assign} = props
   const workspaceId = workspace?.workspace.id
   const path = staffPath(workspaceId,experience)
   const query = useV2Read(path,isStaffView,10000)
@@ -162,6 +165,7 @@ export function StaffBoard(props:Props) {
       <header className="v2-section-head"><h2>工作区经验</h2>
         {!readOnly && <button className="v2-button" disabled={write.busy} onClick={organize}>{write.busy ? '处理中…' : '现在整理'}</button>}
       </header>
+      <DreamScheduleNote openSchedules={openSchedules}/>
       {showShared(sharedMemories.filter(m=>m.workspaceId === workspaceId),'本区共同经验')}
       {inheritedShared.length > 0 && <section className="v2-staff-section" aria-label="全局共同经验">
         <div className="v2-section-head"><h3>全局共同经验</h3>

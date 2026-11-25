@@ -11,12 +11,15 @@ import { hasPublicReply, liaisonNotice } from '../core/liaison-unread.ts'
 import type { ChatView } from '../dsh/chat.ts'
 import { useMarkLiaisonSeen } from './workspace-liaison-unread.tsx'
 import { ChatComposer, MessageInputAttachments, useChatAttachments } from './chat-attachments.tsx'
+import { NoticeScheduleActions, SCHEDULE_STYLE } from './workspace-schedules.tsx'
 
 interface Links {
   openProfileImport: (id: string) => void
   openRoom?: (id: string) => void
   openWorkspace: (id: string) => void
   openDelegation?: (workspaceId: string, delegationId: string) => void
+  /** 「设置 → 定时安排」：定时提醒下的「在设置中查看」。 */
+  openSchedules?: () => void
 }
 interface Props extends Links {
   scope: string; surface: SuperhubSurface; selectedId?: string; sessionId?: string; workOrderId?: string; changed: () => void; close: () => void
@@ -44,23 +47,24 @@ type LiaisonSpeech = Pick<ChatMessage, 'role' | 'time' | 'text' | 'discussions' 
 type ChatNotice = ChatView['notices'][number]
 
 /** A reminder the liaison sends on its own (an order completed, waits for the owner, or stopped short), as one of its turns. */
-function NoticeBody({ notice, openRoom, openDelegation }: Pick<Links, 'openRoom' | 'openDelegation'> & { notice: ChatNotice }) {
+function NoticeBody({ notice, openRoom, openDelegation, openSchedules }: Pick<Links, 'openRoom' | 'openDelegation' | 'openSchedules'> & { notice: ChatNotice }) {
   return <>
     <p className="v2-notice-text">{notice.text}</p>
     {notice.status && <small className="v2-notice-status">{notice.status}</small>}
     {notice.order && openDelegation && <button type="button" className="v2-link" onClick={() => openDelegation(notice.order!.workspaceId, notice.order!.orderId)}>打开工单</button>}
     {notice.roomId && openRoom && <button type="button" className="v2-link" onClick={() => openRoom(notice.roomId!)}>打开讨论</button>}
+    {notice.schedule && <NoticeScheduleActions schedule={notice.schedule} status={notice.status} openSchedules={openSchedules}/>}
   </>
 }
 
-function LiaisonTurn({ message, result, notice, id, scope, sessionId, openProfileImport, openRoom, openWorkspace, openDelegation }: Links & { id?:string; scope: string; sessionId?: string; message: LiaisonSpeech; result?: DiscussionResult; notice?: ChatNotice }) {
+function LiaisonTurn({ message, result, notice, id, scope, sessionId, openProfileImport, openRoom, openWorkspace, openDelegation, openSchedules }: Links & { id?:string; scope: string; sessionId?: string; message: LiaisonSpeech; result?: DiscussionResult; notice?: ChatNotice }) {
   const mine = message.role === 'you'
   const at = new Date(message.time).toISOString()
   return <li data-message-id={id} className={'v2-turn' + (mine ? ' mine' : '') + (notice?.done ? ' settled' : '')}>
     <ChatAvatar portrait={mine ? ownerPortrait : liaisonPortrait}/>
     <div className="v2-message"><div className="v2-byline"><strong>{mine ? '我' : '接口人'}</strong><time dateTime={at}>{readableTime(at)}</time></div>
       <div className="v2-bubble">
-        {notice && <NoticeBody notice={notice} openRoom={openRoom} openDelegation={openDelegation}/>}
+        {notice && <NoticeBody notice={notice} openRoom={openRoom} openDelegation={openDelegation} openSchedules={openSchedules}/>}
         {result && <DiscussionReply result={result} open={openRoom} className="v2-markdown"/>}
         {message.text && <Markdown text={message.text} className="v2-markdown"/>}
         <MessageInputAttachments scope={scope} target={sessionId ? {sessionId} : undefined} attachments={message.inputAttachments}/>
@@ -75,7 +79,7 @@ function LiaisonTurn({ message, result, notice, id, scope, sessionId, openProfil
   </li>
 }
 
-export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, openWorkspace, openDelegation, workspace, surface, selectedId, sessionId, workOrderId, changed, pending }: Props) {
+export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, openWorkspace, openDelegation, openSchedules, workspace, surface, selectedId, sessionId, workOrderId, changed, pending }: Props) {
   const { revoke } = useContext(V2Client)
   const chat = useChat(changed, scope, revoke)
   const key = 'superhub-v2:draft:' + scope + ':liaison:' + (['people','calendar'].includes(surface) ? surface + ':' + (selectedId ?? '') : workspace?.id ?? '')
@@ -148,14 +152,14 @@ export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, op
   }
 
   return <V2Dialog title="接口人" meta={workspace?.name} close={close} size="wide">
-    <style>{style + chatAvatarStyle}</style><div className="v2-liaison">
+    <style>{style + chatAvatarStyle + SCHEDULE_STYLE}</style><div className="v2-liaison">
       {pending && <div className="v2-liaison-actions">{pending}</div>}
       <div className="v2-liaison-history" ref={history} onScroll={event => {
         const el = event.currentTarget
         following.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60
       }}>
         {feed.length > 0 && <ol className="v2-turns" aria-label="接口人对话">
-          {feed.map(({ id, message, result, notice }) => <LiaisonTurn key={id ?? 'liaison-live'} id={id} scope={scope} sessionId={chat.sessionId} message={message} result={result} notice={notice} openProfileImport={openProfileImport} openRoom={openRoom} openWorkspace={openWorkspace} openDelegation={openDelegation}/>)}
+          {feed.map(({ id, message, result, notice }) => <LiaisonTurn key={id ?? 'liaison-live'} id={id} scope={scope} sessionId={chat.sessionId} message={message} result={result} notice={notice} openProfileImport={openProfileImport} openRoom={openRoom} openWorkspace={openWorkspace} openDelegation={openDelegation} openSchedules={openSchedules}/>)}
         </ol>}
       </div>
       <form className="v2-compose" onSubmit={event => { event.preventDefault(); void send() }}>

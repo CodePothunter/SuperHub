@@ -42,7 +42,7 @@ export function readPlace(scope: string): Place {
   const id = (key: string) => params.get(key) || undefined
   const view = params.get('view')
   const staffPanel = params.get('panel') === 'staff' ? 'staff' : undefined
-  if (view === 'settings') return {view,panel:staffPanel,item:staffPanel && id('item')}
+  if (view === 'settings') return {view,panel:staffPanel,item:staffPanel ? id('item') : id('item') === 'schedules' ? 'schedules' : undefined}
   if (view === 'calendar') return {view,date:id('date')}
   if (view === 'people' || view === 'history' || view === 'profile') return {view,item:id('item')}
   const panel = params.get('panel')
@@ -157,6 +157,8 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
   const openDelegation = (id: string) => go({ view: 'workspace', workspace: chosenId, delegation: id })
   const openSession = (id: string, from?: string, message?: string) => go({ view: 'workspace', workspace: chosenId, panel: 'execution', session: id, delegation: from, message })
   const openHistory = (item?: string) => go({ view: 'history', item })
+  /** 「设置 → 定时安排」：从接口人的定时提醒或「经验」面板进入，落在这一节。 */
+  const openSchedules = () => go({ view: 'settings', item: 'schedules' })
   const openProfile = (item?: string) => {
     const scrollTop = page.current?.scrollTop ?? 0
     if (place.view !== 'profile') profileParent.current = {place,scrollTop,fromLiaison:popup === 'liaison'}
@@ -262,7 +264,8 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
       {selecting && archived && shown && <ArchivedBanner workspace={shown} restored={async () => { await reread(); setNotice('已恢复「' + shown.name + '」。') }}/>}
       {place.view === 'history' && <HistoryPanel itemId={place.item} openItem={openHistory} back={() => openHistory()}/>}
       {place.view === 'profile' && <WorkspaceProfileImports selected={place.item} open={openProfile}/>}
-      {place.view === 'settings' && !staffPanel && <WorkspaceSettings configure={configure} reloadBrain={reloadBrain}
+      {place.view === 'settings' && !staffPanel && <WorkspaceSettings key={place.item ?? 'settings'} configure={configure} reloadBrain={reloadBrain}
+        focusSchedules={place.item === 'schedules'}
         openStaff={() => go({view:'settings',panel:'staff'})}/>}
       {place.view === 'settings' && staffPanel && <StaffBoard key={place.item ?? 'list'} spaces={spaces} selected={place.item}
         select={item => go({view:'settings',panel:'staff',item})} openOrder={(workspace,delegation) => go({view:'workspace',workspace,delegation})}
@@ -311,7 +314,7 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
                 ...source.sessionId && source.messageId && (source.kind !== 'owner' || view.sessions.some(session=>session.id === source.sessionId))
                   ? {panel:'execution',session:source.sessionId,message:source.messageId} : {}})}
               openMembership={(workspace,item) => go({view:'workspace',workspace,panel:'staff',item})}
-              openGlobal={item=>go({view:'settings',panel:'staff',item})}
+              openGlobal={item=>go({view:'settings',panel:'staff',item})} openSchedules={openSchedules}
               assign={staff => newOrder(undefined,staff)}/>
             : place.delegation ? delegation ? <WorkOrderPage key={delegation.id} job={delegation} view={view} base={base} message={place.message}
               back={() => go({ view: 'workspace', workspace: chosenId }, 'job-' + delegation.id)}
@@ -339,7 +342,7 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
       openDelegation={(workspace, delegation) => { void enterCreated({view:'workspace',workspace,delegation}, async () => {
         await Promise.all([index.refresh(), workspace === chosenId && current.refresh()])
       }) }}
-      openRoom={id => openHistory(historyItemId('room', id))}/>}
+      openRoom={id => openHistory(historyItemId('room', id))} openSchedules={openSchedules}/>}
     {(popup === 'import' || popup === 'export') && <TransferDialog key={popup} mode={popup} close={() => setPopup(undefined)}
       openProfile={() => openProfile()} openLibrary={() => openHistory()}/>}
     {popup === 'switch-space' && <V2Dialog title="切换工作区" close={() => setPopup(undefined)}>

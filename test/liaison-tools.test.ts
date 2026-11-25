@@ -31,6 +31,7 @@ import { workspaceV2Routes } from '../src/dsh/workspace-v2.ts'
 import { WorkspaceGroupHost } from '../src/dsh/workspace-group-host.ts'
 import { groupRoster } from '../src/dsh/workspace-group-members.ts'
 import { workspaceArchived, type V2Message, type V2Workspace } from '../src/core/workspace-v2.ts'
+import { ScheduleStore } from '../src/dsh/schedules.ts'
 import { liaisonSurfaceContext } from '../src/core/workspace-product.ts'
 import { briefText } from '../src/dsh/view.ts'
 
@@ -44,7 +45,10 @@ const staff: Staff[] = [role('chief'), role('researcher'), { ...role('strategist
 const defaults = { liaison: { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' }, liaisonPinned: false, codexModel: 'gpt-6.2-sol' }
 const settings: Settings = { timeZone: 'Asia/Shanghai', concurrency: 2, mobile: { enabled: false, port: 8787, host: '0.0.0.0' } }
 
-function host(options: { groups?: boolean } = {}) {
+/** 周三上午 10 点（上海）：定时安排的回执按这个时刻算下一次。 */
+const SCHEDULE_NOW = new Date('2026-11-25T02:00:00Z')
+
+function host(options: { groups?: boolean; push?: boolean } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'chief-liaison-tools-'))
   cleanup.push(() => rmSync(directory, { recursive: true, force: true }))
   const root = join(directory, 'brain')
@@ -123,6 +127,7 @@ function host(options: { groups?: boolean } = {}) {
   }})
   cleanup.push(() => { workspaceRoutes.dispose(); groups?.dispose() })
   const outbox = { enqueue: vi.fn() }
+  const schedules = new ScheduleStore(root, { timeZone: 'Asia/Shanghai', now: () => SCHEDULE_NOW })
   const requestRoomExecution = roomExecution({ rooms, superhub, engine, ticket: id => store.ticket(id), outbox: outbox as never, available: () => true })
   vi.spyOn(engine, 'delegate').mockResolvedValue('T-0099')
   const submitImport = vi.fn(async (_text: string, _source: string, requestId: string) => ({
@@ -130,13 +135,13 @@ function host(options: { groups?: boolean } = {}) {
   }))
   registerTools(ctx, {
     engine, brain, brainScope: scope, roster, rooms, requestRoomExecution, remote: new FileRemoteQueue(root), connectors: new Connectors(join(directory, 'connectors')),
-    available: () => true, clock: () => ({ today: '2026-11-19', now: '2026-11-19T17:33' }), push: () => false, timers: () => [],
+    available: () => true, clock: () => ({ today: '2026-11-19', now: '2026-11-19T17:33' }), push: () => options.push === true,
     sources: () => [{ id: 'inbox', name: '你的交办', what: '主人', mode: 'auto', fixed: true }, { id: 'stale-contact', name: '该联系了', what: '提醒', mode: 'observe', fixed: false }],
     isLiaison: (id: string) => id === 'hq', lookup: { info: () => ({ subagent: false }) },
     executionBinding: (id: string) => id === 'executor' ? { ticketId: 'T-0001', assignmentId: 'A-1' } : undefined,
     calendarWeek: async () => ({ scope,week:'2026-11-16',today:'2026-11-19',timeZone:'Asia/Shanghai',entries:[],sources:[],issues:[] }),
     personDetail: history.personDetail,
-    followUps: { set: () => ({ id: 'F-1', at: '2026-11-20 09:00' }), cancel: () => true },
+    schedules: { store: schedules, timeZone: 'Asia/Shanghai', now: () => SCHEDULE_NOW },
     ui: { dev: false, custom: new CustomStore(root), request: async () => 'T-0100', rollback: () => {}, status: () => ({ build: 'test', dev: false, deploying: false, recent: [] }) },
     // 与 src/index.ts 的 showSettings 相同：公开设置加运行信息。未设推送地址是 11-19 的原始故障。
     control: { show: () => ({ ...publicSettings(settings), dev: false, git: true, mobile: { ...publicSettings(settings).mobile, running: false, addresses: [] } }), update: async () => '已保存' },
@@ -166,7 +171,7 @@ function host(options: { groups?: boolean } = {}) {
     const agent = agents.get(session)!
     agent.events.push({ type: 'user/message', seq: agent.events.length + 1, time: Date.now(), data: { id: `a-${agent.events.length + 1}`, source: { kind: 'agent-message', senderSessionId: 'member' }, content: [{ type: 'text', text }] } })
   }
-  return { memberCalls, groups, root, brain, store, workspaceStore, staffStore, workspaceRoutes, messages, history, engine, intake: superhub, rooms, registered, admissions, call, liaison, ownerTurn, leadOf, ownerSays, endTurn, memberSays, requestRoomExecution, outbox, teammates, submitImport }
+  return { schedules, memberCalls, groups, root, brain, store, workspaceStore, staffStore, workspaceRoutes, messages, history, engine, intake: superhub, rooms, registered, admissions, call, liaison, ownerTurn, leadOf, ownerSays, endTurn, memberSays, requestRoomExecution, outbox, teammates, submitImport }
 }
 
 const plain = (value: unknown) => {
@@ -261,7 +266,8 @@ describe('工具返回值的无损 JSON 契约', () => {
       chief_ticket: [[{ id: ticketId, action: 'view' }]],
       chief_lookup: [[{ what: 'overview' }]],
       chief_record: [[{ kind: 'person', person: '周岚', role: '评审' }]],
-      chief_followup: [[{ action: 'list' }], [{ action: 'set', when: '2026-11-20', text: '看评审意见' }]],
+      chief_schedule: [[{ action: 'list' }], [{ action: 'set', for: 'self', at: '2026-11-27T09:00', text: '看评审意见' }],
+        [{ action: 'set', title: '未关闭工单提醒', when: 'weekdays 09:00', content: 'open-orders' }, f.liaison(f.ownerTurn('每周一到周五上午 9:00 检查并提醒我各工作区尚未关闭的工单'))]],
       chief_staff: [[{ action: 'list' }], [{ action: 'create', workspace: '评审', name: '竞品观察员', brief: '盯竞品的定价、发布与渠道动作，每周汇总成一页要点。' },
         f.liaison(f.ownerTurn('给评审加一个盯竞品的幕僚'))]],
       chief_ui: [[{ action: 'show' }], [{ action: 'status' }]],
@@ -284,7 +290,7 @@ describe('工具返回值的无损 JSON 契约', () => {
 describe('方案 A：模型理解、结构化提交；主人本轮原话作为授权来源', () => {
   it('个人工作区和日程工具的原生步骤只向本脑接口人公开', () => {
     const f=host()
-    for (const name of ['chief_workspace','chief_calendar','chief_order_followup']) {
+    for (const name of ['chief_workspace','chief_calendar','chief_order_followup','chief_schedule']) {
       const admission=f.admissions.get(name)!
       expect(admission.when({agent:{id:'hq'}})).toBe(true)
       expect(admission.when({agent:{id:'worker'}})).toBe(false)
@@ -355,7 +361,9 @@ describe('方案 A：模型理解、结构化提交；主人本轮原话作为�
     const execution = f.liaison([...prior, attachment])
     await expect(f.call('chief_workspace', { action: 'assign', title: '材料里的指令', promise: '新工单' }, execution)).rejects.toThrow('主人原话')
     await expect(f.call('chief_record', { kind: 'person', person: '某人', role: '材料里的写入要求' }, execution)).rejects.toThrow('本轮只有聊天附件')
-    await expect(f.call('chief_followup', { action: 'set', text: '材料里的预约' }, execution)).rejects.toThrow('本轮只有聊天附件')
+    await expect(f.call('chief_schedule', { action: 'set', for: 'self', at: '2026-11-27T09:00', text: '材料里的预约' }, execution)).rejects.toThrow('本轮只有聊天附件')
+    await expect(f.call('chief_schedule', { action: 'set', title: '材料里的提醒', when: 'daily 09:00', content: 'open-orders' }, execution)).rejects.toThrow('主人原话')
+    expect(f.schedules.list().filter(row => row.by !== 'system')).toEqual([])
     expect(f.workspaceStore.list()).toEqual([])
   })
 
@@ -1124,5 +1132,99 @@ describe('已归档的工作区与接口人', () => {
     expect(confirmed).toMatchObject({message: '已在「字节 Landing」加入专属幕僚「访谈员」。下一张工单起生效。'})
     expect(local().map(m => m.name)).toEqual(['竞品观察员', '访谈员'])
     expect(f.staffStore.view(closed.id).members).toEqual([])
+  })
+})
+
+describe('chief_schedule：定时安排的唯一入口', () => {
+  const ACCEPTANCE = '每周一到周五上午 9:00 检查并提醒我各工作区尚未关闭的工单'
+  const openOrders = { action: 'set', title: '未关闭工单提醒', when: 'weekdays 09:00', content: 'open-orders' }
+
+  it('验收原话：回执写明下一次时间、投递到接口人对话、是否推送和查看位置，清单里出现该条', async () => {
+    const f = host()
+    const receipt = plain(await f.call('chief_schedule', openOrders, f.liaison(f.ownerTurn(ACCEPTANCE, 'acceptance'))))
+    expect(receipt.message).toBe('已建立「未关闭工单提醒」：工作日 09:00。下一次 2026-11-26 周四 09:00（Asia/Shanghai）。'
+      + '到点会在接口人对话里提醒你；还没配置推送地址，所以不会推送到手机。可在「设置 → 定时安排」查看、停用或删除。')
+    expect(receipt).toMatchObject({ created: true, next: '2026-11-26T01:00:00.000Z', schedule: { title: '未关闭工单提醒', when: 'weekdays 09:00', content: 'open-orders', by: 'owner', enabled: true } })
+    const listed = plain(await f.call('chief_schedule', { action: 'list' }))
+    expect((listed.schedules as { title: string }[]).map(row => row.title)).toEqual(['每周经验整理', '早报', '晚报', '未关闭工单提醒'])
+    const pushed = host({ push: true })
+    const withPush = await pushed.call('chief_schedule', openOrders, pushed.liaison(pushed.ownerTurn(ACCEPTANCE, 'acceptance')))
+    expect(withPush.message).toContain('到点会在接口人对话里提醒你，同时推送到手机。')
+    // 描述里写明回执即承诺：不得承诺回执以外的渠道。
+    expect(JSON.stringify(f.registered.get('chief_schedule'))).toMatch(/回执的 message 就是对主人的承诺/)
+  })
+
+  it('主人的安排需要本轮原话；接口人自己的跟进只能是一次性提醒，且同样进清单', async () => {
+    const f = host()
+    const earlier = f.ownerTurn(ACCEPTANCE, 'earlier')
+    await expect(f.call('chief_schedule', openOrders, f.liaison([...earlier, { type: 'turn/end', seq: 3, time: 3, data: {} }]))).rejects.toThrow('主人原话')
+    await expect(f.call('chief_schedule', openOrders, { agent: { id: 'staff', session: { snapshotEvents: () => earlier } } } as never)).rejects.toThrow('主人原话')
+    expect(f.schedules.list().filter(row => row.by !== 'system')).toEqual([])
+    const outside = f.liaison([...earlier, { type: 'turn/end', seq: 3, time: 3, data: {} }])
+    await expect(f.call('chief_schedule', { action: 'set', for: 'self', when: 'daily 09:00', text: '看看' }, outside)).rejects.toThrow('一次性')
+    await expect(f.call('chief_schedule', { action: 'set', for: 'self', at: '2026-11-27T09:00', content: 'open-orders' }, outside)).rejects.toThrow('reminder')
+    await expect(f.call('chief_schedule', { action: 'set', for: 'self', at: '2026-11-20T09:00', text: '已过去' }, outside)).rejects.toThrow('已经过了')
+    const self = plain(await f.call('chief_schedule', { action: 'set', for: 'self', at: '2026-11-27T09:00', text: '看周岚给没给评审意见' }, outside))
+    expect(self.message).toContain('已给自己定好跟进「跟进：看周岚给没给评审意见」：2026-11-27 09:00 一次。下一次 2026-11-27 周五 09:00')
+    expect(self.schedule).toMatchObject({ by: 'liaison', content: 'reminder', at: '2026-11-27T09:00', removable: true })
+    const owned = await f.call('chief_schedule', openOrders, f.liaison(f.ownerTurn(ACCEPTANCE, 'acceptance')))
+    const id = (owned.schedule as { id: string }).id
+    await expect(f.call('chief_schedule', { action: 'set', for: 'self', id, at: '2026-11-27T10:00', text: '改掉' }, outside)).rejects.toThrow('主人的定时安排')
+  })
+
+  it('停用、恢复、删除；系统内置的只能停用；修改只改给出的字段', async () => {
+    const f = host()
+    const created = await f.call('chief_schedule', openOrders, f.liaison(f.ownerTurn(ACCEPTANCE, 'acceptance')))
+    const id = (created.schedule as { id: string }).id
+    expect(id).toMatch(/^open-orders-[0-9a-f]{4}$/)
+    expect((await f.call('chief_schedule', { action: 'disable', id })).message).toBe('已停用「未关闭工单提醒」，在「设置 → 定时安排」里可以重新打开。')
+    expect(f.schedules.get(id)?.enabled).toBe(false)
+    expect((await f.call('chief_schedule', { action: 'enable', id })).message).toContain('下一次 2026-11-26 周四 09:00')
+    const moved = await f.call('chief_schedule', { action: 'set', id, when: 'weekly mon,thu 08:00' }, f.liaison(f.ownerTurn('改成周一和周四早上 8 点', 'move')))
+    expect(moved).toMatchObject({ created: false, schedule: { title: '未关闭工单提醒', whenLabel: '每周一、四 08:00', content: 'open-orders' } })
+    await expect(f.call('chief_schedule', { action: 'remove', id: 'weekly-dream' })).rejects.toThrow('不能删除，可以停用')
+    await expect(f.call('chief_schedule', { action: 'set', id: 'morning-brief', content: 'reminder', text: 'x' }, f.liaison(f.ownerTurn('早报改成提醒', 'brief')))).rejects.toThrow('不能改内容类别')
+    const brief = await f.call('chief_schedule', { action: 'set', id: 'morning-brief', when: 'weekdays 09:00' }, f.liaison(f.ownerTurn('早报改到 9 点', 'brief-time')))
+    expect(brief.message).toContain('这条安排目前已停用')
+    expect((await f.call('chief_schedule', { action: 'remove', id })).message).toBe('已删除定时安排「未关闭工单提醒」，之后不会再提醒。')
+    expect(f.schedules.get(id)).toBeUndefined()
+    await expect(f.call('chief_schedule', { action: 'set', title: '每半小时', when: 'every 30m', content: 'open-orders' }, f.liaison(f.ownerTurn('每半小时提醒', 'every')))).rejects.toThrow('不支持按间隔重复')
+  })
+
+  it('停用、恢复、删除主人或系统的安排需要主人本轮原话；接口人自己的跟进可以自己停', async () => {
+    const f = host()
+    const outside = f.liaison([...f.ownerTurn(ACCEPTANCE, 'earlier'), { type: 'turn/end', seq: 3, time: 3, data: {} }] as never)
+    const owned = await f.call('chief_schedule', openOrders, f.liaison(f.ownerTurn(ACCEPTANCE, 'acceptance')))
+    const id = (owned.schedule as { id: string }).id
+    const before = f.schedules.list()
+    for (const action of ['disable', 'remove']) {
+      await expect(f.call('chief_schedule', { action, id }, outside)).rejects.toThrow('需要本轮接口人会话中经宿主确认的主人原话')
+    }
+    await expect(f.call('chief_schedule', { action: 'disable', id: 'weekly-dream' }, outside)).rejects.toThrow('主人原话')
+    await expect(f.call('chief_schedule', { action: 'enable', id: 'morning-brief' }, outside)).rejects.toThrow('主人原话')
+    await expect(f.call('chief_schedule', { action: 'disable', id }, { agent: { id: 'staff', session: { snapshotEvents: () => [] } } } as never)).rejects.toThrow()
+    expect(f.schedules.list()).toEqual(before)
+
+    const self = await f.call('chief_schedule', { action: 'set', for: 'self', at: '2026-11-27T09:00', text: '看周岚给没给评审意见' }, outside)
+    const selfId = (self.schedule as { id: string }).id
+    expect((await f.call('chief_schedule', { action: 'disable', id: selfId }, outside)).message).toContain('已停用')
+    expect(f.schedules.get(selfId)?.enabled).toBe(false)
+    expect((await f.call('chief_schedule', { action: 'remove', id: selfId }, outside)).message).toContain('已删除')
+    expect(f.schedules.get(selfId)).toBeUndefined()
+
+    const turn = f.liaison(f.ownerTurn('先把未关闭工单提醒停掉', 'stop'))
+    expect((await f.call('chief_schedule', { action: 'disable', id }, turn)).message).toBe('已停用「未关闭工单提醒」，在「设置 → 定时安排」里可以重新打开。')
+    expect((await f.call('chief_schedule', { action: 'enable', id }, turn)).message).toContain('已恢复「未关闭工单提醒」')
+    expect((await f.call('chief_schedule', { action: 'remove', id }, turn)).message).toContain('已删除')
+    expect(f.schedules.get(id)).toBeUndefined()
+    await expect(f.call('chief_schedule', { action: 'disable', id }, turn)).rejects.toThrow('没有这条定时安排')
+  })
+
+  it('chief_settings 不再有规则动作，show 指向 chief_schedule', async () => {
+    const f = host()
+    const settings = f.registered.get('chief_settings')!
+    expect(JSON.stringify(settings.parameters)).not.toMatch(/rule/)
+    expect(await f.call('chief_settings', { action: 'show' })).toMatchObject({ schedules: expect.stringContaining('chief_schedule list') })
+    expect(f.registered.has('chief_followup')).toBe(false)
   })
 })

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { latestSlot, parseClock, slotKey } from '../src/core/clock.ts'
-import { Engine, parseDecision, type Brain, type ClockRule, type Executors, type RemoteQueue, type RemoteTask, type RunRequest, type RunResult } from '../src/core/engine.ts'
+import { Engine, parseDecision, type Brain, type Executors, type RemoteQueue, type RemoteTask, type RunRequest, type RunResult } from '../src/core/engine.ts'
 import type { Staff } from '../src/core/model.ts'
 import { reportFromRemote, reportFromText } from '../src/core/report.ts'
 import { FileStore } from '../src/core/store.ts'
@@ -74,14 +74,14 @@ const STAFF: Staff[] = [
   { id: 'reviewer', name: '审查官', executor: 'dsh', verifier: 'none', brief: '审查' },
 ]
 
-function setup(script: (request: RunRequest) => RunResult, rules: ClockRule[] = []) {
+function setup(script: (request: RunRequest) => RunResult) {
   const root = mkdtempSync(join(tmpdir(), 'chief-'))
   const store = new FileStore(root)
   const commits: string[] = []
   const saved: string[] = []
   const archived: string[] = []
   const brain: Brain = {
-    root, constitution: () => '主人刚入职', staff: () => STAFF, workspaces: () => [], rules: () => rules,
+    root, constitution: () => '主人刚入职', staff: () => STAFF, workspaces: () => [],
     workdir: id => join(root, 'work', id), appendNote: path => path, commit: message => { commits.push(message) },
     saveRemoteReport: (id, round, content) => {
       saved.push(`${id}#${round}`)
@@ -229,7 +229,7 @@ describe('engine', () => {
     hang = false
     const store2 = new FileStore(t.root)
     const engine2 = new Engine(store2, {
-      root: t.root, constitution: () => '', staff: () => STAFF, workspaces: () => [], rules: () => [],
+      root: t.root, constitution: () => '', staff: () => STAFF, workspaces: () => [],
       workdir: id => join(t.root, 'work', id), appendNote: p => p, commit: () => {},
     }, { available: () => true, supportsSchema: () => true, run: async () => ({ text: '', stopReason: 'completed', structured: { status: 'ready', summary: 'ok', verdict: 'pass', critique: 'ok' } }) },
     { dispatch: () => {}, cancel: () => {} }, { concurrency: 2, timeZone: TZ })
@@ -353,16 +353,6 @@ describe('engine', () => {
     t.advance(25 * 3_600_000)
     await t.engine.sweepRemote()
     expect(t.engine.views()[0]?.stage).toBe('you/blocked')
-  })
-
-  it('时钟规则：同一时刻只触发一次，过期太久不补发', async () => {
-    const t = setup(() => ({ text: '', stopReason: 'completed', structured: { action: 'ignore', reason: '测试' } }),
-      [{ id: 'brief', when: 'daily 08:30', text: '早报' }, { id: 'old', when: 'daily 01:00', text: '太早', graceMinutes: 60 }])
-    await t.engine.tickClock()
-    await t.engine.tickClock()
-    await t.settle()
-    const clockEvents = t.engine.recentEvents().filter(e => e.event.source === 'clock')
-    expect(clockEvents.map(e => e.event.meta?.rule)).toEqual(['brief'])
   })
 
   it('研判连续失败三次后标记为未完成，不阻塞后续事件', async () => {

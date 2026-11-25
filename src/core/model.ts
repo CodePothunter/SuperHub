@@ -4,8 +4,8 @@
  */
 import type { SpeakerPortrait } from './workspace-avatars.ts'
 
-/** 事件来源。`inbox` 是主人的投递，`clock` 是时钟规则与花名册来源，`timer` 是 agent 自己定的跟进，`remote` 是工作电脑回传，`system` 是插件自身。 */
-export type SourceKind = 'inbox' | 'clock' | 'timer' | 'remote' | 'system'
+/** 事件来源。`inbox` 是主人的投递，`clock` 是会议准备与花名册来源（旧数据里还有定时规则产生的），`remote` 是工作电脑回传，`system` 是插件自身。 */
+export type SourceKind = 'inbox' | 'clock' | 'remote' | 'system'
 
 /** 一条不可变事件。`dedupe` 相同的事件只入库一次。 */
 export interface ChiefEvent {

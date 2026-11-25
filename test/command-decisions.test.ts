@@ -57,7 +57,7 @@ function fixture() {
   const commands = () => rows
   const deps = {
     engine, brain, brainScope: scope, remote: new FileRemoteQueue(root), roster: new Roster(root, brain, () => '2026-11-19'), rooms,
-    available: () => true, clock: () => ({ today: '2026-11-19', now: '2026-11-19T17:20' }), sources: () => [], timers: () => [], push: () => false,
+    available: () => true, clock: () => ({ today: '2026-11-19', now: '2026-11-19T17:20' }), sources: () => [], push: () => false,
   }
   const workspace = superhubWorkspaceRoutes({ scope, brain, engine, trace, rooms, superhub, commands,
     goals: new SuperhubGoals(root, vi.fn()), saa: new SuperhubSaa(root, vi.fn()) })

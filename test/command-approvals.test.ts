@@ -226,7 +226,7 @@ const STAFF: Staff[] = [
 function engineWith(run: (request: RunRequest) => Promise<RunResult>) {
   const root = mkdtempSync(join(tmpdir(), 'chief-approval-'))
   const store = new FileStore(root)
-  const brain: Brain = { root, constitution: () => '', staff: () => STAFF, workspaces: () => [], rules: () => [], workdir: id => join(root, 'work', id), appendNote: path => path, commit: () => {} }
+  const brain: Brain = { root, constitution: () => '', staff: () => STAFF, workspaces: () => [], workdir: id => join(root, 'work', id), appendNote: path => path, commit: () => {} }
   const calls: RunRequest[] = []
   const executors: Executors = { available: () => true, supportsSchema: () => false, run: request => { calls.push(request); return run(request) } }
   const engine = new Engine(store, brain, executors, { dispatch: () => {}, cancel: () => {} }, { concurrency: 1, timeZone: 'Asia/Shanghai' })

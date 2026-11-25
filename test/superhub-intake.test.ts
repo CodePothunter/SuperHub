@@ -36,7 +36,7 @@ function fixture(installation?: string, brainScope = scope, brainName = brainSco
   const run = vi.fn(async () => ({ text: '', stopReason: 'completed' as const }))
   let intake: SuperhubIntake
   const brain: Brain = {
-    root, constitution: () => '', staff: () => staff, workspaces: () => [workspace], rules: () => [],
+    root, constitution: () => '', staff: () => staff, workspaces: () => [workspace],
     workdir: id => join(root, 'work', id), appendNote: path => path, commit: () => {},
   }
   const engine = new Engine(store, brain, { available: () => true, supportsSchema: () => true, run }, { dispatch() {}, cancel() {} }, {

@@ -12,7 +12,7 @@ import { LIAISON_PRODUCT_GUIDE, ORDER_FOLLOWUP_TOOL } from '../core/workspace-pr
 import { mergeHistory } from './liaison.ts'
 import type { TicketReplyReceipt } from './room-work.ts'
 import type { NoticeDelivery } from './result-notices.ts'
-import type { NoticeOrder } from './outbox.ts'
+import type { NoticeOrder, NoticeSchedule } from './outbox.ts'
 import { liaisonUnread } from '../core/liaison-unread.ts'
 import { chatAttachmentError, type ChatAttachments } from './chat-attachments.ts'
 import type { Agent, NativePromptPart, SessionController, SessionEventLike } from './ports.ts'
@@ -84,7 +84,7 @@ export interface ChatView {
   live?: LiveTurn
   /** 提醒；status 是这件事现在的状态（处理过的提醒会带上，页面上变暗）。 */
   notices: { key: string; at: string; text: string; ticketId?: string; roomId?: string; status?: string; done?: boolean;
-    kind?: 'result'; delivery?: NoticeDelivery; deliveryUnavailable?: boolean; order?: NoticeOrder }[]
+    kind?: 'result'; delivery?: NoticeDelivery; deliveryUnavailable?: boolean; order?: NoticeOrder; schedule?: NoticeSchedule }[]
   /** Persisted work replies projected alongside the native chat. */
   workReplies?: TicketReplyReceipt[]
   /** Results from discussions handed off from this private conversation. */
@@ -99,7 +99,7 @@ const clip = (text: unknown, n: number) => { const t = String(text ?? '').replac
 
 const TOOL_LABEL: Record<string, string> = {
   chief_record: '记入花名册', chief_lookup: '查了花名册', chief_inbox: '交给幕僚团', chief_ticket: '处理了工单', chief_brief: '看了态势',
-  chief_room: '衔接讨论', chief_followup: '定了跟进', chief_staff: '调整了幕僚', chief_ui: '改了界面',
+  chief_room: '衔接讨论', chief_schedule: '调整了定时安排', chief_staff: '调整了幕僚', chief_ui: '改了界面',
   chief_read_attachment: '读了聊天附件',
 }
 const RECORD_KIND: Record<string, string> = {
@@ -122,7 +122,10 @@ export function describeTool(name: string, rawArgs: string): { label: string; de
       return { label: labels[String(a.action)] ?? '查看工单跟进' }
     }
     case 'chief_ticket': return { label: `处理工单 ${clip(a.id, 10)}`, detail: String(a.action ?? '') }
-    case 'chief_followup': return { label: a.action === 'set' ? '定一个跟进' : '查看跟进', detail: clip([a.when, a.text].filter(Boolean).join('，'), 48) }
+    case 'chief_schedule': {
+      const labels: Record<string, string> = { list: '查看定时安排', set: a.for === 'self' ? '给自己定一个跟进' : '设定时安排', enable: '恢复定时安排', disable: '停用定时安排', remove: '删除定时安排' }
+      return { label: labels[String(a.action)] ?? '定时安排', detail: clip([a.title ?? a.id, a.when ?? a.at].filter(Boolean).join('，'), 48) }
+    }
     case 'chief_staff': return { label: '调整幕僚', detail: clip([a.name ?? a.id, a.action].filter(Boolean).join('，'), 30) }
     case 'chief_ui': return { label: '改界面', detail: clip(a.request ?? a.action, 48) }
     case 'chief_import': return { label: a.action === 'submit' ? '收录待核对资料' : '查看导入提示词' }
@@ -485,8 +488,10 @@ export const LIAISON_PROMPT = `${LIAISON_PRODUCT_GUIDE}
 ## 花名册还很空的时候
 主动帮他搭起来，一次问一个问题：先问他负责对接哪几个团队或项目（每个建一条横向线），再问每条线上的关键人物是谁、各自什么角色，然后问眼下最卡的是哪件事。每得到一个答案就记下来，再问下一个。
 
-## 跟进
-有些事要过几天才知道结果（"她说周三给"）。带日期的承诺系统会自己盯着，逾期会提醒，不用你管。除此之外需要回头看的事，用 chief_followup 给自己定一个跟进，写清到时候要检查什么。到点你会收到一条事件。不要为同一件事重复定。
+## 定时安排与跟进
+- 主人要定期或在某个时间提醒、汇总、写早报晚报（"每周一到周五上午 9 点提醒我各工作区还没关闭的工单""每周五下午提醒我写周报""早报改到 9 点"），用 chief_schedule 的 set 建立或修改；问现在有哪些定时提醒用 list；要停、恢复或删掉用 disable / enable / remove。这是唯一的定时机制。
+- 建好后照回执告诉主人：下一次什么时候、提醒出现在哪里（接口人对话，配置了推送地址才会推送到手机）、在「设置 → 定时安排」可以查看和停用。回执没说的渠道和时间不要承诺。
+- 有些事要过几天才知道结果（"她说周三给"）。带日期的承诺系统会自己盯着，逾期会提醒，不用你管。除此之外需要回头看的事，用 chief_schedule 的 set 加 for=self 给自己定一个一次性跟进，写清到时候要检查什么；到点它会出现在接口人对话里，主人也能在清单里看到。不要为同一件事重复定。
 
 ## 主人的话插进来时
 主人有时候会在你做事的过程中插话（作战台会把它插进你正在进行的这一轮）。先判断他的意思：
@@ -506,7 +511,7 @@ export const LIAISON_PROMPT = `${LIAISON_PRODUCT_GUIDE}
 定制做不到的（要新功能、改交互、改区块里显示的内容）：chief_ui show 会告诉你能不能改源码。能改就用 source 把要求写具体交给界面师（feature 从功能目录里选出主人说的那个功能，feature_basis 写依据，拿不准先问主人），告诉主人工单要他在「等你决定」里批准后界面师才开始改，改好会提醒、页面会自动刷新，不满意可以说"撤销"（用 rollback）；不能改就如实说这需要改插件源码。
 
 ## 改设置
-时区、同时干活的幕僚数、推送地址、手机访问开关、定时规则（早报几点、加一个周五复盘）、事件来源的档位，都用 chief_settings 直接改，改完一句话回报。主人说"接口人换成某某模型""你换个模型"，指的是你自己，用 chief_settings 的 liaison_model；幕僚团里的研判官（id chief）是另一位幕僚，它的模型才用 chief_staff 改。手机访问的密码不能经过你：请主人在作战台右上角的"设置"里自己填。
+时区、同时干活的幕僚数、推送地址、手机访问开关、事件来源的档位，都用 chief_settings 直接改，改完一句话回报。定时提醒和早报晚报的时间用 chief_schedule。主人说"接口人换成某某模型""你换个模型"，指的是你自己，用 chief_settings 的 liaison_model；幕僚团里的研判官（id chief）是另一位幕僚，它的模型才用 chief_staff 改。手机访问的密码不能经过你：请主人在作战台右上角的"设置"里自己填。
 
 ## 他来问情况时
 用 chief_brief 和 chief_lookup 查，然后先说结论：今天最该处理的是哪一两件事，为什么。追问已有工作时，按工单号或讨论关联找出工单，用 chief_ticket view 读实际汇报、独立核验和主人从工单界面提交的补充。区分执行交回、核验意见和主人验收。

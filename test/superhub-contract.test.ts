@@ -33,7 +33,7 @@ function harness(
   const roles = [...staff]
   const proofs = new Map([[delivery.path, { ...delivery, content: 'Captured, hash-checked test evidence' }]])
   const brain: Brain = {
-    root, constitution: () => '', staff: () => roles, workspaces: () => [], rules: () => [],
+    root, constitution: () => '', staff: () => roles, workspaces: () => [],
     workdir: id => join(root, 'work', id), appendNote: path => path, commit: () => {},
     snapshotOutputs: (_id, outputs) => [...proofs.values()].filter(proof => outputs.includes(proof.path))
       .map(({ path, version }) => ({ path, version })),

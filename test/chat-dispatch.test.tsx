@@ -212,7 +212,7 @@ describe('接口人交办到工单对话的导航', () => {
     await expect(f.inbox.execute({ text: ' ' }, { signal: new AbortController().signal, agent: { id: 'hq' } } as never)).rejects.toThrow('不能为空')
     expect(f.engine.recentEvents()).toEqual([])
     const id = randomUUID()
-    f.store.appendEvent({ id, at: new Date().toISOString(), source: 'timer', text: '同文', dedupe: id, meta: { channel: 'chat' } })
+    f.store.appendEvent({ id, at: new Date().toISOString(), source: 'clock', text: '同文', dedupe: id, meta: { channel: 'chat' } })
     f.store.setDisposition(id, { kind: 'accepted', ticketId: 'T-0001' })
     expect(inboxDispatchState(f.store, id)).toBeUndefined()
   })

@@ -1,4 +1,4 @@
-/** 重构后的新模块：配置、初始化、界面定制、手机访问、接口挂载方式、规则编辑。 */
+/** 重构后的新模块：配置、初始化、界面定制、手机访问、接口挂载方式。 */
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { request } from 'node:http'
@@ -123,26 +123,6 @@ describe('初始化', () => {
     let hits = ''
     try { hits = execFileSync('grep', ['-rl', '-e', 'ubuntu', '-e', '字节', '-e', '106.55', t], { encoding: 'utf8' }).trim() } catch { /* 没有匹配时 grep 以 1 退出 */ }
     expect(hits).toBe('')
-  })
-})
-
-describe('规则编辑', () => {
-  it('新增、修改、停用、删除，保留注释', () => {
-    const dir = join(tmp(), 'brain')
-    scaffoldBrain(dir)
-    const brain = new BrainRepo(dir)
-    brain.setRule({ id: 'morning-brief', when: 'weekdays 09:00' })
-    brain.setRule({ id: 'friday-review', when: 'weekly fri 17:00', text: '周五复盘' })
-    brain.setRule({ id: 'evening-review', enabled: false })
-    expect(() => brain.setRule({ id: 'bad', when: 'sometimes', text: 'x' })).toThrow()
-    expect(() => brain.setRule({ id: 'new-one', when: 'daily 10:00' })).toThrow('when 和 text')
-    const yaml = readFileSync(join(dir, 'rules.yaml'), 'utf8')
-    expect(yaml).toContain('# 时钟规则')
-    expect(brain.allRules().find(r => r.id === 'morning-brief')?.when).toBe('weekdays 09:00')
-    expect(brain.rules().map(r => r.id)).toEqual(['morning-brief', 'weekly-dream', 'friday-review'])
-    brain.removeRule('friday-review')
-    expect(brain.allRules().some(r => r.id === 'friday-review')).toBe(false)
-    expect(() => brain.removeRule('nope')).toThrow()
   })
 })
 
