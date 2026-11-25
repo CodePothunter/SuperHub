@@ -19,7 +19,7 @@ import { warroomState } from '../src/dsh/view.ts'
 const { chromium } = await import(pathToFileURL(process.env.CHIEF_PLAYWRIGHT_PATH).href)
 const root = mkdtempSync(join(tmpdir(), 'chief-thread-ui-'))
 const staff = [{ id: 'strategist', name: '谋士', executor: 'dsh', verifier: 'reviewer', brief: '执行本工单' }, { id: 'reviewer', name: '审查官', executor: 'dsh', verifier: 'none', brief: '独立核验' }, { id: 'external', name: '工作端作者', executor: 'remote', verifier: 'reviewer', brief: '仅执行核对后的工作端任务' }]
-const brain = { root, staff: () => staff, rules: () => [], constitution: () => '', goals: () => '', workspaces: () => [], commit() {}, workdir(id) { const dir = join(root, 'work', id); mkdirSync(dir, { recursive: true }); return dir } }
+const brain = { root, staff: () => staff, constitution: () => '', goals: () => '', workspaces: () => [], commit() {}, workdir(id) { const dir = join(root, 'work', id); mkdirSync(dir, { recursive: true }); return dir } }
 const runs = new Map(), releases = new Map(), prompts = new Map()
 const result = structured => ({ text: '', stopReason: 'completed', structured })
 const executors = { available: () => true, supportsSchema: () => true, run: async r => {
@@ -35,8 +35,8 @@ const store = new FileStore(root), remote = new FileRemoteQueue(root)
 const engine = new Engine(store, brain, executors, remote, { concurrency: 3, timeZone: 'UTC' })
 const roster = new Roster(root, brain, () => '2026-11-17')
 const worklines = new Worklines(engine, brain, roster), discussions = new Discussions(engine, brain, executors, remote)
-const deps = { engine, brain, remote, roster, worklines, discussions, available: () => true, clock: () => ({ today: '2026-11-17', now: '2026-11-17T10:00' }), sources: () => [], timers: () => [], push: () => false }
-const routes = runtimeRoutes({ ...deps, chat: { view: async () => ({ sessionId: 'liaison-untouched', messages: [], busy: false, notices: [] }) }, followUps: { cancel: () => false }, custom: {}, importer: {}, exporter: {} })
+const deps = { engine, brain, remote, roster, worklines, discussions, available: () => true, clock: () => ({ today: '2026-11-17', now: '2026-11-17T10:00' }), sources: () => [], push: () => false }
+const routes = runtimeRoutes({ ...deps, chat: { view: async () => ({ sessionId: 'liaison-untouched', messages: [], busy: false, notices: [] }) }, custom: {}, importer: {}, exporter: {} })
 let activeDeps = deps, activeRoutes = routes, otherEngine
 const commission = title => engine.commission({ title, text: title, staff: 'strategist', level: 'think', scope: title, doneWhen: ['回答并交付报告'], needsReview: true })
 const a = await commission('甲工作独立对话'), b = await commission('乙工作独立对话')
@@ -153,7 +153,7 @@ try {
   const otherRoster = new Roster(otherRoot, otherBrain, () => '2026-11-17')
   assert.equal(await otherEngine.commission({ title: '另一第二大脑同号工单', text: '新背景', staff: 'strategist', level: 'think', scope: '新范围', doneWhen: ['新标准'], needsReview: true }), a)
   activeDeps = { ...deps, engine: otherEngine, brain: otherBrain, remote: otherRemote, roster: otherRoster }
-  activeRoutes = runtimeRoutes({ ...activeDeps, chat: { view: async () => ({ messages: [], notices: [], busy: false }) }, followUps: { cancel: () => false }, custom: {}, importer: {}, exporter: {} })
+  activeRoutes = runtimeRoutes({ ...activeDeps, chat: { view: async () => ({ messages: [], notices: [], busy: false }) }, custom: {}, importer: {}, exporter: {} })
   await page.goto(oldLink)
   const mismatched = page.getByRole('dialog', { name: a, exact: true })
   await mismatched.getByText('这条链接属于其他工单记录。请返回全部执行记录重新选择。', { exact: true }).waitFor()

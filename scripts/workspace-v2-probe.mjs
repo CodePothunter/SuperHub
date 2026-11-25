@@ -53,6 +53,14 @@ function response({ messages, sessionId, tools, system }) {
     }))
     return text(JSON.stringify({items}))
   }
+  // 定时安排的早报、晚报：接口人的模型只依据快照撰写（scripts/schedules-ui-regression.mjs）。
+  // 晚报模拟模型故障：定时安排先按 10 分钟间隔重试，第三次失败才在接口人对话里说明原因。
+  if (typeof system === 'string' && system.startsWith('你是主人的接口人，正在写今天的晚报')) return { type: 'error', message: '模型服务暂时不可用（夹具）' }
+  if (typeof system === 'string' && /^你是主人的接口人，正在写今天的(早报|晚报)/.test(system)) {
+    const snapshot = JSON.parse(said(messages[0]))
+    const open = snapshot.openOrders ?? []
+    return text(`${system.includes('早报') ? '早报' : '晚报'}：今天还有 ${open.length} 张未关闭的工单${open[0] ? `，先看「${open[0].title}」` : ''}。`)
+  }
   const done = id => messages.some(m => m.role === 'tool' && m.toolCallId === id)
   const owner = messages.findLast(m => m.role === 'user' && m.source?.kind === 'user')
   const words = owner?.content?.filter(b => b.type === 'text').map(b => b.text).join('\n').trim()
@@ -60,6 +68,21 @@ function response({ messages, sessionId, tools, system }) {
   if (sessionId?.startsWith('chief-liaison-') && words?.startsWith(importRequest)) {
     if (!done('paste-profile')) return call('paste-profile','chief_import',{action:'submit',source:'Claude'})
     return text('')
+  }
+  const toolMessage = id => {
+    const result = messages.find(m => m.role === 'tool' && m.toolCallId === id)
+    if (!result || result.isError) return undefined
+    try { return JSON.parse(result.content.find(block => block.type === 'text').text).message } catch { return undefined }
+  }
+  // 2026-11-25 owner's words: a schedule delivered to the liaison conversation (scripts/schedules-ui-regression.mjs).
+  if (sessionId?.startsWith('chief-liaison-') && words === '每周一到周五上午 9:00 检查并提醒我各工作区尚未关闭的工单') {
+    if (!done('schedule-open-orders')) return call('schedule-open-orders','chief_schedule',{action:'set',title:'未关闭工单提醒',when:'weekdays 09:00',content:'open-orders'})
+    return text(toolMessage('schedule-open-orders') ?? '定时安排没有建成。')
+  }
+  if (sessionId?.startsWith('chief-liaison-') && words === '周岚说后天给评审意见，你到时候上午十点回头看一下。') {
+    const day = new Date(Date.now() + 2 * 86_400_000).toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' })
+    if (!done('schedule-self')) return call('schedule-self','chief_schedule',{action:'set',for:'self',at:day + 'T10:00',text:'看周岚给没给评审意见'})
+    return text(toolMessage('schedule-self') ?? '跟进没有定好。')
   }
   if (sessionId?.startsWith('chief-liaison-') && words === '帮我加一位社区导览员，负责帮助新成员上手。') {
     if (!done('staff-create-with-portrait')) return call('staff-create-with-portrait','chief_staff',{
@@ -158,6 +181,7 @@ function response({ messages, sessionId, tools, system }) {
   return text('已完成本轮核对。')
 }
 async function* stream(block) {
+  if (block.type === 'error') { yield { type:'finish', reason:{ kind:'error', failure:{ message:block.message } } }; return }
   yield { type:'block-start', index:0, blockType:block.type }
   if (block.type === 'text') yield { type:'text-delta', index:0, text:block.text }
   else yield { type:'tool-call-delta', index:0, id:block.id, name:block.name, argumentsDelta:block.arguments }

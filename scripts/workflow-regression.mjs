@@ -21,7 +21,7 @@ const result = structured => ({ text: '', structured, stopReason: 'completed' })
 function fixture(t, override) {
   const root = mkdtempSync(join(tmpdir(), 'chief-workflow-'))
   const staff = ['chief', 'strategist', 'reviewer', 'researcher', 'external'].map(id => ({ id, name: id, executor: id === 'external' ? 'remote' : 'dsh', verifier: id === 'reviewer' ? 'none' : 'reviewer', brief: `原角色 ${id}` }))
-  const brain = { root, staff: () => staff, constitution: () => '', workspaces: () => [], rules: () => [], commit() {}, workdir(id) { const dir = join(root, 'work', id); mkdirSync(dir, { recursive: true }); return dir }, saveRemoteReport(id, round, raw) { const path = `work/${id}/remote-report-${round}.md`; writeFileSync(join(brain.workdir(id), `remote-report-${round}.md`), raw); return path } }
+  const brain = { root, staff: () => staff, constitution: () => '', workspaces: () => [], commit() {}, workdir(id) { const dir = join(root, 'work', id); mkdirSync(dir, { recursive: true }); return dir }, saveRemoteReport(id, round, raw) { const path = `work/${id}/remote-report-${round}.md`; writeFileSync(join(brain.workdir(id), `remote-report-${round}.md`), raw); return path } }
   const store = new FileStore(root), remote = new FileRemoteQueue(root), calls = []
   let engine
   const executors = { available: () => true, supportsSchema: () => true, run: async request => { calls.push(request); return override?.(request, engine, brain) ?? result({ verdict: 'pass', critique: '证据与标准均满足' }) } }

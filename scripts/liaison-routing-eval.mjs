@@ -335,6 +335,19 @@ const allCases = [
       if (turn.profileRecords.length !== 1 || turn.profileRecords[0]?.text !== turn.said) return '没有完整原文与宿主确认的资料回执'
       if (createdTicket(turn) || turn.newRooms || turn.newWorkspaces || turn.workOrders.length) return '导入创建了工作对象'
     }},
+  // 2026-11-25 owner's words: the liaison could only say it was "unsure which entry would remind you" (rules.yaml → v1).
+  {id:'schedule-open-orders',said:'每周一到周五上午 9:00 检查并提醒我各工作区尚未关闭的工单',
+    expect:'chief_schedule set（weekdays 09:00、open-orders），照回执说下一次时间、接口人对话与「设置 → 定时安排」，不建单',
+    judge:turn => {
+      const set = calls(turn,'chief_schedule',row=>args(row).action === 'set' && succeeded(row))
+      if (!set.length) return '没有用 chief_schedule set 建立定时安排'
+      const row = (turn.schedules ?? []).find(item => item.by === 'owner' && item.content === 'open-orders')
+      if (!row || !row.enabled || row.whenLabel !== '工作日 09:00') return `清单里没有工作日 09:00 的未关闭工单提醒（${JSON.stringify((turn.schedules ?? []).map(item => [item.title, item.whenLabel, item.content]))}）`
+      if (!turn.reply.includes('接口人') || !turn.reply.includes('定时安排')) return '回复没有说明投递位置或在「设置 → 定时安排」查看'
+      if (!row.nextLabel || !/0?9[:：]00|9 ?点/.test(turn.reply)) return '回复没有说下一次触发时间'
+      if (/短信|邮件|微信|日历提醒/.test(turn.reply)) return '承诺了回执以外的渠道'
+      if (createdTicket(turn) || turn.newRooms || turn.workOrders.length || calls(turn,'chief_settings',row=>args(row).action !== 'show').length) return '建了工单、讨论或改了设置'
+    }},
   {id:'profile-team',said:'请交给团队做一份我能直接转发的产品访谈提纲。只拟文稿，我会自己发送。',
     expect:'从今天用 chief_workspace assign 接新工单并关联负责会话',
     judge:turn => {
@@ -345,7 +358,7 @@ const allCases = [
     }},
 ]
 const scenario = option('--scenario', 'all')
-if (!['all','workspace','signup','order','followup','brief','portrait','profile'].includes(scenario)) throw Error('--scenario 可选 all、workspace、signup、order、followup、brief、portrait 或 profile')
+if (!['all','workspace','signup','order','followup','brief','portrait','profile','schedule'].includes(scenario)) throw Error('--scenario 可选 all、workspace、signup、order、followup、brief、portrait、profile 或 schedule')
 /**
  * `--case <id>[,<id>…]` runs only the named cases. Each one keeps the earlier turns it builds on (`needs`, and the order
  * a `bound` case opens), which run first in conversation order as prerequisites: their lines are printed but they do not
@@ -392,11 +405,7 @@ async function startHost(model) {
 }
 
 async function configureHost(host, model) {
-  // A fresh brain normally schedules a morning brief at startup. This suite measures only owner turns.
-  const yaml = (await import('yaml')).default
-  const rulesFile = join(host.brain, 'rules.yaml')
-  const rules = yaml.parse(readFileSync(rulesFile, 'utf8'))
-  writeFileSync(rulesFile, yaml.stringify({ ...rules, rules: [] }))
+  // A fresh brain's built-in schedules (早报、晚报 off; weekly experience on Sunday evening) leave owner turns alone.
   if (model.startsWith('openai-codex/')) {
     host.install('dsh-codex-subscription@3.2.24')
     const problem = await codexCredentials(host.home)
@@ -500,6 +509,7 @@ async function conversation(host) {
     if (item.id === 'workspace-experience-remember' && selectedId) {
       turn.experiences = (await host.api(`/v2/workspaces/${selectedId}/staff?scope=${encodeURIComponent(scope)}`)).sharedExperiences
     }
+    if (item.id.startsWith('schedule-')) turn.schedules = (await host.api(`/v2/schedules?scope=${encodeURIComponent(scope)}`)).schedules
     if (item.id === 'profile-submit') {
       const imports = replies.flatMap(message => message.profileImports ?? [])
       turn.profileRecords = await Promise.all(imports.map(async ({importId}) =>

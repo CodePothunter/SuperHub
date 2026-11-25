@@ -23,7 +23,7 @@ const staff = [
   { id: 'reviewer', name: '审查官', executor: 'dsh', verifier: 'none', brief: '独立核验' },
   { id: 'external', name: '外务作者', executor: 'remote', verifier: 'reviewer', brief: '工作电脑执行' },
 ]
-const brain = { root, staff: () => staff, rules: () => [], constitution: () => '', goals: () => '', workspaces: () => [], commit() {}, workdir(id) { const dir = join(root, 'work', id); mkdirSync(dir, { recursive: true }); return dir }, saveRemoteReport(id, round, content) { const path = `work/${id}/remote-report-${round}.md`; writeFileSync(join(brain.workdir(id), `remote-report-${round}.md`), content); return path } }
+const brain = { root, staff: () => staff, constitution: () => '', goals: () => '', workspaces: () => [], commit() {}, workdir(id) { const dir = join(root, 'work', id); mkdirSync(dir, { recursive: true }); return dir }, saveRemoteReport(id, round, content) { const path = `work/${id}/remote-report-${round}.md`; writeFileSync(join(brain.workdir(id), `remote-report-${round}.md`), content); return path } }
 let engine, runs = 0
 const executors = { available: () => true, supportsSchema: () => true, run: async r => {
   if (r.label.startsWith('讨论')) return { text: '依据已核验的评测，甲方案的延迟更低；样本限制已列在原报告。', stopReason: 'completed' }
@@ -43,8 +43,8 @@ const roster = new Roster(root, brain, () => '2026-11-16')
 roster.upsertLine('评测线', { goal: '维护长期评测与决定' })
 roster.addCommitment({ direction: 'theirs', who: '评测伙伴', what: '提供评测结果', line: '评测线' })
 const worklines = new Worklines(engine, brain, roster), discussions = new Discussions(engine, brain, executors, remote)
-const deps = { engine, brain, remote, roster, worklines, discussions, available: () => true, clock: () => ({ today: '2026-11-16', now: '2026-11-16T10:00' }), sources: () => [], timers: () => [], push: () => false }
-const routes = runtimeRoutes({ ...deps, chat: { view: async () => ({ sessionId: 'workflow-test', messages: [], busy: false, notices: [] }) }, followUps: { cancel: () => false }, custom: {}, importer: {}, exporter: {} })
+const deps = { engine, brain, remote, roster, worklines, discussions, available: () => true, clock: () => ({ today: '2026-11-16', now: '2026-11-16T10:00' }), sources: () => [], push: () => false }
+const routes = runtimeRoutes({ ...deps, chat: { view: async () => ({ sessionId: 'workflow-test', messages: [], busy: false, notices: [] }) }, custom: {}, importer: {}, exporter: {} })
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://local')

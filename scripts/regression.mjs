@@ -120,7 +120,7 @@ test('相同文字历史不提前确认新消息，每个新事件只确认一�
 function engineFixture(t, decide) {
   const root = mkdtempSync(join(tmpdir(), 'chief-engine-regression-'))
   const staff = ['chief', 'researcher', 'reviewer'].map(id => ({ id, name: id, executor: 'dsh', verifier: 'none', brief: id }))
-  const brain = { root, constitution: () => '', staff: () => staff, workspaces: () => [], rules: () => [], workdir: id => join(root, 'work', id), appendNote: path => path, commit() {} }
+  const brain = { root, constitution: () => '', staff: () => staff, workspaces: () => [], workdir: id => join(root, 'work', id), appendNote: path => path, commit() {} }
   const store = new FileStore(root)
   const calls = []
   const executors = { available: () => true, supportsSchema: () => true, run: async request => {
