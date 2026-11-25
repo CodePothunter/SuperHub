@@ -26,7 +26,23 @@ function member({ messages, system }) {
   return undefined
 }
 
+/**
+ * The engagement coordinator (`{"turn":…}` prompts): a member's line linking 交接清单 is the order's final delivery, citing
+ * that line. Other judgements keep the probe's ordinary answer.
+ */
+function coordinate(messages) {
+  const prompt = messages.filter(m => m.role === 'user').map(said).findLast(text => text.startsWith('{"turn":'))
+  let input
+  try { input = prompt && JSON.parse(prompt) } catch { return undefined }
+  if (input?.turn === 'member' && input.order && input.source?.text?.includes('[交接清单](交接清单.md)')) {
+    return text(JSON.stringify({kind:'deliver', text:'交接清单已整理好，核对交付日期一项已列入。', final:true, evidenceSeqs:[input.source.seq]}))
+  }
+  return undefined
+}
+
 function response({ messages, sessionId, tools, system }) {
+  const coordinated = coordinate(messages)
+  if (coordinated) return coordinated
   const history = messages.map(said).join('\n')
   if (typeof system === 'string' && system.startsWith('你负责整理其他助手对主人的了解。')) {
     const original = JSON.parse(messages[0].content[0].text).助手原始回答

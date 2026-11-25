@@ -87,12 +87,17 @@ try {
   const sections = await desktop.locator('[aria-label="项目目录"], [aria-label="最近产物"], [aria-label="会话与工单"]').evaluateAll(list => list.map(el => el.getAttribute('aria-label')))
   assert.deepEqual(sections,['项目目录','最近产物','会话与工单'])
   await picture(desktop,'outputs-overview-desktop')
+  // On the overview a tag opens the order it names.
+  await button(recent,'打开工单「整理交接清单」').click()
+  await desktop.getByRole('heading',{name:'整理交接清单',exact:true,level:1}).waitFor()
+  assert.equal(place(desktop).get('order'),checklistId)
+  await desktop.goBack()
   await recent.getByRole('button',{name:/^查看全部（2）/}).click()
   assert.equal(place(desktop).get('panel'),'outputs')
   const nav = desktop.getByRole('navigation',{name:'工作区版面'})
   assert.deepEqual(await nav.getByRole('button').allTextContents(),['概览','执行','产物','幕僚'])
   assert.equal(await nav.getByRole('button',{name:'产物'}).getAttribute('aria-current'),'page')
-  passed('概览在项目目录与会话之间列出最近产物（带工单名），「查看全部（2）」进入子导航里的「产物」版面')
+  passed('概览在项目目录与会话之间列出最近产物（带工单名，点标签打开该工单），「查看全部（2）」进入子导航里的「产物」版面')
 
   const board = desktop.getByRole('region',{name:'产物',exact:true})
   const rows = board.locator('.v2-output-row')
