@@ -1285,3 +1285,54 @@ describe('归档的工作区：群不再干活', () => {
     await vi.waitFor(() => expect(f.codex.reattached).toHaveLength(1))
   })
 })
+
+describe('群聊发言分页', () => {
+  it('账本按 g-<seq> 游标取窗口，头像只算窗口内的发言人和成员', async () => {
+    const f = fixture()
+    const ws = await f.workspace()
+    const session = await f.group(ws)
+    const engine = await f.host().engine(session)
+    for (let i = 1; i <= 120; i++) engine.note({ speaker: 'liaison', text: '记录第 ' + i + ' 条' })
+    const path = '/' + ws.id + '/sessions/' + session.id
+    type Paged = { messages: GroupMessage[]; page?: { older: boolean; newer: boolean }; group: unknown; portraits: Record<string, unknown> }
+    const legacy = (await f.call<Paged>(path)).data
+    expect(legacy.messages).toHaveLength(120)
+    expect(legacy.page).toBeUndefined()
+    const tail = (await f.call<Paged>(path + '?limit=40')).data
+    expect(tail.messages.map(m => m.id)).toEqual(legacy.messages.slice(80).map(m => m.id))
+    expect(tail.page).toEqual({ older: true, newer: false })
+    expect(tail.group).toEqual(legacy.group)
+    const before = (await f.call<Paged>(path + '?limit=40&before=' + tail.messages[0]!.id)).data
+    expect(before.messages.map(m => m.id)).toEqual(legacy.messages.slice(40, 80).map(m => m.id))
+    const around = (await f.call<Paged>(path + '?limit=20&around=g-10')).data
+    expect(around.messages[0]!.id).toBe('g-1')
+    expect(around.messages.map(m => m.id)).toContain('g-10')
+    expect(around.page).toEqual({ older: false, newer: true })
+    expect(Object.keys(tail.portraits).sort()).toEqual(Object.keys(legacy.portraits).sort())
+    expect((await f.call(path + '?around=g-999')).status).toBe(410)
+  })
+})
+
+describe('分页不隐藏等主人选择的消息', () => {
+  it('窗口之外仍待选择的接口人消息随响应附在 pinned 里，选过之后不再附', async () => {
+    const f = fixture({judge:'ambiguous'})
+    const ws = await f.workspace()
+    const job = f.route().assign('pin-setup','研究员检查报价',undefined,ws.id,undefined,undefined,'researcher')
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(1))
+    expect((await f.say(job.session,'可以验收了')).status).toBe(200)
+    const note = (await f.view(job.session)).data.messages.find(row => row.actions?.length)!
+    expect(note.actions!.some(action => !action.done)).toBe(true)
+    const engine = await f.host().engine(job.session)
+    for (let i = 1; i <= 60; i++) engine.note({ speaker: 'liaison', text: '后来的记录 ' + i })
+    const path = '/' + ws.id + '/sessions/' + job.session.id
+    type Paged = { messages: GroupMessage[]; pinned?: GroupMessage[] }
+    const tail = (await f.call<Paged>(path + '?limit=40')).data
+    expect(tail.messages.some(row => row.id === note.id)).toBe(false)
+    expect(tail.pinned).toEqual([expect.objectContaining({id: note.id, actions: note.actions})])
+    expect((await f.call<Paged>(path + '?limit=40&around=' + note.id)).data.pinned).toBeUndefined()
+    expect((await f.call<Paged>(path)).data.pinned).toBeUndefined()
+    const owner = (await f.view(job.session)).data.messages.find(row => row.held === 'choosing')!
+    expect((await f.call(path + '/messages/' + owner.id + '/forward', {requestId:f.id()})).status).toBe(200)
+    expect((await f.call<Paged>(path + '?limit=40')).data.pinned).toBeUndefined()
+  })
+})

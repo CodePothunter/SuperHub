@@ -839,3 +839,34 @@ describe('archiving a workspace', () => {
     expect(f.store().focus({surface: 'workspace', selectedId: w.id})?.workspace.id).toBe(w.id)
   })
 })
+
+describe('会话发言分页', () => {
+  it('日志会话按游标取窗口；不带分页参数仍返回全部', async () => {
+    const f = fixture()
+    const w = await f.workspace()
+    const s = await f.session(w)
+    const all: V2Message[] = Array.from({ length: 300 }, (_, i) => ({ id: 'm' + i, role: i % 2 ? 'agent' : 'user', author: i % 2 ? 'Claude Code' : '你',
+      at: new Date(Date.UTC(2026, 10, 1, 0, i)).toISOString(), text: '第 ' + i + ' 条' }))
+    f.messages.set(s.id, all)
+    type Paged = V2SessionView & { page?: { older: boolean; newer: boolean } }
+    const read = async (query: string) => (await f.call<Paged>(f.path(s) + query))
+    const ids = (view: Paged) => view.messages.map(m => m.id)
+    const legacy = (await read('')).data
+    expect(legacy.messages).toHaveLength(300)
+    expect(legacy.page).toBeUndefined()
+    const tail = (await read('?limit=40')).data
+    expect(ids(tail)).toEqual(all.slice(260).map(m => m.id))
+    expect(tail.page).toEqual({ older: true, newer: false })
+    expect(tail.session.id).toBe(s.id)
+    const older = (await read('?limit=40&before=m260')).data
+    expect(ids(older)).toEqual(all.slice(220, 260).map(m => m.id))
+    const around = (await read('?limit=40&around=m10')).data
+    expect(ids(around)).toEqual(all.slice(0, 40).map(m => m.id))
+    expect(around.page).toEqual({ older: false, newer: true })
+    const after = (await read('?limit=40&after=m39')).data
+    expect(ids(after)).toEqual(all.slice(40, 80).map(m => m.id))
+    expect((await read('?limit=100000')).data.messages).toHaveLength(100)
+    expect(await read('?before=gone')).toMatchObject({ status: 410, data: { error: '消息已不可用' } })
+    expect((await read('?limit=0')).status).toBe(400)
+  })
+})

@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { pagedReadsFromV2Read } from './paged-read-mock.ts'
 import type { StaffView } from '../src/core/workspace-staff.ts'
 import type { V2Delegation, V2Message, V2Session, V2Workspace, V2WorkspaceView } from '../src/core/workspace-v2.ts'
 import type { Scoped } from '../src/client/superhub-api.ts'
@@ -37,6 +38,7 @@ function mockReads(responses: Record<string, object>) {
 const inside = (archived: boolean, node: ReactNode) => renderToStaticMarkup(<ArchivedWorkspace.Provider value={archived}>{node}</ArchivedWorkspace.Provider>)
 const buttons = (html: string) => [...html.matchAll(/<button[^>]*>(.*?)<\/button>/g)].map(match => match[1]!.replace(/<[^>]+>/g, ''))
 afterEach(() => vi.restoreAllMocks())
+beforeEach(() => pagedReadsFromV2Read())
 
 describe('已归档工作区页', () => {
   it('shows since when it is archived and offers 「恢复」', () => {

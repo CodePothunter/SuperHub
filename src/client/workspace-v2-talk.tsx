@@ -1,10 +1,12 @@
-import { useContext, useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useContext, useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import { messageWorkOrder, orderEnded, type V2Attachment, type V2AttachmentRef, type V2Delegation, type V2Delivery, type V2Held, type V2Message, type V2Session, type V2WorkspaceView } from '../core/workspace-v2.ts'
 import { Markdown } from './markdown.tsx'
 import type { Scoped } from './superhub-api.ts'
-import { segment, useV2Read, useV2Write, V2Client } from './workspace-v2-api.ts'
+import { segment, useV2PagedRead, useV2Read, useV2Write, V2Client } from './workspace-v2-api.ts'
+import { NewerEdge, OlderEdge, historyEdgeStyle } from './history-edge.tsx'
+import { MESSAGE_ROW, scrollParent, useEdgeSentinel, usePrependAnchor } from './scroll-anchor.ts'
 import { ARCHIVED_NOTE, executorName, Issue, readableTime, sessionKind, useArchived, V2Dialog, V2Icon } from './workspace-v2-elements.tsx'
-import { isAttachmentView, isSessionView } from './workspace-v2-response.ts'
+import { isAttachmentView, isSessionView, type SessionLine, type SessionView } from './workspace-v2-response.ts'
 import { ChatAvatar, chatAvatarStyle, usePortraitArrivals } from './workspace-chat-avatar.tsx'
 import { SessionExecution } from './workspace-execution.tsx'
 import { GroupDeliveries, GroupRoster, GroupStatus, MemberBadges, MentionMenu, mentionDecorator, useMentionMenu } from './workspace-group.tsx'
@@ -106,8 +108,15 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
   const { scope, revoke } = useContext(V2Client)
   const ownerActions = useContext(OwnerActions)
   const path = base + '/sessions/' + segment(session.id)
-  const transcript = useV2Read(path, isSessionView, 4000)
-  const result = transcript.data?.session.id === session.id && transcript.data.session.workspaceId === view.workspace.id ? transcript.data : undefined
+  // Paged: the newest page first (or the page around a linked message), older pages as the top comes near.
+  const following = useRef(!sourceMessage)
+  const paged = useV2PagedRead<SessionView, SessionLine>(path, isSessionView, {
+    interval: 4000, anchor: sourceMessage, following: () => following.current,
+    // Portraits come with the speakers of each page; keep those of the pages already shown.
+    combine: (previous, next) => ({...next, ...(previous?.portraits || next.portraits) && {portraits: {...previous?.portraits, ...next.portraits}}}),
+  })
+  const transcript = { error: paged.error, refresh: paged.refresh }
+  const result = paged.view?.session.id === session.id && paged.view.session.workspaceId === view.workspace.id ? {...paged.view, messages: paged.messages} : undefined
   const write = useV2Write(), sessionAction = useV2Write(), stopWait = useV2Write(), stopMembers = useV2Write()
   // Archived: the conversation reads as before, but nothing here writes (composer, choices, close, reopen, new order).
   const archived = useArchived()
@@ -144,16 +153,72 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
   const mention = useMentionMenu(group && !closed && !readOnlySource && !archived ? group.members : undefined, draft, edit)
   const memberBySpeaker = new Map(group?.members.map(member => [member.speakerId, member]))
   const history = useRef<HTMLDivElement>(null)
+  const scroller = useCallback(() => scrollParent(history.current), [])
+  const top = useRef<HTMLDivElement>(null), bottom = useRef<HTMLDivElement>(null)
+  const capture = usePrependAnchor(scroller, history, messages[0]?.id)
+  const loadOlder = () => void paged.loadOlder(capture)
+  // A page appended below while catching up is read where it is, not followed to its end.
+  const appending = useRef(false)
+  const loadNewer = () => void paged.loadNewer(() => { appending.current = true })
+  useEdgeSentinel(top, scroller, 'top', paged.hasOlder && paged.older === 'idle' && !paged.jumping, loadOlder, messages.length)
+  useEdgeSentinel(bottom, scroller, 'bottom', paged.hasNewer && paged.newer === 'idle' && !paged.jumping, loadNewer, messages.length)
+  /** Bring the newest message (and the composer under it) into view. */
+  const showLatest = useCallback(() => {
+    const list = history.current, rows = list?.querySelectorAll(MESSAGE_ROW)
+    const last = rows?.[rows.length - 1]
+    if (!list || !last) return
+    const container = scrollParent(list)
+    const target = list.parentElement?.querySelector('.v2-compose') ?? last
+    const shift = target.getBoundingClientRect().bottom - (container ? container.getBoundingClientRect().bottom : window.innerHeight)
+    if (shift <= 0) return
+    if (container) container.scrollTop += shift
+    else window.scrollBy(0, shift)
+  }, [])
+  // Following: the newest message is (nearly) in view. New messages then keep it in view; reading further up stays put.
+  useEffect(() => {
+    const container = scroller()
+    const target: HTMLElement | Window = container ?? window
+    const track = () => {
+      const rows = history.current?.querySelectorAll(MESSAGE_ROW)
+      const last = rows?.[rows.length - 1]
+      if (!last) return
+      following.current = last.getBoundingClientRect().bottom - (container ? container.getBoundingClientRect().bottom : window.innerHeight) < 60
+    }
+    target.addEventListener('scroll', track, {passive: true})
+    return () => target.removeEventListener('scroll', track)
+  }, [scroller, !!result])
+  const lastId = messages.at(-1)?.id
+  const positioned = useRef(false)
+  useLayoutEffect(() => {
+    if (!lastId) return
+    const skip = appending.current || paged.hasNewer
+    appending.current = false
+    // On opening, the newest message shows (a linked message is centred by its own effect below).
+    if (!positioned.current) { positioned.current = true; if (!sourceMessage) showLatest(); return }
+    if (following.current && !skip) showLatest()
+  }, [lastId])
   usePortraitArrivals(history, path + (closed ? '/closed' : '/open'), readOnlySource ? undefined : result?.messages, result?.observedAt)
   const byId = new Map(messages.map(m => [m.id, m]))
   const requested = sourceMessage ? byId.get(sourceMessage) : undefined
   const anchoredId = requested && (!origin || job && messageWorkOrder(session, requested) === job.id) ? requested.id : undefined
   const actionsByMessage = new Map<string, OwnerAction[]>()
+  // What still waits for the owner is never hidden by paging: questions and choices anchored to a message outside the
+  // loaded pages stand at the end of the conversation until their message is loaded, then only inline.
+  const partial = paged.hasOlder || paged.hasNewer
+  const elsewhere = new Map<string, {message?: V2Message; actions: OwnerAction[]}>()
+  if (partial && !readOnlySource) for (const message of result?.pinned ?? []) if (!byId.has(message.id)) elsewhere.set(message.id, {message, actions: []})
   if (!closed && !readOnlySource && !archived) {
     for (const action of ownerActions.items) {
       if (action.workspaceId !== session.workspaceId || action.sessionId !== session.id) continue
       const message = byId.get(action.messageId)
-      if (!message || messageWorkOrder(session, message) !== action.orderId) continue
+      if (!message) {
+        if (!partial) continue
+        const row = elsewhere.get(action.messageId)
+        if (row) row.actions.push(action)
+        else elsewhere.set(action.messageId, {actions: [action]})
+        continue
+      }
+      if (messageWorkOrder(session, message) !== action.orderId) continue
       const items = actionsByMessage.get(action.messageId)
       if (items) items.push(action)
       else actionsByMessage.set(action.messageId, [action])
@@ -161,10 +226,20 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
   }
   useEffect(() => {
     if (!anchoredId) return
+    following.current = false
     const node = document.getElementById(prefix + anchoredId)
     node?.focus({ preventScroll:true })
     node?.scrollIntoView({ block:'center' })
   }, [anchoredId, prefix])
+  // A quoted (or pending) message outside the loaded pages: load the page around it, then move to it.
+  const [quoteTarget, setQuoteTarget] = useState<string>()
+  const quoteLoaded = !!quoteTarget && byId.has(quoteTarget)
+  useEffect(() => {
+    if (!quoteTarget || paged.jumping) return
+    if (quoteLoaded) { following.current = false; focusMessage(quoteTarget) }
+    setQuoteTarget(undefined)
+  }, [quoteTarget, quoteLoaded, paged.jumping])
+  const locate = (id: string) => { setQuoteTarget(id); void paged.jumpTo(id) }
   const authors = [...new Set(messages.map(m => m.author))]
   // Words said into a running turn use no budget, so the last turn of an order can still take them.
   const blocked = job && (job.paused || orderEnded(job) || job.remainingTurns === 0 && !result?.working)
@@ -173,13 +248,15 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
   const dayTime = (at: string) => new Date(at).toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' })
   const anchored = attachment && byId.get(attachment.message)?.attachments?.some(a => a.id === attachment.ref.id)
   useEffect(() => { if (attachment && !anchored && result) setAttachment(undefined) }, [attachment, anchored, result])
-  const focusMessage = (id: string) => {
+  function focusMessage(id: string) {
     const node = document.getElementById(prefix + id)
     node?.focus({ preventScroll: true }); node?.scrollIntoView({ block: 'center' })
   }
   async function dispatch() {
     if (!files.canSend(draft) || !result || closed || blocked || readOnlySource || archived) return
     const sent = draft
+    following.current = true
+    if (paged.hasNewer) void paged.toLatest()
     // The host answers once the words are with the executor (or queued), so the composer is free again right away.
     const receipt = await write.post<Scoped & { session: V2Session }>(path + '/messages', { text: sent, ...(job && { workOrderId:job.id }), wait: false,
       ...(files.ready.length > 0 && {inputAttachments:files.ready.map(row => row.id)}) })
@@ -193,7 +270,7 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
   const working = !!result?.working && !closed && !blocked && !group
   const waiting = !closed ? result?.waiting : undefined
   return <section className="v2-card v2-reader" aria-label={session.title}>
-    <style>{chatAvatarStyle}</style>
+    <style>{chatAvatarStyle + historyEdgeStyle}</style>
     <header><div className="v2-chat-context">
       {compact && !embedded && <button className="v2-link" onClick={back}><V2Icon name="back"/>返回会话列表</button>}
       {hadOrigin && !embedded && <button className="v2-link" onClick={() => openDelegation(hadOrigin.id)}>返回工单</button>}
@@ -205,9 +282,10 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
     <div className="v2-chat-history" ref={history}>
       <Issue text={transcript.error} retry={transcript.refresh}/>
       {result?.issue && <div className="v2-source-status" role="status">{result.issue}</div>}
-      {result && sourceMessage && !anchoredId && <p className="v2-source-status" role="status">{origin ? '这条工单原话当前不可读。' : '这条原话当前不可读。'}</p>}
+      {result && sourceMessage && !anchoredId && !paged.jumping && <p className="v2-source-status" role="status">{origin ? '这条工单原话当前不可读。' : '这条原话当前不可读。'}</p>}
       {!result && !transcript.error && <p role="status" className="v2-quiet">正在读取会话…</p>}
       {result && !messages.length && !result.issue && <div className="v2-empty"><strong>这场会话还没有可读的发言</strong><p>{closed ? '会话已关闭。' : archived ? ARCHIVED_NOTE : '在下方发出第一句话。'}</p></div>}
+      {result && <OlderEdge edge={top} hasOlder={paged.hasOlder} loading={paged.older === 'loading'} error={paged.olderError} count={messages.length} load={loadOlder}/>}
       {messages.length > 0 && <ol className="v2-turns" aria-label="会话发言">{messages.map((m, i) => {
         const day = dayTime(m.at), quoted = m.replyTo && byId.get(m.replyTo)
         const orderId = messageWorkOrder(session, m)
@@ -228,7 +306,8 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
               {messageOrder && <button className={group ? 'v2-link v2-order-tag' : 'v2-link'} onClick={() => openDelegation(messageOrder.id)}>{group && <V2Icon name="work"/>}{messageOrder.title}</button>}
               <div className="v2-bubble">
                 {quoted ? <button className="v2-quote" onClick={() => focusMessage(quoted.id)}>回复{quoted.author} · {quoted.text}</button>
-                  : m.replyTo && <small className="v2-quote">被回复的原话当前不可读</small>}
+                  : m.replyTo && (paged.hasOlder ? <button className="v2-quote" onClick={() => locate(m.replyTo!)}>回复更早的一条发言 · 查看</button>
+                    : <small className="v2-quote">被回复的原话当前不可读</small>)}
                 {m.relayed && <small className="v2-relay-note">经接口人转交的原话</small>}
                 <Markdown text={m.text} className="v2-markdown" decorate={group ? mentionDecorator(m.mentions, group.members, result?.portraits) : undefined}/>
                 <MessageInputAttachments scope={scope} target={{...inputTarget, workOrderId:orderId}} attachments={m.inputAttachments}/>
@@ -244,6 +323,19 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
                 changed={async () => { await Promise.all([ownerActions.refresh(), transcript.refresh(), changed()]) }}/>)}
             </div></div></li>
       })}</ol>}
+      {elsewhere.size > 0 && <section className="v2-pending-elsewhere" aria-label="等你处理的事（原话不在已加载的消息里）">
+        <h3>等你处理</h3>
+        {[...elsewhere].map(([id, {message, actions}]) => <div key={id} className="v2-pending-item" data-pending-for={id}>
+          {message && <p className="v2-pending-source"><strong>{message.author}</strong> · {message.text.replace(/\s+/g, ' ').slice(0, 120)}</p>}
+          <button type="button" className="v2-link" disabled={!!paged.jumping} onClick={() => locate(id)}>定位到原话</button>
+          {message?.actions?.length ? <MessageChoices message={message} order={jobs.find(row => row.id === messageWorkOrder(session, message))} base={base} path={path}
+            done={async () => { await Promise.all([transcript.refresh(), changed()]) }}/> : null}
+          {actions.map(item => <OwnerActionReply key={item.id} item={item} showQuestion
+            changed={async () => { await Promise.all([ownerActions.refresh(), transcript.refresh(), changed()]) }}/>)}
+        </div>)}
+      </section>}
+      <NewerEdge edge={bottom} hasNewer={paged.hasNewer} loading={paged.newer === 'loading'} error={paged.newerError} load={loadNewer}
+        latest={() => { following.current = true; void paged.toLatest() }}/>
     </div>
     {archived && !readOnlySource && <p className="v2-quiet v2-archived-note">{ARCHIVED_NOTE}</p>}
     {!closed && !readOnlySource && !archived && <div className="v2-compose">{jobs.length > 1 && <label>发言对象<select value={job?.id ?? ''} onChange={event => target(session.id,event.target.value || undefined)}>

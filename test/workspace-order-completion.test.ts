@@ -415,6 +415,23 @@ describe('next follow-up time', () => {
   })
 })
 
+describe('分页不隐藏等主人选择的消息（日志会话）', () => {
+  it('窗口之外仍待选择的接口人消息随分页响应附在 pinned 里', async () => {
+    const f = fixture({judge: vi.fn<CommandJudge>(async () => 'ambiguous')})
+    const job = await f.order()
+    await f.say(job, 'pin-1', '可以验收了')
+    const messages = await f.transcript(job)
+    const owner = messages.find(row => row.role === 'user')!, note = liaison(messages)[0]!
+    const path = '/workspaces/' + job.workspaceId + '/sessions/' + job.sessionId
+    type Paged = {messages: V2Message[]; pinned?: V2Message[]}
+    const around = (await f.call<Paged>(path + '?limit=1&around=' + owner.id)).data
+    expect(around.messages.map(row => row.id)).toEqual([owner.id])
+    expect(around.pinned).toEqual([expect.objectContaining({id: note.id, actions: note.actions})])
+    expect((await f.call<Paged>(path + '?limit=1&around=' + note.id)).data.pinned).toBeUndefined()
+    expect((await f.call<Paged>(path)).data.pinned).toBeUndefined()
+  })
+})
+
 describe('held words in the real conversation source', () => {
   it('records held words where they were said and keeps that message when they are dispatched later', async () => {
     const root = temp()

@@ -18,6 +18,7 @@ import { chatAttachmentError, type ChatAttachments } from './chat-attachments.ts
 import type { Agent, NativePromptPart, SessionController, SessionEventLike } from './ports.ts'
 import { liaisonRoomRequest, type DiscussionReceipt, type DiscussionResult } from './room-results.ts'
 import { profileImportId } from '../core/profile-import.ts'
+import { pageWindow, speechCursor, type PageInfo, type PageQuery } from '../core/paging.ts'
 
 /** 接口人处理一件事的过程中的一步：想了什么，或者用了什么工具。 */
 export interface ChatStep {
@@ -89,7 +90,16 @@ export interface ChatView {
   workReplies?: TicketReplyReceipt[]
   /** Results from discussions handed off from this private conversation. */
   discussionResults?: DiscussionResult[]
+  /** 分页读取（`limit`/`before`/`after`/`around`）时：这一页之前 / 之后还有没有消息。 */
+  page?: PageInfo
 }
+
+/** 不带分页参数的旧客户端拿到的最近条数。 */
+export const LEGACY_CHAT_LIMIT = 80
+/** 当前一段会话投影、换段归档各自保留的最多条数（向上翻页能翻到的范围）。 */
+export const LIAISON_HISTORY_MAX = 1000
+/** 接口人消息的分页游标（见 core/paging.ts）。 */
+export const chatCursor = speechCursor
 
 interface Block { type?: string; text?: string; name?: string; toolName?: string }
 const blocks = (content: unknown): Block[] => Array.isArray(content) ? content as Block[] : []
@@ -320,7 +330,7 @@ export class LiaisonChat {
 
   sending(): boolean { return this.delivering > 0 }
 
-  project(events: readonly SessionEventLike[]) { return chatFromEvents(events, 200, this.input?.forRequest) }
+  project(events: readonly SessionEventLike[]) { return chatFromEvents(events, LIAISON_HISTORY_MAX, this.input?.forRequest) }
 
   /** 对话历史（含之前各段的归档）、进行中的一轮和其中的讨论回执。 */
   private async history() {
@@ -330,13 +340,17 @@ export class LiaisonChat {
     const offset = this.parts.offset()
     const current = offset ? messages.map(m => offsetSpeech(m, offset)) : messages
     const archived = this.parts.archived()
-    const history = archived.length ? mergeHistory(archived, current) : current.slice(-80)
+    // 完整的合并历史（不截断）：分页在它上面取窗口，旧客户端与未读仍按最近 80 条。
+    const history = archived.length ? mergeHistory(archived, current, Infinity) : current
     const receipts = [...archived, ...current].flatMap(message => message.discussions ?? []).concat(live?.discussions ?? [])
     return { agent, observedAt, offset, history, live, receipts }
   }
 
-  async view(): Promise<ChatView> {
-    const { agent, observedAt, offset, history, live, receipts } = await this.history()
+  /** 不带 `page` 时返回最近 80 条（旧客户端）；带 `page` 时返回那一页并附 `page`。派工状态、工单标签只解析返回的消息。 */
+  async view(page?: PageQuery): Promise<ChatView> {
+    const { agent, observedAt, offset, history: all, live, receipts } = await this.history()
+    const window = page ? pageWindow(all, chatCursor, page) : undefined
+    const history = window ? window.items : all.slice(-LEGACY_CHAT_LIMIT)
     const resolve = (sources: ChatDispatch[] | undefined) => (Array.isArray(sources) ? sources : []).flatMap(source => {
       if (!source || typeof source.eventId !== 'string' || !eventIdPattern.test(source.eventId)) return []
       // Archived snapshots retain only the durable source identity as authority.
@@ -359,6 +373,7 @@ export class LiaisonChat {
         ...(live.workspaces && {workspaces:labels(live.workspaces)}) } } : {}, notices: this.notices(),
       ...this.workReplies ? { workReplies: this.workReplies() } : {},
       ...(discussionResults?.length && { discussionResults }),
+      ...(window && { page: window.page }),
     }
   }
 
@@ -368,7 +383,7 @@ export class LiaisonChat {
     // 没有请求号的旧版讨论回执要回读成员会话才有回报，新版转交都带请求号、回报已持久，这里不再回读旧会话。
     const { history, receipts } = await this.history()
     const discussionResults = await this.discussionResults?.(receipts, { historical: false }) ?? []
-    return liaisonUnread({ messages: history, notices: this.notices(), discussionResults }, seenAt)
+    return liaisonUnread({ messages: history.slice(-LEGACY_CHAT_LIMIT), notices: this.notices(), discussionResults }, seenAt)
   }
 
   /**

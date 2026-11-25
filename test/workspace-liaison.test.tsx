@@ -9,6 +9,7 @@ import { reconcilePending } from '../src/client/chat-state.ts'
 import type { ChatInputAttachment } from '../src/core/chat-attachments.ts'
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
+const noPaging = { hasOlder: false, hasNewer: false, loadOlder: vi.fn(), loadNewer: vi.fn(), toLatest: vi.fn(), loadingOlder: false, olderError: undefined as string | undefined, loadingNewer: false, newerError: undefined as string | undefined }
 
 describe('一句话交办', () => {
   it('opens attachment-only history in the private conversation even when the dialog is opened from an order', () => {
@@ -16,7 +17,7 @@ describe('一句话交办', () => {
     const image: ChatInputAttachment = {id:'two', name:'图.png', kind:'image', bytes:42}
     vi.spyOn(api, 'useChat').mockReturnValue({
       sessionId:'hq', confirmedMessages:[], observedAt:3, messages:[{seq:1, time:1, role:'you', text:'', inputAttachments:[file, image]}],
-      live:undefined, notices:[], workReplies:[], busy:false, error:undefined, say:vi.fn(), refresh:vi.fn(), tick:0,
+      live:undefined, notices:[], workReplies:[], busy:false, error:undefined, say:vi.fn(), refresh:vi.fn(), tick:0,  ...noPaging,
     })
     const html = renderToStaticMarkup(<WorkspaceLiaison scope="brain" surface="workspace" workspace={{id:'w', name:'工作区'}} sessionId="group" workOrderId="order"
       changed={vi.fn()} close={vi.fn()} openProfileImport={vi.fn()} openWorkspace={vi.fn()}/>)
@@ -42,7 +43,7 @@ describe('一句话交办', () => {
         { seq: 2, time: 2, role: 'liaison', text: '已经发起。', discussions: [{ id: 'room', title: '幕僚团自我介绍' }] },
       ], discussionResults: [{ id: 'result-1', roomId: 'room', title: '幕僚团自我介绍', at: new Date(3).toISOString(),
         status: 'partial', text: '**研究员**负责查证。工程师尚未答复。' }],
-      live: undefined, notices: [], workReplies: [], busy: false, error: undefined, say: vi.fn(), refresh: vi.fn(), tick: 0,
+      live: undefined, notices: [], workReplies: [], busy: false, error: undefined, say: vi.fn(), refresh: vi.fn(), tick: 0,  ...noPaging,
     })
     const html = renderToStaticMarkup(<WorkspaceLiaison scope="brain" surface="today" changed={vi.fn()} close={vi.fn()} openProfileImport={vi.fn()} openRoom={vi.fn()} openWorkspace={vi.fn()}/>)
     expect(html).toMatch(/已经发起。.+部分结果 · 幕僚团自我介绍.+研究员.*负责查证。工程师尚未答复。.+查看讨论过程/s)
@@ -57,7 +58,7 @@ describe('一句话交办', () => {
           steps: [{ kind: 'think', label: 'private step', detail: 'private detail', done: true }] },
         { seq: 3, time: 3, role: 'liaison', text: '', profileImports: [{importId:'profile-' + 'a'.repeat(64)}] },
       ], live: undefined, notices: [{key:'retired',at:'2026-11-22T08:00:00Z',text:'旧工单提醒',ticketId:'T-0042'}],
-      workReplies: [], busy: false, error: undefined, say: vi.fn(), refresh: vi.fn(), tick: 0,
+      workReplies: [], busy: false, error: undefined, say: vi.fn(), refresh: vi.fn(), tick: 0,  ...noPaging,
     })
     const html = renderToStaticMarkup(<WorkspaceLiaison scope="brain" surface="today" changed={vi.fn()} close={vi.fn()} openProfileImport={vi.fn()} openWorkspace={vi.fn()}/>)
     expect(html).toContain('aria-label="接口人"')
@@ -75,7 +76,7 @@ describe('一句话交办', () => {
     vi.spyOn(api, 'useChat').mockReturnValue({
       sessionId:'hq', confirmedMessages:[], observedAt:0, messages:[{seq:1,time:1,role:'liaison',text:'已接手',workspaces:[receipt]}],
       live:{since:2,steps:[],text:'',workspaces:[{...receipt,delegationId:'next',delegationTitle:'下期报名'}]},
-      notices:[], workReplies:[], busy:true, error:undefined, say:vi.fn(), refresh:vi.fn(), tick:0,
+      notices:[], workReplies:[], busy:true, error:undefined, say:vi.fn(), refresh:vi.fn(), tick:0,  ...noPaging,
     })
     const html = renderToStaticMarkup(<WorkspaceLiaison scope="brain" surface="today" changed={vi.fn()} close={vi.fn()}
       openProfileImport={vi.fn()} openWorkspace={vi.fn()} openDelegation={vi.fn()}/>)
@@ -91,7 +92,7 @@ describe('一句话交办', () => {
         { seq: 1, time: Date.parse(at(1)), role: 'you', text: '帮我写周报' },
         { seq: 2, time: Date.parse(at(2)), role: 'liaison', text: '已交给工作区团队。' },
         { seq: 3, time: Date.parse(at(20)), role: 'liaison', text: '还有别的吗？' },
-      ], live: undefined, workReplies: [], busy: false, error: undefined, say: vi.fn(), refresh: vi.fn(), tick: 0,
+      ], live: undefined, workReplies: [], busy: false, error: undefined, say: vi.fn(), refresh: vi.fn(), tick: 0,  ...noPaging,
       notices: [
         { key: 'workspace-done:d1:t1', at: at(10), text: '「本周周报」已完成，接口人验收通过。打开工单查看成果。', order: { workspaceId: 'w1', orderId: 'd1' } },
         { key: 'room-action:q', at: at(15), text: '「选型讨论」需要你回答', roomId: 'room-1', status: '已回答', done: true },
@@ -104,6 +105,33 @@ describe('一句话交办', () => {
     expect(html).toContain('data-message-id="notice-workspace-done:d1:t1"')
     expect(html).toMatch(/class="v2-turn settled"[^>]*data-message-id="notice-room-action:q"|data-message-id="notice-room-action:q" class="v2-turn settled"/)
     expect(html).not.toMatch(/旧工单待验收|接口人提醒|<details/)
+  })
+
+  it('只显示已加载时间范围内的提醒与讨论回报；顶部说明能否加载更早的消息', () => {
+    const at = (minute: number) => new Date(Date.UTC(2026, 10, 24, 3, minute)).toISOString()
+    const loaded = Array.from({ length: 40 }, (_, i) => ({ seq: 100 + i, time: Date.parse(at(10 + i)), role: (i % 2 ? 'liaison' : 'you') as 'you' | 'liaison', text: '第 ' + i + ' 条' }))
+    const chat = (paging: Partial<typeof noPaging>) => ({
+      sessionId: 'hq', confirmedMessages: loaded, observedAt: Date.parse(at(59)), messages: loaded, live: undefined, workReplies: [], busy: false,
+      error: undefined, say: vi.fn(), refresh: vi.fn(), tick: 0, ...noPaging, ...paging,
+      discussionResults: [{ id: 'r-old', roomId: 'room', title: '旧讨论', text: '更早的讨论回报', at: at(5), status: 'ready' as const }],
+      notices: [{ key: 'early', at: at(3), text: '更早的提醒' }, { key: 'inside', at: at(30), text: '范围内的提醒' }],
+    })
+    const render = () => renderToStaticMarkup(<WorkspaceLiaison scope="brain" surface="today" changed={vi.fn()} close={vi.fn()} openProfileImport={vi.fn()}
+      openRoom={vi.fn()} openWorkspace={vi.fn()} openDelegation={vi.fn()}/>)
+    vi.spyOn(api, 'useChat').mockReturnValue(chat({ hasOlder: true }))
+    let html = render()
+    expect(html).toContain('范围内的提醒')
+    expect(html).not.toMatch(/更早的提醒|更早的讨论回报/)
+    expect(html).toContain('加载更早的消息')
+    vi.mocked(api.useChat).mockReturnValue(chat({ hasOlder: true, loadingOlder: true }))
+    expect(render()).toContain('正在加载更早的消息…')
+    vi.mocked(api.useChat).mockReturnValue(chat({ hasOlder: true, olderError: '连接不上主机' }))
+    expect(render()).toMatch(/没能加载更早的消息.*重试/)
+    vi.mocked(api.useChat).mockReturnValue(chat({}))
+    html = render()
+    expect(html).toMatch(/已经到最早的消息.*更早的提醒.*更早的讨论回报.*范围内的提醒/s)
+    vi.mocked(api.useChat).mockReturnValue(chat({ hasNewer: true }))
+    expect(render()).toContain('跳到最新')
   })
 
   it('shows the unread badge with 99+ beyond 99, none at zero or while the conversation is open', () => {

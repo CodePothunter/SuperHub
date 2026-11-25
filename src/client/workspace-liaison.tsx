@@ -1,4 +1,4 @@
-import { useContext, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useContext, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { type ChatMessage, type DiscussionResult, useChat } from './api.ts'
 import type { SuperhubSurface } from '../core/workspace-product.ts'
 import { DiscussionReply, RoomReceipts } from './chat.tsx'
@@ -12,6 +12,8 @@ import type { ChatView } from '../dsh/chat.ts'
 import { useMarkLiaisonSeen } from './workspace-liaison-unread.tsx'
 import { ChatComposer, MessageInputAttachments, useChatAttachments } from './chat-attachments.tsx'
 import { NoticeScheduleActions, SCHEDULE_STYLE } from './workspace-schedules.tsx'
+import { NewerEdge, OlderEdge, historyEdgeStyle } from './history-edge.tsx'
+import { useEdgeSentinel, usePrependAnchor } from './scroll-anchor.ts'
 
 interface Links {
   openProfileImport: (id: string) => void
@@ -30,7 +32,7 @@ interface Props extends Links {
 const style = `
 .wv2 .v2-liaison { flex:1; display:flex; flex-direction:column; min-height:0; }
 .wv2 .v2-liaison-actions { flex:none; }
-.wv2 .v2-liaison-history { flex:1; min-height:120px; overflow:auto; overscroll-behavior:contain; padding:2px; scrollbar-gutter:stable; }
+.wv2 .v2-liaison-history { flex:1; min-height:120px; overflow:auto; overscroll-behavior:contain; overflow-anchor:none; padding:2px; scrollbar-gutter:stable; }
 .wv2 .v2-liaison .v2-turns { margin:3px 0 10px; }
 .wv2 .v2-liaison .v2-compose { flex:none; margin:13px 0 0; }
 .wv2 .v2-liaison .wr-room-receipts { display:flex; flex-wrap:wrap; gap:3px 10px; }
@@ -81,7 +83,8 @@ function LiaisonTurn({ message, result, notice, id, scope, sessionId, openProfil
 
 export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, openWorkspace, openDelegation, openSchedules, workspace, surface, selectedId, sessionId, workOrderId, changed, pending }: Props) {
   const { revoke } = useContext(V2Client)
-  const chat = useChat(changed, scope, revoke)
+  const following = useRef(true)
+  const chat = useChat(changed, scope, revoke, () => following.current)
   const key = 'superhub-v2:draft:' + scope + ':liaison:' + (['people','calendar'].includes(surface) ? surface + ':' + (selectedId ?? '') : workspace?.id ?? '')
   const [draft, setDraft] = useState(() => { try { return sessionStorage.getItem(key) ?? '' } catch { return '' } })
   const latestDraft = useRef(draft)
@@ -97,17 +100,19 @@ export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, op
   const [delivered, setDelivered] = useState(false)
   const active = useRef(false)
   const history = useRef<HTMLDivElement>(null)
-  const following = useRef(true)
   const messages = chat.messages.filter(hasPublicReply)
   const live = chat.live
   const livePublic = live && hasPublicReply(live)
   const liveId = live?.firstSeq !== undefined ? 'liaison-' + live.firstSeq : undefined
-  const results = chat.discussionResults ?? []
-  const notices = chat.notices.filter(liaisonNotice)
+  // Reminders and discussion results interleave by time: only those inside the loaded range show, the rest come with their page.
+  const loaded = chat.confirmedMessages
+  const inRange = (at: number) => (!chat.hasOlder || !loaded.length || at >= loaded[0]!.time) && (!chat.hasNewer || !loaded.length || at <= loaded.at(-1)!.time)
+  const results = (chat.discussionResults ?? []).filter(result => inRange(Date.parse(result.at)))
+  const notices = chat.notices.filter(notice => liaisonNotice(notice) && inRange(Date.parse(notice.at)))
   const feed: { id: string | undefined; message: LiaisonSpeech; result?: DiscussionResult; notice?: ChatNotice }[] = messages.map(message => ({ id: speechId(message), message }))
   for (const result of results) feed.push({ id: result.id, result, message: { role: 'liaison', text: '', time: Date.parse(result.at) } })
   for (const notice of notices) feed.push({ id: 'notice-' + notice.key, notice, message: { role: 'liaison', text: '', time: Date.parse(notice.at) } })
-  if (live && livePublic) feed.push({ id: liveId, message: { ...live, role: 'liaison', time: live.firstSpokenAt ?? live.since } })
+  if (live && livePublic && !chat.hasNewer) feed.push({ id: liveId, message: { ...live, role: 'liaison', time: live.firstSpokenAt ?? live.since } })
   feed.sort((a, b) => a.message.time - b.message.time)
   const timeline = chat.confirmedMessages.filter(hasPublicReply)
     .map(m => ({id:speechId(m), at:m.time}))
@@ -115,9 +120,21 @@ export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, op
   for (const notice of notices) timeline.push({ id: 'notice-' + notice.key, at: Date.parse(notice.at) })
   if (liveId && livePublic) timeline.push({id:liveId, at:live!.firstSpokenAt ?? live!.since})
   usePortraitArrivals(history, chat.sessionId, timeline, chat.observedAt)
+  // Older pages load as the top comes near; the first visible message stays where it was.
+  const scroller = useCallback(() => history.current, [])
+  const top = useRef<HTMLDivElement>(null), bottom = useRef<HTMLDivElement>(null)
+  const capture = usePrependAnchor(scroller, history, loaded[0] && speechId(loaded[0]))
+  const loadOlder = () => void chat.loadOlder(capture)
+  // A page appended below while catching up is read where it is, not followed to its end.
+  const appending = useRef(false)
+  const loadNewer = () => void chat.loadNewer(() => { appending.current = true })
+  useEdgeSentinel(top, scroller, 'top', chat.hasOlder && !chat.loadingOlder && !chat.olderError, loadOlder, loaded.length)
+  useEdgeSentinel(bottom, scroller, 'bottom', chat.hasNewer && !chat.loadingNewer && !chat.newerError, loadNewer, loaded.length)
   useLayoutEffect(() => {
     const element = history.current
-    if (element && following.current) element.scrollTop = element.scrollHeight
+    const skip = appending.current || chat.hasNewer
+    appending.current = false
+    if (element && following.current && !skip) element.scrollTop = element.scrollHeight
   }, [messages.length, messages.at(-1)?.seq, results.length, results.at(-1)?.id, notices.length, notices.at(-1)?.key, live?.text, live?.discussions?.length, live?.workspaces?.length, live?.profileImports?.length])
   // What the owner sees here is read: on opening, and whenever the newest message (or a reminder) changes.
   // A reply still being written is not counted as unread, so it is marked when it lands.
@@ -134,6 +151,7 @@ export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, op
     setSending(true)
     setDelivered(false)
     following.current = true
+    if (chat.hasNewer) void chat.toLatest()
     try {
       if (await chat.say(draft, 'auto', {surface, ...(selectedId && {selectedId}),
         ...(surface === 'workspace' && sessionId && {sessionId, ...(workOrderId && {workOrderId})})}, files.ready)) {
@@ -152,15 +170,18 @@ export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, op
   }
 
   return <V2Dialog title="接口人" meta={workspace?.name} close={close} size="wide">
-    <style>{style + chatAvatarStyle + SCHEDULE_STYLE}</style><div className="v2-liaison">
+    <style>{style + chatAvatarStyle + SCHEDULE_STYLE + historyEdgeStyle}</style><div className="v2-liaison">
       {pending && <div className="v2-liaison-actions">{pending}</div>}
       <div className="v2-liaison-history" ref={history} onScroll={event => {
         const el = event.currentTarget
         following.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60
       }}>
+        <OlderEdge edge={top} hasOlder={chat.hasOlder} loading={chat.loadingOlder} error={chat.olderError} count={loaded.length} load={loadOlder}/>
         {feed.length > 0 && <ol className="v2-turns" aria-label="接口人对话">
           {feed.map(({ id, message, result, notice }) => <LiaisonTurn key={id ?? 'liaison-live'} id={id} scope={scope} sessionId={chat.sessionId} message={message} result={result} notice={notice} openProfileImport={openProfileImport} openRoom={openRoom} openWorkspace={openWorkspace} openDelegation={openDelegation} openSchedules={openSchedules}/>)}
         </ol>}
+        <NewerEdge edge={bottom} hasNewer={chat.hasNewer} loading={chat.loadingNewer} error={chat.newerError} load={loadNewer}
+          latest={() => { following.current = true; void chat.toLatest() }}/>
       </div>
       <form className="v2-compose" onSubmit={event => { event.preventDefault(); void send() }}>
         <ChatComposer draft={files} text={draft} sending={sending} disabled={!chat.sessionId}

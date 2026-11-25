@@ -23,7 +23,7 @@ import { approvalNotice, commandApprovals, commandSummary } from './approvals.ts
 import { CodingGate, llmReviewer } from './coding-gate.ts'
 import { BrainRepo } from './brain.ts'
 import { createProfileImportService, llmProfileOrganizer } from './assistant-import.ts'
-import { inboxDispatchState, LIAISON_PROMPT, LiaisonChat, offsetSpeech, type ChatMessage, type LiaisonParts } from './chat.ts'
+import { inboxDispatchState, LIAISON_HISTORY_MAX, LIAISON_PROMPT, LiaisonChat, offsetSpeech, type ChatMessage, type LiaisonParts } from './chat.ts'
 import { chatAttachmentError, ChatAttachments } from './chat-attachments.ts'
 import { registerCodexApprovals, type CodexApprovalConfig } from './codex-approvals.ts'
 import { contextTokens, handoffText, hasRawConnectorHistory, liaisonGuard, LiaisonToolVisibility, mergeHistory, nextPartId, rotateLine, SteerCutter, type LiaisonToolStatus } from './liaison.ts'
@@ -414,7 +414,7 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
         const { messages } = chat.project(agent.session?.snapshotEvents() ?? [])
         mkdirSync(liaisonDir, { recursive: true, mode: 0o700 })
         writeFileSync(handoffFile(next), handoffText(previous, omitHistory ? [] : messages, clock().now.replace('T', ' ')))
-        const merged = mergeHistory(archived(), messages.map(m => offsetSpeech(m, parts.offset())), 200)
+        const merged = mergeHistory(archived(), messages.map(m => offsetSpeech(m, parts.offset())), LIAISON_HISTORY_MAX)
         const materials = new Map(merged.flatMap(message => (message.inputAttachments ?? []).map(file => [file.id, file] as const)))
         for (const [id, file] of omitHistory ? [] : materials) {
           try { inputAttachments.allowRead(next, [file]) }

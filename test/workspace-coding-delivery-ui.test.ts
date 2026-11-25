@@ -1,6 +1,7 @@
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { pagedReadsFromV2Read } from './paged-read-mock.ts'
 import { isOrderOutputs } from '../src/client/workspace-v2-response.ts'
 import type { V2Delegation, V2Session, V2WorkspaceView } from '../src/core/workspace-v2.ts'
 import type { Scoped } from '../src/client/superhub-api.ts'
@@ -20,6 +21,7 @@ function mockReads(responses: Record<string, Scoped & Record<string,unknown>>) {
   })
 }
 afterEach(() => vi.restoreAllMocks())
+beforeEach(() => pagedReadsFromV2Read())
 
 describe('工单成果', () => {
   it('keeps the file and its source message bound to the requested work order, including a shared conversation', () => {
