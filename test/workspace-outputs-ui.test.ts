@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { WorkspaceOutput } from '../src/core/workspace-v2.ts'
 import type { Scoped } from '../src/client/superhub-api.ts'
 import * as api from '../src/client/workspace-v2-api.ts'
-import { arrangeOutputs, outputChoices, OutputsBoard, RecentOutputs } from '../src/client/workspace-outputs.tsx'
+import { arrangeOutputs, availableFilter, outputChoices, OutputsBoard, RecentOutputs } from '../src/client/workspace-outputs.tsx'
 import { isWorkspaceOutputs } from '../src/client/workspace-v2-response.ts'
 import { readPlace } from '../src/client/workspace-v2.tsx'
 
@@ -40,18 +40,20 @@ afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
 describe('工作区产物：概览「最近产物」', () => {
   it('只列最近 5 个，标题旁给出「查看全部（7）」，每个带工单名标签', () => {
     mockReads({[path]: answer(seven)})
-    const html = renderToStaticMarkup(createElement(RecentOutputs, {base, feed, showAll: vi.fn()}))
+    const html = renderToStaticMarkup(createElement(RecentOutputs, {base, feed, showAll: vi.fn(), openOrder: vi.fn()}))
     expect(html).toContain('最近产物')
     expect(html).toContain('查看全部（7）')
     expect(titles(html)).toEqual(['汇总', '计费表', '价目', '报价单', 'Alpha 说明'])
-    // Overview tags are labels; filtering by a tag happens on the board.
-    expect(html).toMatch(/<span class="v2-output-tag">.*?核对价目<\/span>.*?<span class="v2-output-tag">.*?方舟计费<\/span>/)
+    // On the overview a tag opens its order; filtering by a tag happens on the board.
+    expect(html).toContain('aria-label="打开工单「核对价目」"')
+    expect(html).toContain('aria-label="打开工单「方舟计费」"')
+    expect(html).not.toContain('只看工单')
     expect(html).toContain('研究员')
   })
 
   it('有工单还在进行时每 15 秒重读，否则只在工单变化时重读', () => {
     const read = mockReads({[path]: answer(seven)})
-    renderToStaticMarkup(createElement(RecentOutputs, {base, feed, showAll: vi.fn()}))
+    renderToStaticMarkup(createElement(RecentOutputs, {base, feed, showAll: vi.fn(), openOrder: vi.fn()}))
     expect(read).toHaveBeenLastCalledWith(path, isWorkspaceOutputs, 15000, 3)
     renderToStaticMarkup(createElement(OutputsBoard, {base, feed: {live: false, revision: 4}}))
     expect(read).toHaveBeenLastCalledWith(path, isWorkspaceOutputs, undefined, 4)
@@ -59,7 +61,7 @@ describe('工作区产物：概览「最近产物」', () => {
 
   it('没有产物时整块不出现', () => {
     mockReads({[path]: answer([])})
-    expect(renderToStaticMarkup(createElement(RecentOutputs, {base, feed, showAll: vi.fn()}))).toBe('')
+    expect(renderToStaticMarkup(createElement(RecentOutputs, {base, feed, showAll: vi.fn(), openOrder: vi.fn()}))).toBe('')
   })
 })
 
@@ -100,6 +102,14 @@ describe('工作区产物：「产物」版面', () => {
     expect(arrangeOutputs(seven, 'name', {order: 'd2', by: 'staff:engineer'}).map(row => row.label)).toEqual(['草图'])
     expect(arrangeOutputs(seven, 'recent', {order: 'gone'})).toEqual([])
     expect(outputChoices(seven)).toEqual({orders: [billing, prices], deliveredBy: [engineer, researcher]})
+  })
+
+  it('选中的工单或交付人已不在产物里时不再筛选（例如工单被移除）', () => {
+    const choices = outputChoices(seven)
+    expect(availableFilter({order: 'd2', by: 'staff:engineer'}, choices)).toEqual({order: 'd2', by: 'staff:engineer'})
+    expect(availableFilter({order: 'gone', by: 'staff:engineer'}, choices)).toEqual({by: 'staff:engineer'})
+    expect(availableFilter({order: 'gone', by: 'nobody'}, choices)).toEqual({})
+    expect(arrangeOutputs(seven, 'recent', availableFilter({order: 'gone'}, choices))).toHaveLength(seven.length)
   })
 })
 

@@ -35,21 +35,29 @@ export function outputChoices(rows: WorkspaceOutput[]) {
  */
 export interface OutputsFeed { live: boolean; revision?: number }
 
+/** A chosen order or deliverer that is no longer among the outputs (the order was retired, say) stops narrowing the list. */
+export function availableFilter(filter: OutputFilter, choices: ReturnType<typeof outputChoices>): OutputFilter {
+  return {...choices.orders.some(order => order.id === filter.order) && {order: filter.order},
+    ...choices.deliveredBy.some(person => person.id === filter.by) && {by: filter.by}}
+}
+
 function useWorkspaceOutputs(base: string, {live, revision}: OutputsFeed) {
   return useV2Read(base + '/outputs', isWorkspaceOutputs, live ? 15000 : undefined, revision)
 }
 
+/** What clicking an order tag does: the board narrows to that order, the overview opens it. */
+interface TagAction { label: (title: string) => string; pick: (orderId: string) => void }
+
 /** A delivered file: its name, who delivered it and when, and the orders it came from (a tag each). */
-function OutputRow({ row, open, pickOrder }: { row: WorkspaceOutput; open: () => void; pickOrder?: (id: string) => void }) {
+function OutputRow({ row, open, tag }: { row: WorkspaceOutput; open: () => void; tag: TagAction }) {
   return <li className="v2-output-row">
     <button type="button" className="v2-output-open" onClick={open}>
       <span className="v2-row-title"><strong><V2Icon name="file"/>{row.label}</strong><V2Icon name="next"/></span>
       <small>{row.deliveredBy.map(person => person.name).join('、')} · {readableTime(row.at)}</small>
     </button>
     <ul className="v2-output-tags" aria-label="来自工单">{row.orders.map(order => <li key={order.id}>
-      {pickOrder ? <button type="button" className="v2-output-tag" aria-label={'只看工单「' + order.title + '」的产物'} onClick={() => pickOrder(order.id)}>
-        <V2Icon name="work"/>{order.title}</button>
-        : <span className="v2-output-tag"><V2Icon name="work"/>{order.title}</span>}</li>)}</ul>
+      <button type="button" className="v2-output-tag" aria-label={tag.label(order.title)} onClick={() => tag.pick(order.id)}>
+        <V2Icon name="work"/>{order.title}</button></li>)}</ul>
   </li>
 }
 
@@ -60,7 +68,7 @@ function OutputReader({ base, row, close }: { base: string; row: WorkspaceOutput
 }
 
 /** The overview's 「最近产物」: the latest few, and the way to the full board. Nothing when nothing was delivered. */
-export function RecentOutputs({ base, feed, showAll }: { base: string; feed: OutputsFeed; showAll: () => void }) {
+export function RecentOutputs({ base, feed, showAll, openOrder }: { base: string; feed: OutputsFeed; showAll: () => void; openOrder: (id: string) => void }) {
   const query = useWorkspaceOutputs(base, feed)
   const [file, setFile] = useState<string>()
   const rows = query.data?.outputs ?? []
@@ -70,7 +78,8 @@ export function RecentOutputs({ base, feed, showAll }: { base: string; feed: Out
     <div className="v2-section-head"><h2><V2Icon name="box"/>最近产物</h2>
       <button type="button" className="v2-link" onClick={showAll}>查看全部（{rows.length}）<V2Icon name="next"/></button></div>
     <Issue text={query.error || query.data?.issue} retry={query.refresh}/>
-    <ul className="v2-card v2-output-list">{rows.slice(0, RECENT_OUTPUTS).map(row => <OutputRow key={row.key} row={row} open={() => setFile(row.key)}/>)}</ul>
+    <ul className="v2-card v2-output-list">{rows.slice(0, RECENT_OUTPUTS).map(row => <OutputRow key={row.key} row={row} open={() => setFile(row.key)}
+      tag={{label: title => '打开工单「' + title + '」', pick: openOrder}}/>)}</ul>
     {selected && <OutputReader base={base} row={selected} close={() => setFile(undefined)}/>}
   </section>
 }
@@ -79,12 +88,13 @@ export function RecentOutputs({ base, feed, showAll }: { base: string; feed: Out
 export function OutputsBoard({ base, feed }: { base: string; feed: OutputsFeed }) {
   const query = useWorkspaceOutputs(base, feed)
   const [sort, setSort] = useState<OutputSort>('recent')
-  const [filter, setFilter] = useState<OutputFilter>({})
+  const [chosen, setFilter] = useState<OutputFilter>({})
   const [file, setFile] = useState<string>()
   const data = query.data
   const rows = data?.outputs ?? []
-  const shown = arrangeOutputs(rows, sort, filter)
   const choices = outputChoices(rows)
+  const filter = availableFilter(chosen, choices)
+  const shown = arrangeOutputs(rows, sort, filter)
   const selected = rows.find(row => row.key === file)
   return <section className="v2-outputs" aria-label="产物">
     <Issue text={query.error || data?.issue} retry={query.refresh}/>
@@ -102,7 +112,7 @@ export function OutputsBoard({ base, feed }: { base: string; feed: OutputsFeed }
       </div>
       <div className="v2-people-count" role="status">{shown.length === rows.length ? rows.length + ' 个产物' : '找到 ' + shown.length + ' 个，共 ' + rows.length + ' 个'}</div>
       {shown.length ? <ul className="v2-card v2-output-list">{shown.map(row => <OutputRow key={row.key} row={row} open={() => setFile(row.key)}
-        pickOrder={order => setFilter({...filter, order})}/>)}</ul>
+        tag={{label: title => '只看工单「' + title + '」的产物', pick: order => setFilter({...filter, order})}}/>)}</ul>
         : <div className="v2-empty"><p>没有符合这些条件的产物。</p>
           <button type="button" className="v2-link" onClick={() => setFilter({})}>清除筛选</button></div>}
     </> : !data.issue && <div className="v2-empty"><strong>还没有产物</strong><p>工单交出的文件会集中列在这里，并标明来自哪张工单。</p></div>)}

@@ -310,7 +310,7 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
               popup={setPopup} changed={current.refresh}/>
               : null
             : <><ProjectDirectory key={view.workspace.id} workspace={view.workspace} changed={current.refresh}/>
-              <RecentOutputs key={'outputs-' + view.workspace.id} base={base} feed={outputsFeed} showAll={openOutputs}/>
+              <RecentOutputs key={'outputs-' + view.workspace.id} base={base} feed={outputsFeed} showAll={openOutputs} openOrder={openDelegation}/>
               <Overview view={view} openJob={openDelegation} openSession={openSession} delegate={() => newOrder()} create={() => setPopup('new-session')}/>
               <ArchiveWorkspace key={view.workspace.id} workspace={view.workspace} personalId={personalId} done={async () => {
                 const name = view.workspace.name
