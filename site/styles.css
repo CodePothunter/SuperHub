@@ -145,6 +145,7 @@ h1 em{font-style:normal;color:var(--blue)}
 .install-item p{font-size:12px;margin-top:4px}
 .faqs{max-width:820px;margin:auto}
 .faqs>h2{font-size:34px;margin-bottom:28px;letter-spacing:-1px}
+.faqs p a{color:var(--blue-text);text-decoration:underline;text-underline-offset:3px}
 details{border-top:1px solid var(--line);padding:19px 0}
 summary{cursor:pointer;font-weight:550;font-size:14px}
 details p{padding-top:15px;font-size:13px;color:var(--muted)}
