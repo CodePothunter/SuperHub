@@ -1535,7 +1535,12 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       if (child === 'delegations' && childId && action === 'outputs' && seg.length === 6) {
         const order = store.delegation(workspaceId,childId)
         const session = store.session(workspaceId,order.sessionId)
-        const outputs = publishedOutputs(session, await read(session), order.id)
+        // Group attachments are read live from their path, so two lines linking one path are one output.
+        const group = roster(session) ? await groupTranscript(session).catch(() => undefined) : undefined
+        const outputs = group ? publishedOutputs(session, group.transcript, order.id, id => {
+          const [, seq, index] = /^g-(\d+)-(\d+)$/.exec(id) ?? []
+          return seq ? group.engine.ledger.get(Number(seq))?.attachments?.[Number(index)]?.path : undefined
+        }) : roster(session) ? [] : publishedOutputs(session, await read(session), order.id)
         current()
         return ok({workspaceId,delegationId:childId,outputs})
       }

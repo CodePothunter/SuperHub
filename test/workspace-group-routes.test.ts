@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { WORKSPACE_ARCHIVED, workspaceArchived, type V2Delegation, type V2DialogueSource, type V2PendingApproval, type V2Session, type V2Workspace } from '../src/core/workspace-v2.ts'
+import { WORKSPACE_ARCHIVED, workspaceArchived, type V2Delegation, type V2DialogueSource, type V2PendingApproval, type V2Session, type V2Workspace, type WorkOrderOutput } from '../src/core/workspace-v2.ts'
 import { workspaceFingerprint } from '../src/dsh/superhub-goals.ts'
 import type { ChatInputAttachment } from '../src/core/chat-attachments.ts'
 import type { ChatAttachments } from '../src/dsh/chat-attachments.ts'
@@ -697,6 +697,10 @@ describe('工单交付提醒：成员在群里交出成果', () => {
     f.dsh.answer('researcher', '还是这份：[计费表](计费表.md)')
     await new Promise(resolve => setTimeout(resolve, 10))
     expect((await notices(f)).data.items).toHaveLength(2)
+    // The order's delivered files list that file once, at its latest link.
+    const again = (await f.view(job.session)).data.messages.filter(m => m.author === '研究员' && m.attachments?.length).at(-1)!
+    const outputs = (await f.call<{ outputs: WorkOrderOutput[] }>('/' + ws.id + '/orders/' + job.delegation.id + '/outputs')).data.outputs
+    expect(outputs.map(row => [row.messageId, row.attachment.label])).toEqual([[again.id, '计费表']])
     // Lines of the general discussion (no order) and the owner's own words never become notices.
     await f.say(job.session, '工单回报\n这是我自己写的')
     await new Promise(resolve => setTimeout(resolve, 10))
