@@ -169,6 +169,18 @@ export interface V2Session {
 export interface V2AttachmentRef { id: string; label: string }
 export interface V2OrderOriginal { text: string; complete: boolean }
 export interface WorkOrderOutput { sessionId: string; messageId: string; attachment: V2AttachmentRef }
+/**
+ * One delivered file across a workspace's orders (`GET …/:w/outputs`), listed once however many orders or lines linked it.
+ * `key` is stable and never the file path. `sessionId`, `messageId` and `attachment` are its latest reference (what opens
+ * when the owner reads it); `orders` are the orders that delivered it, latest first; `deliveredBy` the speakers who linked it.
+ */
+export interface WorkspaceOutput extends WorkOrderOutput {
+  key: string
+  label: string
+  at: string
+  orders: { id: string; title: string }[]
+  deliveredBy: { id: string; name: string }[]
+}
 export interface V2Attachment extends V2AttachmentRef { format: 'markdown' | 'text' | 'html'; content: string }
 export interface V2Message {
   id: string

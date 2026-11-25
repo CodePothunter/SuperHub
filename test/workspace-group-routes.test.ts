@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { WORKSPACE_ARCHIVED, workspaceArchived, type V2Delegation, type V2DialogueSource, type V2PendingApproval, type V2Session, type V2Workspace, type WorkOrderOutput } from '../src/core/workspace-v2.ts'
+import { WORKSPACE_ARCHIVED, workspaceArchived, type V2Delegation, type V2DialogueSource, type V2PendingApproval, type V2Session, type V2Workspace, type WorkOrderOutput, type WorkspaceOutput } from '../src/core/workspace-v2.ts'
 import { workspaceFingerprint } from '../src/dsh/superhub-goals.ts'
 import type { ChatInputAttachment } from '../src/core/chat-attachments.ts'
 import type { ChatAttachments } from '../src/dsh/chat-attachments.ts'
@@ -724,6 +724,108 @@ describe('工单交付提醒：成员在群里交出成果', () => {
     expect(together).toBeGreaterThanOrEqual(0)
     expect(writes.mock.results[together]!.value).toMatchObject({ state: 'pending', orderId: job.delegation.id })
     expect((await notices(f)).data.items).toMatchObject([{ orderId: job.delegation.id, title: '计费表' }])
+  })
+})
+
+describe('工作区产物：各工单交付成果按文件合在一处', () => {
+  const pause = () => new Promise(resolve => setTimeout(resolve, 5))
+  const list = (f: ReturnType<typeof fixture>, ws: V2Workspace) => f.call<{ workspaceId: string; outputs: WorkspaceOutput[]; issue?: string }>('/' + ws.id + '/outputs')
+
+  it('同一文件只列一次、带各工单标签、时间取最近；群里讨论与主人附件不算；不返回路径', async () => {
+    const upload: ChatInputAttachment = {id: 'up', name: '主人的草稿.md', kind: 'file', bytes: 4}
+    const f = fixture({turnLimit: 20, inputAttachments: {resolve: () => [upload], grant: vi.fn()}})
+    const ws = await f.workspace()
+    expect((await list(f, ws)).data).toMatchObject({workspaceId: ws.id, outputs: []})
+    const first = f.route().assign('owner-o1', '让研究员整理方舟的计费规则', undefined, ws.id, undefined, { title: '方舟计费', promise: '一份计费表' }, 'researcher')
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(1))
+    const dir = f.host().workDir(first.session)
+    for (const name of ['计费表', '价目', '杂记', '汇总']) writeFileSync(join(dir, name + '.md'), '# ' + name + '\n')
+    f.dsh.answer('researcher', '整理好了：[计费表](计费表.md)')
+    await pause()
+    // The same order links the file again: still one output.
+    await f.say(first.session, '@研究员 再发一次链接', { workOrderId: first.delegation.id })
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(2))
+    f.dsh.answer('researcher', '还是这份：[计费表](计费表.md)')
+    await pause()
+    // A second order in the same group delivers that file again and one more.
+    const second = f.route().assign('owner-o2', '顺便核对价目', undefined, ws.id, first.session.id, { title: '核对价目', promise: '价目与计费表' }, 'researcher')
+    expect(second.session.id).toBe(first.session.id)
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(3))
+    f.dsh.answer('researcher', '[计费表](计费表.md) 和 [价目](价目.md)')
+    await pause()
+    // The group's general discussion (no order) delivers nothing.
+    await f.say(first.session, '@研究员 随手记一下')
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(4))
+    f.dsh.answer('researcher', '[杂记](杂记.md)')
+    await pause()
+    await f.say(first.session, '@工程师 出个汇总', { workOrderId: first.delegation.id })
+    await vi.waitFor(() => expect(f.codex.count('engineer')).toBe(1))
+    f.codex.answer('engineer', '[汇总](汇总.md)')
+    await pause()
+    // Neither do the owner's own uploads.
+    expect((await f.say(first.session, '材料给你', { workOrderId: first.delegation.id, inputAttachments: [upload.id] })).status).toBe(200)
+    const data = await vi.waitFor(async () => {
+      const read = (await list(f, ws)).data
+      expect(read.outputs.map(row => row.label)).toEqual(['汇总', '计费表', '价目'])
+      return read
+    })
+    const lines = (await f.view(first.session)).data.messages
+    const researcher = lines.filter(m => m.author === '研究员' && m.attachments?.length)
+    const engineer = lines.find(m => m.author === '工程师' && m.attachments?.length)!
+    const [summary, sheet, prices] = data.outputs
+    expect(sheet).toMatchObject({ sessionId: first.session.id, messageId: researcher[2]!.id, at: researcher[2]!.at, attachment: researcher[2]!.attachments![0],
+      orders: [{ id: second.delegation.id, title: '核对价目' }, { id: first.delegation.id, title: '方舟计费' }],
+      deliveredBy: [{ id: researcher[0]!.speakerId, name: '研究员' }] })
+    expect(prices).toMatchObject({ messageId: researcher[2]!.id, orders: [{ id: second.delegation.id, title: '核对价目' }] })
+    expect(summary).toMatchObject({ messageId: engineer.id, at: engineer.at, orders: [{ id: first.delegation.id, title: '方舟计费' }],
+      deliveredBy: [{ id: engineer.speakerId, name: '工程师' }] })
+    expect(data.outputs.every(row => /^[a-f0-9]{24}$/.test(row.key))).toBe(true)
+    expect(new Set(data.outputs.map(row => row.key)).size).toBe(3)
+    expect(data.issue).toBeUndefined()
+    const body = JSON.stringify(data)
+    expect(body).not.toContain(dir)
+    expect(body).not.toMatch(/\.md|杂记|主人的草稿/)
+    // The latest reference opens the same file as the order's 「交付成果」.
+    const opened = await f.call<{ attachment: { content: string } }>('/' + ws.id + '/sessions/' + sheet!.sessionId + '/attachments/' + sheet!.attachment.id)
+    expect(opened.data.attachment.content).toContain('# 计费表')
+    const orderOutputs = (await f.call<{ outputs: WorkOrderOutput[] }>('/' + ws.id + '/orders/' + second.delegation.id + '/outputs')).data.outputs
+    expect(orderOutputs.map(row => [row.messageId, row.attachment.id])).toContainEqual([sheet!.messageId, sheet!.attachment.id])
+  })
+
+  it('一场会话读不到时，其余产物照常列出并说明不全', async () => {
+    const f = fixture()
+    const ws = await f.workspace()
+    const job = f.route().assign('owner-o3', '让研究员整理方舟的计费规则', undefined, ws.id, undefined, { title: '方舟计费', promise: '一份计费表' }, 'researcher')
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(1))
+    writeFileSync(join(f.host().workDir(job.session), '计费表.md'), '# 计费表\n')
+    f.dsh.answer('researcher', '[计费表](计费表.md)')
+    const other = await f.group(ws)
+    f.route().assign('owner-o4', '另一件事', undefined, ws.id, other.id, { title: '另一件事', promise: '说明' }, 'researcher')
+    await vi.waitFor(async () => expect((await list(f, ws)).data.outputs.map(row => row.label)).toEqual(['计费表']))
+    const engine = f.host().engine.bind(f.host())
+    vi.spyOn(f.host(), 'engine').mockImplementation(session => session.id === other.id ? Promise.reject(new Error('账本损坏')) : engine(session))
+    const read = (await list(f, ws)).data
+    expect(read.outputs.map(row => row.label)).toEqual(['计费表'])
+    expect(read.issue).toContain('暂时读不到')
+  })
+
+  it('已归档的工作区照常列出产物，群只读打开', async () => {
+    const f = fixture()
+    const ws = await f.workspace()
+    const job = f.route().assign('owner-o5', '让研究员整理方舟的计费规则', undefined, ws.id, undefined, { title: '方舟计费', promise: '一份计费表' }, 'researcher')
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(1))
+    writeFileSync(join(f.host().workDir(job.session), '计费表.md'), '# 计费表\n')
+    f.dsh.answer('researcher', '[计费表](计费表.md)')
+    await vi.waitFor(async () => expect((await list(f, ws)).data.outputs.map(row => row.label)).toEqual(['计费表']))
+    const file = join(f.root, 'ops', 'superhub-v2', workspaceFingerprint(scope) + '.json')
+    const board = JSON.parse(readFileSync(file, 'utf8'))
+    board.workspaces.find((row: V2Workspace) => row.id === ws.id).archivedAt = '2026-11-24T08:00:00.000Z'
+    writeFileSync(file, JSON.stringify(board))
+    f.restart()
+    const read = await list(f, ws)
+    expect(read).toMatchObject({ status: 200, data: { outputs: [{ label: '计费表', orders: [{ id: job.delegation.id }] }] } })
+    expect(read.data.issue).toBeUndefined()
+    expect((await f.host().engine(job.session)).readOnly).toBe(true)
   })
 })
 

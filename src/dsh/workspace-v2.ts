@@ -21,7 +21,7 @@ import { randomUUID } from 'node:crypto'
 import { extname, join, sep } from 'node:path'
 import { completionCandidate, judgeCommand, type CommandJudge } from './workspace-order-command.ts'
 import { ACCEPTANCE_TIMEOUT_MS, ORIGINAL_LIMIT, RESULTS_LIMIT, type AcceptanceReviewer } from './workspace-acceptance.ts'
-import { publishedOutputs } from './workspace-outputs.ts'
+import { publishedOutputs, workspaceOutputs, type OutputSource } from './workspace-outputs.ts'
 import type { OrderBrief } from './workspace-order-brief.ts'
 import type { WorkspaceStaffStore } from './workspace-staff-store.ts'
 import { WorkspaceFollowup } from './workspace-followup.ts'
@@ -251,6 +251,11 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         ...mentions?.some(part => 'memberId' in part || 'all' in part) && {mentions},
       }
     })
+  }
+  /** The file behind a group attachment (`g-<seq>-<index>`): group attachments are read live from their path. */
+  const groupFileOf = (engine: GroupEngine) => (id: string) => {
+    const [, seq, index] = /^g-(\d+)-(\d+)$/.exec(id) ?? []
+    return seq ? engine.ledger.get(Number(seq))?.attachments?.[Number(index)]?.path : undefined
   }
   /** The group's transcript with the board's held words and choices, like the other conversations. */
   async function groupTranscript(session: V2Session): Promise<{transcript: V2Transcript & {messages: GroupMessage[]}; engine: GroupEngine}> {
@@ -1516,6 +1521,25 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       store.workspace(workspaceId)
       // Read-only listing while the owner types; binding stays the POST above.
       if (child === 'directory' && seg.length === 4) return ok(store.suggestDirectories(url.searchParams.get('path') ?? ''))
+      // Every order's delivered files together; a conversation that cannot be read is left out and said so.
+      if (child === 'outputs' && seg.length === 4) {
+        const orders = store.view(workspaceId).orders.filter(order => !store.isRetiredOrder(order.id))
+        const sessions = [...new Set(orders.map(order => order.sessionId))].map(id => store.session(workspaceId, id))
+        const unread: string[] = []
+        const sources = (await Promise.all(sessions.map(async (session): Promise<OutputSource | undefined> => {
+          const owned = orders.filter(order => order.sessionId === session.id).map(order => ({id: order.id, title: order.title}))
+          if (roster(session)) {
+            const group = await groupTranscript(session).catch(() => undefined)
+            if (!group) { unread.push(session.id); return undefined }
+            return {session, transcript: group.transcript, orders: owned, fileOf: groupFileOf(group.engine)}
+          }
+          const transcript = await read(session)
+          if (transcript.issue && !transcript.messages.length) { unread.push(session.id); return undefined }
+          return {session, transcript, orders: owned}
+        }))).filter(source => source !== undefined)
+        current()
+        return ok({workspaceId, outputs: workspaceOutputs(sources), ...(unread.length > 0 && {issue: '有的会话暂时读不到，产物可能不全，请稍后重试'})})
+      }
       if (seg.length === 3) {
         const stored = store.view(workspaceId)
         const orders = stored.orders.map(shown)
@@ -1537,10 +1561,8 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         const session = store.session(workspaceId,order.sessionId)
         // Group attachments are read live from their path, so two lines linking one path are one output.
         const group = roster(session) ? await groupTranscript(session).catch(() => undefined) : undefined
-        const outputs = group ? publishedOutputs(session, group.transcript, order.id, id => {
-          const [, seq, index] = /^g-(\d+)-(\d+)$/.exec(id) ?? []
-          return seq ? group.engine.ledger.get(Number(seq))?.attachments?.[Number(index)]?.path : undefined
-        }) : roster(session) ? [] : publishedOutputs(session, await read(session), order.id)
+        const outputs = group ? publishedOutputs(session, group.transcript, order.id, groupFileOf(group.engine))
+          : roster(session) ? [] : publishedOutputs(session, await read(session), order.id)
         current()
         return ok({workspaceId,delegationId:childId,outputs})
       }
