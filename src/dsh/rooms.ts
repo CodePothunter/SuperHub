@@ -3,6 +3,8 @@ import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { registerSpeakers, type SpeakerPortraits } from '../core/workspace-avatars.ts'
 import type { WorkspaceStaffStore } from './workspace-staff-store.ts'
+import type { ExperienceRef } from '../core/workspace-experience.ts'
+import type { NativeExperience } from './workspace-native-experience.ts'
 import { workspaceSpeakerId } from './workspace-speaker-id.ts'
 import type { Agent, HostContext, NativeTeamMember, NativeTeams, SessionEventLike } from './ports.ts'
 import { roomWorkBrief, type RoomWork } from './room-work.ts'
@@ -36,7 +38,13 @@ export interface RoomExecutionRequest {
 }
 export type RequestRoomExecution = (room: string, request: RoomExecutionRequest) => Promise<{ ticketId: string; stage?: string; executor?: string; available: boolean; message?: string }>
 export interface RoomMeta { id: string; title: string; session: string; notes: RoomNote[]; tickets?: string[]; ownerActions?: RoomOwnerAction[]; stoppedThrough?: Record<string, number>; portraits?: SpeakerPortraits }
-interface RoomRecord extends RoomMeta { liaisonRequests?: string[]; liaisonResults?: RoomResult[] }
+export interface RoomExperienceGrant extends ExperienceRef { recipient: string; purpose: string }
+export interface RoomExperienceScope { workspaceId: string; orderId?: string; grants?: RoomExperienceGrant[] }
+interface RoomRecord extends RoomMeta {
+  liaisonRequests?: string[]
+  liaisonResults?: RoomResult[]
+  experienceScopes?: Record<string, RoomExperienceScope>
+}
 export interface RoomMessage { id: string; seq: number; time: number; author: string; to: string; text: string; kind: 'message' | 'status'; session: string; replyTo?: string; publicReply?: true; speakerId?: string }
 export interface RoomCursor { session: string; positions: Record<string, number> }
 export const roomSessionId = (root: string, id: string) => 'chief-room-' + createHash('sha256').update(root + ':' + id).digest('hex').slice(0,24)
@@ -121,7 +129,9 @@ export class NativeRooms {
   private readonly abort = new AbortController()
   constructor(private readonly ctx: HostContext, root: string, private readonly roles: () => readonly RoomRole[],
     private readonly permitted: () => boolean = () => true, private readonly work?: RoomWork, private readonly modelDefaults: () => ModelDefaults = () => ({ liaisonPinned: false }),
-    private readonly staffPortraits?:Pick<WorkspaceStaffStore,'bindRoomSpeaker'|'roomPortraits'>) {
+    private readonly staffPortraits?:Pick<WorkspaceStaffStore,'bindRoomSpeaker'|'roomPortraits'>,
+    private readonly experience?: NativeExperience,
+    private readonly workCurrent?: (workspaceId: string, orderId?: string) => boolean) {
     mkdirSync(join(root, 'ops'), { recursive: true })
     this.file = join(root, 'ops', 'room-index.json')
     this.directory = join(root, 'ops', 'rooms')
@@ -198,11 +208,19 @@ export class NativeRooms {
     if (!this.containsSession(agent.id) && !this.roomIdForAgent(agent) && !this.containsSession(this.ctx.agents?.get(agent.id)?.session?.header?.parentSession)) return
     if (this.ctx.tools) this.toolVisibility.attach(agent)
     this.attachIdentity(agent)
-    if (this.promptSections.has(agent) || !agent.ctx?.systemPrompt) return
-    const release = agent.ctx.systemPrompt.section({ name: 'chief-room-context', order: 9050, interpolate: false, text: () => {
+    const system = agent.ctx?.systemPrompt
+    if (this.promptSections.has(agent) || !system) return
+    const experienceText = () => {
+      const membership = this.ctx.get('agentTeams')?.tryMembership(agent)
+      const room = this.rows.find(r => r.session === membership?.root.id)
+      return room ? this.experiencePrompt(agent,room,membership?.root,membership?.name) : ''
+    }
+    const dynamic = this.experience && system.context?.({name:'chief-room-experience',order:130,required:true,interpolate:false,text:experienceText})
+    const release = system.section({ name: 'chief-room-context', order: 9050, interpolate: false, text: () => {
       const membership = this.ctx.get('agentTeams')?.tryMembership(agent)
       const room = this.rows.find(r => r.session === membership?.root.id)
       if (!room) return ''
+      const inherited = dynamic ? '' : this.experiencePrompt(agent, room, membership?.root, membership?.name)
       const notes = [...new Map(room.notes.map(n => [n.id, n])).values()].slice(-8).map(n => ({ ...n, text: n.text.slice(0, 420), reason: n.reason?.slice(0, 160) }))
       const work = roomWorkBrief(this.tickets(room), this.work)
       const defaults = this.modelDefaults()
@@ -215,7 +233,7 @@ export class NativeRooms {
       })
       const example = allRoles[0] ? `${allRoles[0].name}（${allRoles[0].id}）` : '研究员（researcher）'
       const returns = membership?.role === 'lead' ? this.returnSources(room.id, agent).slice(-12).map(({ source, status }) => ({ source, status })) : []
-      return `你在幕僚室「${room.title}」。协作使用 DSH 原生团队工具。只发新的请求、证据或待决项，纯确认不要求对方再回复。等待中的祖先不重复派工。部分失败如实说明所欠。角色：${roles.join('；')}。
+      return `${inherited ? inherited + '\n\n' : ''}你在幕僚室「${room.title}」。协作使用 DSH 原生团队工具。只发新的请求、证据或待决项，纯确认不要求对方再回复。等待中的祖先不重复派工。部分失败如实说明所欠。角色：${roles.join('；')}。
 幕僚 id 与中文名对照：${allRoles.map(r => `${r.id} = ${r.name}`).join('，')}。写给主人看的文字（汇总、回答、表格、待办、笔记）一律用幕僚中文名，需要时在括号里附 id，例如「${example}」，不要只写 id；spawn_teammate 的 name、request_execution 的 staff 等工具参数照旧写 id。
 主人要多位或每一位幕僚各自回答（例如「让每个人汇报一下自己用的模型」）时：讨论接口人为每位相关的 DSH 幕僚各用 spawn_teammate 拉起一名成员，name 必须写幕僚 id（如 researcher），宿主会让该成员按这位幕僚的幕僚卡模型和职责运行；不要拉起名字不是幕僚 id 的成员来代答。执行器为 codex、claude-code 或 remote 的幕僚只能经工单在自己的执行器上运行，讨论成员不能冒充：不要拉起，在讨论里如实说明「<幕僚中文名> 配置为 <执行器/模型>，只能通过工单运行」。主人确实要他本人回答时：codex、claude-code 幕僚用 request_execution 交给他一张只读工单；远程幕僚需经工作电脑工单交办，请主人在作战台他的幕僚卡上「点名交给」他，不要用 request_execution。收齐各成员回答后，按幕僚中文名逐一汇总给主人，不替成员编造。
 回答已有工作的追问时，先用下方关联工单的实际汇报、独立核验和主人补充，区分执行结果、核验意见与验收状态。带上工单号，说明哪些截至记录时间已做、哪些仍需主人操作。执行位置以汇报记录为准，不从路径猜测；没有证据时，不推断主人已完成某步。即使讨论笔记为空，关联工单也可能已有结果。需要更多细节时，用 chief_room_note 的 work 动作，按 ticket 及 source 读取具体记录。主人问到其他工作（例如"为什么某位幕僚老失败""自己看历史"）时，直接用只读工具自己查：chief_brief 看全局简报和近期工单，chief_ticket（action=view）看任意工单的详情和各轮执行记录（rounds），chief_lookup 查人物和横向线。工具限于本讨论资料、上述只读查询、原生团队协作、公开检索和获准连接器。正式执行需主人授权工单。
@@ -227,7 +245,26 @@ ${membership?.role === 'lead' ? `接口人私聊转交的需求有结果时，�
 关联工单：${JSON.stringify(work)}
 用 chief_room_note 的 read 和 source 动作定位原生讨论原话。引用回复时，在 send_message 的 message 正文开头写〔回复原话 "原话标识"〕，下一行写正文；结论保存为有来源的待核实笔记。`
     } })
-    this.promptSections.set(agent, release)
+    this.promptSections.set(agent, () => { release(); dynamic?.() })
+  }
+  private experiencePrompt(agent: Agent, room: RoomRecord, lead: Agent | undefined, name: string | undefined) {
+    this.experience?.clear(agent.id)
+    if (!this.experience || !lead) return ''
+    const live = this.experience.ownedInput(lead.id)
+    const input = live ?? roomOwnerInputs(lead.id, lead.session?.snapshotEvents() ?? []).at(-1)
+    if (!input) return ''
+    const scope = Object.hasOwn(room.experienceScopes ?? {}, input.requestId) ? room.experienceScopes?.[input.requestId] : undefined
+    let verified: RoomExperienceScope | undefined
+    try {
+      if (scope && this.workCurrent?.(scope.workspaceId, scope.orderId)
+        && (live || !room.liaisonResults?.some(result => result.requestId === input.requestId && result.status === 'ready'))) verified = scope
+    } catch { /* The work can have been removed. */ }
+    const matching = this.ctx.get('agentTeams')?.listMembers(lead).filter(member => member.name === name && member.status !== 'failed')
+    const delegated = matching?.length === 1 && matching[0]?.id === agent.id ?
+      verified?.grants?.filter(grant => grant.recipient === name).map(({id, version, purpose}) => ({id, version, purpose})) : undefined
+    return this.experience.prompt(agent.id, {workspaceId: verified?.workspaceId, task: input.text, delegated},
+      {sessionId: room.id, nativeSessionId: agent.id, executorId: name ?? agent.id, turnId: input.requestId, orderId: verified?.orderId},
+      agent.session?.snapshotEvents())
   }
   /**
    * 讨论成员的名字是幕僚 id（或中文称呼）时，按这位幕僚运行：DSH 执行者换到幕僚卡（或工单同样沿用的）模型与思考深度，
@@ -278,14 +315,16 @@ ${honest}`
     const room = this.rows.find(r => r.id === id)
     if (!room) throw new Error('没有这个讨论')
     const tickets = this.tickets(room)
-    const { liaisonRequests, liaisonResults, ...visible } = room
+    const { liaisonRequests, liaisonResults, experienceScopes, ...visible } = room
     return { ...structuredClone(visible), ...tickets.length ? { tickets } : {}, ...(room.ownerActions ? { ownerActions: room.ownerActions.map(action => this.actionView(id, action)) } : {}) }
   }
-  async discuss(requestId: string, title: string, text: string, roomId?: string, ticket?: string, returnToLiaison = false) {
+  async discuss(requestId: string, title: string, text: string, roomId?: string, ticket?: string, returnToLiaison = false,
+    experienceScope?: RoomExperienceScope) {
     if (!text.trim()) throw new Error('需要主人原话')
     const matches = roomId ? [this.meta(roomId)] : this.rows.filter(r => r.title === title)
     if (matches.length > 1) return { ambiguous: true as const, choices: matches.map(r => ({ id: r.id, title: r.title, tickets: r.tickets ?? [] })) }
     const room = matches[0] ?? await this.create(requestId, title)
+    this.bindExperienceScope(room.id, requestId, experienceScope)
     if (ticket) this.link(room.id, ticket)
     if (returnToLiaison) {
       if (!liaisonRoomRequest.test(requestId)) throw Error('接口人讨论投递标识无效')
@@ -299,6 +338,22 @@ ${honest}`
     }
     await this.say(room.id, requestId, text)
     return { id: room.id, title: room.title, session: room.session, reused: matches.length === 1, ...(returnToLiaison && { requestId }) }
+  }
+  bindExperienceScope(id: string, requestId: string, scope?: RoomExperienceScope) {
+    if (!scope) return
+    const room = this.rows.find(row => row.id === id)
+    if (!room || !this.workCurrent?.(scope.workspaceId, scope.orderId)) throw Error('讨论需要有效的来源工作区和工单。')
+    const scopes = room.experienceScopes ?? {}
+    if (Object.values(scopes).some(previous => previous.workspaceId !== scope.workspaceId)) {
+      throw Error('这个讨论已绑定其他工作区，请为本次委托新建讨论。')
+    }
+    if (Object.hasOwn(scopes, requestId)) {
+      if (JSON.stringify(scopes[requestId]) !== JSON.stringify(scope)) throw Error('该讨论委托的经验授权已变更，请重新发出。')
+      return
+    }
+    const experienceScopes = {...scopes, [requestId]: scope}
+    this.saveRoom({...room, experienceScopes})
+    room.experienceScopes = experienceScopes
   }
   private liaisonInputs(room: RoomRecord, lead: Agent) {
     if (lead.id !== room.session) return []

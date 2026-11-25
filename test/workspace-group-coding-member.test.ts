@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { V2CodingPermission } from '../src/core/workspace-v2.ts'
 import type { ChatInputAttachment } from '../src/core/chat-attachments.ts'
+import type { ExperienceEntry, ExperienceRef } from '../src/core/workspace-experience.ts'
 import type { ChatAttachments } from '../src/dsh/chat-attachments.ts'
 import { commandApprovals, type PendingCommand } from '../src/dsh/approvals.ts'
 import { CodingGate, GATE_TOKEN_ENV } from '../src/dsh/coding-gate.ts'
@@ -171,6 +172,49 @@ describe('Codex 成员', () => {
     expect(t.h.calls[3]!.resume).toBe('thread-eng')
   })
 
+  it.each(['codex', 'claude-code'] as const)('%s 续接只补发新增经验，落选可再次选用，撤回时清除旧回放', async tool => {
+    const t = setup((_spec, _prompt, {say}) => {
+      if (tool === 'claude-code') say({type:'result',subtype:'success',num_turns:1,session_id:'native-1',result:'完成'})
+      else say({type:'turn.completed'})
+      return 0
+    }, {tool})
+    const v1 = {id:'walking',version:1,text:'认真比较所有调用点。'}
+    const v2 = {id:'walking',version:2,text:'先核对所有分支。'}
+    const second = {id:'verify',version:1,text:'保留快照后跑构建。'}
+    let active: ExperienceRef[] = []
+    let entries: ExperienceEntry[] = []
+    const delivered = vi.fn()
+    t.group.experience = {
+      selectExperience: query => ({query,scope:'brain',authority:'v1',entries,authorized:active}),
+      assertExperienceCurrent: () => {},
+      recordExperienceDelivery: delivered,
+    }
+    const push = async (id: string, selected: ExperienceEntry[], allowed: ExperienceRef[]) => {
+      entries = selected
+      active = allowed
+      const finished = sinkLog()
+      await t.runner.run({...t.call(id), experience:t.group.experience!.selectExperience({task:id,workspaceId:'w1',staffId:'eng'}),
+        recap: clean => clean ? '主人原话' : '旧助手回放不应再注入'}, finished.sink)
+      await finished.done
+    }
+    await push('c1', [v1], [v1])
+    await push('c2', [second], [v1,second])
+    await push('c3', [v1], [v1,second])
+    await push('c4', [v2], [v2,second])
+
+    expect(t.h.calls.map(call => !!call.resume)).toEqual([false,true,true,false])
+    expect(t.h.calls[0]!.prompt).toContain(v1.text)
+    expect(t.h.calls[1]!.prompt).toContain(second.text)
+    expect(t.h.calls[1]!.prompt).not.toContain(v1.text)
+    expect(t.h.calls[2]!.prompt).toContain('"id":"walking","version":1')
+    expect(t.h.calls[2]!.prompt).not.toContain(v1.text)
+    expect(t.h.calls[3]!.prompt).toContain(v2.text)
+    expect(t.h.calls[3]!.prompt).toContain('主人原话')
+    expect(t.h.calls[3]!.prompt).not.toContain('旧助手回放')
+    expect(delivered.mock.calls.map(([selection, target]) => [selection.entries[0].version, target.turnId, target.sessionId]))
+      .toEqual([[1,'c1.1','g1'],[1,'c2.1','g1'],[1,'c3.1','g1'],[2,'c4.1','g1']])
+  })
+
   it('续推在同一 thread 再跑一轮', async () => {
     const t = setup(async (_spec, prompt, { say }) => {
       say({ type: 'item.completed', item: { id: 'm', type: 'agent_message', text: prompt.includes('开工') ? '已完成。' : '收到，我去查。' } })
@@ -252,6 +296,37 @@ describe('Codex 成员', () => {
 })
 
 describe('Claude Code 成员', () => {
+  it('仅报道初始化的原生会话仍会在下一轮补发未确认的经验', async () => {
+    const t = setup(() => 0,{tool:'claude-code'})
+    const h = cliHost((_spec,_prompt,{say},call) => {
+      say({type:'system',subtype:'init',session_id:'native-1'})
+      if (!call.resume) {
+        say({type:'result',subtype:'error_during_execution',is_error:true,num_turns:0,session_id:'native-1'})
+        return 1
+      }
+      say({type:'result',subtype:'success',num_turns:1,session_id:'native-1',result:'完成'})
+      return 0
+    },{replay:false})
+    const runner = new CodingMemberRunner({tool:'claude-code',subprocess:()=>h.subprocess,executable:()=>'/fake/claude'})
+    cleanups.push(()=>runner.dispose())
+    const current = {id:'retry-note',version:1,text:'检查边界情况'}
+    const recordExperienceDelivery = vi.fn()
+    t.group.experience = {
+      selectExperience:query=>({query,scope:'brain',authority:'v1',entries:[current],authorized:[current]}),
+      assertExperienceCurrent:()=>{},
+      recordExperienceDelivery,
+    }
+    const experience = t.group.experience.selectExperience({task:'测试',workspaceId:'w1',staffId:'eng'})
+    await expect(runner.run({...t.call('c1'),experience},sinkLog().sink)).rejects.toThrow()
+    expect(recordExperienceDelivery).not.toHaveBeenCalled()
+    const done = sinkLog()
+    await runner.run({...t.call('c2'),experience},done.sink)
+    await done.done
+    expect(h.calls.map(call=>call.prompt.includes(current.text))).toEqual([true,true])
+    expect(h.calls[1]!.resume).toBe('native-1')
+    expect(recordExperienceDelivery).toHaveBeenCalledTimes(1)
+  })
+
   it('同一会话续接（--resume），钩子参数装在命令行上', async () => {
     let gate!: CodingGate
     const t = setup(async (spec, _prompt, { say }) => {

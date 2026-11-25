@@ -131,6 +131,21 @@ describe('已归档工作区页', () => {
       expect(buttons(html)).not.toContain(label)
   })
 
+  it('keeps archived shared experience and evidence readable without management controls', () => {
+    const staff: StaffView = {scope:'brain', workspaceId:'w', members:[], available:[], received:[], shares:[], memories:[],
+      sharedExperiences:[{id:'common',audience:'shared',workspaceId:'w',text:'用原话交接',status:'proposed',version:2,at,previousVersions:[1],
+        evidence:[{id:'m',kind:'group',workspaceId:'w',sessionId:'s',messageId:'m',quote:'请保留原话'}]}]}
+    mockReads({'/v2/workspaces/w/staff':staff})
+    const panel = (archived: boolean) => inside(archived, <StaffBoard workspace={view(archived ? shelved : space)} spaces={[archived ? shelved : space]}
+      experience select={vi.fn()} openOrder={vi.fn()} openMembership={vi.fn()} openEvidence={vi.fn()}/>)
+    const controls = ['现在整理','添加共同经验','采纳','更正','停用']
+    expect(buttons(panel(false))).toEqual(expect.arrayContaining(controls))
+    const html = panel(true)
+    for (const label of ['用原话交接','请保留原话','历史版本']) expect(html).toContain(label)
+    expect(buttons(html)).toContain('打开来源')
+    for (const label of controls) expect(buttons(html)).not.toContain(label)
+  })
+
   it('does not offer joining an archived workspace from a global role card', () => {
     const member = {id:'analyst', name:'研究员', brief:'研究使用体验', memberships:[{workspaceId:'o', duty:''}]}
     const staff: StaffView = {scope:'brain', members:[member], available:[], memories:[], received:[], shares:[]}

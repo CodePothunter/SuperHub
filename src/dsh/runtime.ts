@@ -11,7 +11,8 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { slotKey, zonedInstant } from '../core/clock.ts'
 import type { Custom } from '../core/custom.ts'
-import { buildExport, type ExportTarget } from '../core/export.ts'
+import { buildExport, confirmedWorkBehavior, type ExportTarget } from '../core/export.ts'
+import type { ExperienceEvidence, WorkspaceExperiencePort } from '../core/workspace-experience.ts'
 import { IMPORT_PROMPT } from '../core/onboarding.ts'
 import { Engine } from '../core/engine.ts'
 import { FileStore } from '../core/store.ts'
@@ -44,6 +45,8 @@ import { llmEngagementCoordinator } from './workspace-engagement.ts'
 import { llmCommandJudge } from './workspace-order-command.ts'
 import { liaisonSurfaceContext } from '../core/workspace-product.ts'
 import { WorkspaceStaffStore } from './workspace-staff-store.ts'
+import { createExperienceLearning } from './workspace-experience-learning.ts'
+import { NativeExperience } from './workspace-native-experience.ts'
 import { isRosterGroup, workspaceScope, WorkspaceV2Store } from './workspace-v2-store.ts'
 import { workspaceCalendarRoutes } from './workspace-calendar.ts'
 import { workspaceHistoryRoutes } from './workspace-history.ts'
@@ -51,8 +54,9 @@ import { createV2DialogueSource } from './workspace-v2-dialogue.ts'
 import { executable } from './workspace-v2-coding.ts'
 import { DshMemberRunner } from './workspace-group-dsh-member.ts'
 import { CodingMemberRunner } from './workspace-group-coding-member.ts'
-import { groupRoster } from './workspace-group-members.ts'
+import { groupRoster, LIAISON_MEMBER_ID } from './workspace-group-members.ts'
 import { WorkspaceGroupHost } from './workspace-group-host.ts'
+import { GROUP_LEDGER_FILE, memberCompletionEvidenceId, readGroupLedger } from './workspace-group-ledger.ts'
 import { LIAISON_AUTHOR } from '../core/workspace-v2.ts'
 import { acquireLock } from './lock.ts'
 import { makeNotifier, Outbox, type Notice } from './outbox.ts'
@@ -138,6 +142,61 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
     const workspaceStore = new WorkspaceV2Store(root, brainScope, undefined, { internal: [chiefHome], rosterGroups: true })
     const staffStore = new WorkspaceStaffStore(root,brainScope,() => brain.staff(),id=>workspaceStore.workspace(id),undefined,
       id=>workspaceArchived(workspaceStore.workspace(id)))
+    const learningProblem = (error: unknown) => ctx.logger.warn('经验处理待重试：%s', String(error))
+    const liaisonModel = () => {
+      try { return liaisonSelection(settings.get(), ctx.get('agentDefaultModel')?.currentSelection()) } catch { return undefined }
+    }
+    const learning = createExperienceLearning({ root, scope: brainScope, staff: staffStore, llm: () => ctx.get('llm'),
+      model: liaisonModel, writable: id => { workspaceStore.writable(id) },
+      workspaces: () => workspaceStore.list().filter(row => !workspaceArchived(row)).map(row => row.id),
+      verifyEvidence(evidence) {
+        const {workspaceId, sessionId, orderId} = evidence
+        if (workspaceId && workspaceArchived(workspaceStore.workspace(workspaceId))) return false
+        if (orderId && !workspaceId) return false
+        const order = workspaceId && orderId ? workspaceStore.delegation(workspaceId,orderId) : undefined
+        if (evidence.kind === 'owner' && !evidence.id.startsWith('group:')) {
+          return superhub.receipts().some(({source}) => source.requestId === evidence.id && source.text.includes(evidence.quote ?? '')
+            && (!workspaceId || workspaceStore.focus(source.context, true)?.workspace.id === workspaceId))
+            || !!(sessionId && isLiaison(sessionId) && ctx.agents.get(sessionId)) && (ctx.agents.get(sessionId) as unknown as Agent).session
+              ?.snapshotEvents().some(event => {
+                const source = nativeIntakeSource([event])
+                return source?.requestId === evidence.id && source.text.includes(evidence.quote ?? '')
+              }) === true
+        }
+        if (!workspaceId || !sessionId || order && order.sessionId !== sessionId) return false
+        const session = workspaceStore.session(workspaceId,sessionId)
+        if (evidence.kind === 'owner' && evidence.id.startsWith('group:')) {
+          const seq = Number(evidence.messageId?.slice(2))
+          const rows = groupHost.loaded(session.id)?.ledger.all() ?? readGroupLedger(join(groupHost.paths(session).dir,GROUP_LEDGER_FILE))
+          return evidence.id === 'group:' + sessionId + ':' + seq &&
+            rows.some(row=>row.seq === seq && row.speakerId === 'owner' && row.workOrderId === orderId && row.text.includes(evidence.quote ?? ''))
+        }
+        if (evidence.kind === 'group' && evidence.id.startsWith('group-member:')) {
+          if (!isRosterGroup(session) || !/^g-[1-9]\d*$/.test(evidence.messageId ?? '')) return false
+          const seq = Number(evidence.messageId!.slice(2))
+          const rows = groupHost.loaded(session.id)?.ledger.all() ?? readGroupLedger(join(groupHost.paths(session).dir,GROUP_LEDGER_FILE))
+          const line = rows.find(row => row.seq === seq && row.workOrderId === orderId)
+          if (!line || [LIAISON_MEMBER_ID, 'owner', 'host'].includes(line.speakerId) || !line.text.includes(evidence.quote ?? '')
+            || !staffStore.view(workspaceId).members.some(member => member.id === line.speakerId)) return false
+          if (memberCompletionEvidenceId(sessionId, line) === evidence.id) return true
+          const formal = orderId && [...workspaceStore.groupEvidence(orderId), ...workspaceStore.resultNotices()].some(result =>
+            result.workspaceId === workspaceId && result.sessionId === sessionId && result.orderId === orderId && result.messageId === evidence.messageId)
+          return !!formal && memberCompletionEvidenceId(sessionId, line, true) === evidence.id
+        }
+        if (evidence.kind === 'delivery' && evidence.version) {
+          return workspaceStore.resultNotices().some(row=>row.id === evidence.id && row.sessionId === sessionId && row.version === evidence.version)
+        }
+        return true
+      } })
+    releases.push(() => learning.dispose())
+    const brainDocument = (name: string) => { try { return readFileSync(join(root, name), 'utf8') } catch { return undefined } }
+    const experience: WorkspaceExperiencePort = {
+      selectExperience: query => ({...staffStore.selectExperience(query),
+        behavior: confirmedWorkBehavior({me: brainDocument('me.md'), agents: brainDocument('AGENTS.md')})}),
+      assertExperienceCurrent: selection => staffStore.assertExperienceCurrent(selection),
+      recordExperienceDelivery: (selection, target, entries) => staffStore.recordExperienceDelivery(selection, target, entries),
+    }
+    const nativeExperience = new NativeExperience(experience, learningProblem)
     releases.push(() => workspaceStore.dispose())
     const commitPaths = (message: string, paths: string[]) => brain.commit(message, { paths })
     const goals = new SuperhubGoals(root, commitPaths)
@@ -240,8 +299,8 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
     try {
       const off = ctx.on?.('llm/stream', (options, next) => {
         try { toolVisibility.observe(options) } catch { requestAudit = 'unavailable' }
-        return next()
-      })
+        return nativeExperience.request(options, next)
+      }, {prepend: true})
       if (typeof off === 'function') { releases.push(off); requestAudit = 'available' }
     } catch { /* 旧宿主没有最终请求事件时，诊断明确显示不可用 */ }
     const offToolChanges = ctx.on?.('tools/change', () => toolVisibility.refresh())
@@ -287,13 +346,24 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
           // 换段后的新会话：交接内容接在设定后面，进系统提示（不占一轮对话，重启后也还在）
           const handoff = existsSync(handoffFile(sessionId)) ? readFileSync(handoffFile(sessionId), 'utf8') : ''
           const prompt = handoff ? `${LIAISON_PROMPT}\n\n${handoff}` : LIAISON_PROMPT
-          const release = agent.ctx?.systemPrompt?.section({ name: 'dsh-chief-liaison', order: 9000, interpolate: false, text: () => {
-            const ownerTurn = nativeIntakeSource(agent.session?.snapshotEvents() ?? [])
+          const system = agent.ctx?.systemPrompt
+          const currentContext = () => {
+            const ownerTurn = nativeExperience.ownedInput(agent.id) ?? nativeIntakeSource(agent.session?.snapshotEvents() ?? [])
             const origin = ownerTurn && superhub.ownerTurnOrigin(ownerTurn)
+            const focus = workspaceStore.focus(origin?.context)
             const surface = liaisonSurfaceContext(origin?.context, workspaceStore.list(), {
-              personName:historyRoutes.personName, today:clock().today, focus:workspaceStore.focus(origin?.context) })
+              personName:historyRoutes.personName, today:clock().today, focus })
+            nativeExperience.clear(agent.id)
+            const inherited = ownerTurn ? nativeExperience.prompt(agent.id, {workspaceId: focus?.workspace.id, task: ownerTurn.text},
+              {turnId: ownerTurn.requestId, sessionId: focus?.session?.id ?? agent.id, nativeSessionId: agent.id,
+                executorId: 'liaison', orderId: focus?.order?.id}, agent.session?.snapshotEvents()) : ''
+            return [surface, inherited].filter(Boolean).join('\n\n')
+          }
+          const dynamic = system?.context?.({name:'dsh-chief-liaison-turn',order:130,required:true,interpolate:false,text:currentContext})
+          if (dynamic) releases.push(dynamic)
+          const release = system?.section({ name: 'dsh-chief-liaison', order: 9000, interpolate: false, text: () => {
             const recent = recentTicketReplies(store.tickets(), [], 5).map(({ ticketId, title, at }) => ({ ticketId, title: title.slice(0, 120), at }))
-            return [prompt, surface, recent.length ? `最近有主人补充的工单索引（仅供定位）：${JSON.stringify(recent)}。查询原话时用 chief_ticket view。` : ''].filter(Boolean).join('\n\n')
+            return [prompt, dynamic ? '' : currentContext(), recent.length ? `最近有主人补充的工单索引（仅供定位）：${JSON.stringify(recent)}。查询原话时用 chief_ticket view。` : ''].filter(Boolean).join('\n\n')
           } })
           if (release) releases.push(release)
           else flag('接口人设定没有生效：这个版本的 DSH 不支持按会话追加系统提示')
@@ -313,13 +383,21 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
       eventId => inboxDispatchState(store, eventId),
       () => recentTicketReplies(store.tickets(), rooms.list()), (workspaceId,orderId) => workspaceStore.orderLabel(workspaceId,orderId),
       (receipts, options) => rooms.discussionResults(receipts, options),
-      { service: inputAttachments, forRequest: source => superhub.ownerTurnOrigin(source)?.inputAttachments })
+      { service: inputAttachments, forRequest: source => superhub.ownerTurnOrigin(source)?.inputAttachments },
+      async (requestId, text) => {
+        const context = superhub.ownerTurnOrigin({requestId,text})?.context
+        const query = {workspaceId: workspaceStore.focus(context)?.workspace.id, task:text}
+        const needsFresh = () => !!hqAgent && nativeExperience.needsFreshHistory(hqAgent.session?.snapshotEvents() ?? [],query)
+        if (!needsFresh()) return
+        await maybeRotate(true)
+        if (needsFresh()) throw Object.assign(Error('接口人正在处理原工作区的消息。请等本轮结束后重新发送，届时会用当前范围打开新一段。'),{status:409})
+      })
 
     /**
      * 换段：一轮结束、接口人闲着、上下文超过线时，开一段新会话。
      * 旧的一段原样留着（DSH 里能打开），作战台把它的消息归档后接在前面；新的一段从交接内容开始。
      */
-    const maybeRotate = async () => {
+    const maybeRotate = async (restrictedHistory = false) => {
       const agent = hqAgent
       const idle = () => agent?.id === hqSession && agent.status !== 'running' && !rotating && !chat.sending()
         && (agent.inbox?.nextTurn.length ?? 0) + (agent.inbox?.nextStep.length ?? 0) === 0
@@ -328,17 +406,18 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
       const used = contextTokens(events)
       const legacyConnectors = hasRawConnectorHistory(agent.session?.toolHistory?.())
       // CHIEF_LIAISON_ROTATE_AT：调试用，临时把换段线调低（token 数）
-      const line = legacyConnectors ? 0 : Number(process.env.CHIEF_LIAISON_ROTATE_AT) || rotateLine(await contextWindow(ctx.get('llm'), agent.model?.current()))
-      if ((!legacyConnectors && (!used || used < line)) || !idle()) return
+      const line = legacyConnectors || restrictedHistory ? 0 : Number(process.env.CHIEF_LIAISON_ROTATE_AT) || rotateLine(await contextWindow(ctx.get('llm'), agent.model?.current()))
+      if ((!restrictedHistory && !legacyConnectors && (!used || used < line)) || !idle()) return
+      const omitHistory = restrictedHistory || nativeExperience.needsFreshHistory(events,{task:''})
       rotating = (async () => {
         const previous = hqSession, next = nextPartId(previous), base = baseId()
         // The context-window lookup can overlap a completed send. Archive the last idle snapshot.
         const { messages } = chat.project(agent.session?.snapshotEvents() ?? [])
         mkdirSync(liaisonDir, { recursive: true, mode: 0o700 })
-        writeFileSync(handoffFile(next), handoffText(previous, messages, clock().now.replace('T', ' ')))
+        writeFileSync(handoffFile(next), handoffText(previous, omitHistory ? [] : messages, clock().now.replace('T', ' ')))
         const merged = mergeHistory(archived(), messages.map(m => offsetSpeech(m, parts.offset())), 200)
         const materials = new Map(merged.flatMap(message => (message.inputAttachments ?? []).map(file => [file.id, file] as const)))
-        for (const [id, file] of materials) {
+        for (const [id, file] of omitHistory ? [] : materials) {
           try { inputAttachments.allowRead(next, [file]) }
           catch (error) { ctx.logger.warn('接口人换段未能恢复附件 %s：%s', id, chatAttachmentError(error)) }
         }
@@ -360,6 +439,7 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
     const cutter = new SteerCutter(() => hqAgent)
     let rotateCheck: ReturnType<typeof setTimeout> | undefined
     const offEvents = ctx.on?.('session/event', (session, event) => {
+      if (event.type === 'turn/end') nativeExperience.finishTurn(session.id)
       if (session.id !== hqSession) return
       cutter.observe(event)
       if (event.type === 'turn/end') {
@@ -621,9 +701,18 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
         const meta = store.event(ticket.mandate.eventId)?.meta
         return (meta?.channel === 'room-review' || meta?.channel === 'superhub') && meta.room_id === roomId && meta.room_source === source
       })?.id,
-    }, modelDefaults, staffStore)
+    }, modelDefaults, staffStore, nativeExperience, (id, orderId) => {
+      if (workspaceArchived(workspaceStore.workspace(id))) return false
+      return !orderId || !orderEnded(workspaceStore.delegation(id, orderId))
+    })
     const offRoomCreated = ctx.on?.('agent/created', ({ agent }) => rooms.attachContext(agent))
     if (offRoomCreated) releases.push(offRoomCreated)
+    const offNativeExperience = ctx.on?.('agent/pre-step', async ({agent}, next) => {
+      const selected = isLiaison(agent.id) || !!rooms.roomIdForAgent(agent)
+      const decision = await next()
+      return selected ? nativeExperience.step(agent.id, decision, !agent.ctx?.systemPrompt?.context) : decision
+    })
+    if (offNativeExperience) releases.push(offNativeExperience)
     const connectors = new Connectors(join(chiefHome, createHash('sha256').update(root).digest('hex').slice(0, 20), 'connectors'))
     releases.push(() => rooms.dispose())
     const requestRoomExecution = roomExecution({ rooms, superhub, engine, ticket: id => store.ticket(id), outbox,
@@ -736,12 +825,11 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
     releases.push(() => profileImports.dispose())
     const importer = { prompt: IMPORT_PROMPT, submit: profileImports.submit }
     /** 反哺：把主人确认过的内容整理成别的系统能用的形式（见 src/core/export.ts）。 */
-    const read = (name: string) => { try { return readFileSync(join(root, name), 'utf8') } catch { return undefined } }
     const cliEnv = process.env.DSH_HOME ? `DSH_HOME=${process.env.DSH_HOME} ` : ''
     const cli = `${cliEnv}${process.execPath} ${join(pluginRoot, 'bin', 'cli.mjs')}`
     const exporter = {
       build: (target: ExportTarget) => ({
-        ...buildExport(target, { me: read('me.md'), agents: read('AGENTS.md'), goals: brain.goals() }, clock().today),
+        ...buildExport(target, { me: brainDocument('me.md'), agents: brainDocument('AGENTS.md'), goals: brain.goals() }, clock().today),
         // 本机的 Claude Code / Codex 可以自动同步：给出这台机器上能直接用的命令
         commands: {
           session: `${cli} export --for session`,
@@ -754,11 +842,28 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
     releases.push(() => calendarRoutes.dispose())
     const historyRoutes = workspaceHistoryRoutes({brain,rooms,roster,goals,scope:brainScope})
     releases.push(() => historyRoutes.dispose())
-    const dialogue = createV2DialogueSource({ ctx, root, scope: brainScope, codex: opts.codex, gate, internalDirectories: [chiefHome], staff:{
+    const dialogue = createV2DialogueSource({ ctx, root, scope: brainScope, codex: opts.codex, gate, internalDirectories: [chiefHome], experience,
+      onCodingResult(result) {
+        const {workspaceId, sessionId, orderId, turnId} = result
+        const where = {workspaceId, sessionId, orderId}
+        const evidence: ExperienceEvidence[] = result.messages.filter(message => message.text.trim()).slice(-6).map(message => ({
+          kind: 'delivery', id: message.id, messageId: message.id, ...where}))
+        for (const {itemId, command, exitCode, outputTail} of result.commands.slice(-8)) {
+          const test = /^\s*(?:(?:pnpm|npm|yarn|bun|cargo|go)\s+test\b|(?:pnpm\s+exec\s+)?(?:vitest|pytest)\b|node\s+--test\b)/.test(command)
+          evidence.push({kind: test ? 'test' : 'tool', id: itemId, ...where,
+            quote: `${command.slice(0, 300)}（退出码 ${exitCode}）${outputTail ? '\n' + outputTail.slice(-500) : ''}`})
+        }
+        const summary = result.messages.map(message => message.text).join('\n').trim().slice(-8000) ||
+          evidence.flatMap(item => item.quote ? [item.quote] : []).join('\n').slice(-8000)
+        if (summary && evidence.length) void learning.settle({id: 'coding:' + sessionId + ':' + turnId, ...where, turnId,
+          kind: result.recovered ? 'recovery' : 'delivery', summary,
+          evidence}).catch(learningProblem)
+      }, staff:{
       context:(workspace,id)=>staffStore.context(workspace,id), current:context=>staffStore.assertCurrent(context),
       used:(context,order)=>staffStore.markUsed(context,order),
-      propose(context,orderId,requestId,text) {
+      propose(context,orderId,requestId,text,selection) {
         staffStore.assertCurrent(context)
+        if (selection) staffStore.assertExperienceCurrent(selection)
         staffStore.apply(context.workspaceId,{action:'learn',staffId:context.staffId,orderId,text,proposed:true,witnessedToken:context.token,
           requestId:createHash('sha256').update(JSON.stringify(['staff-suggestion',orderId,requestId])).digest('hex')})
       },
@@ -773,9 +878,6 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
         try { return dialogue.briefEvidence?.(session,turnId,orderId) ?? {} }
         catch { return {} } // A missing native archive can still be restored from its accepted owner RPC.
       })
-    const liaisonModel = () => {
-      try { return liaisonSelection(settings.get(), ctx.get('agentDefaultModel')?.currentSelection()) } catch { return undefined }
-    }
     // Workspace group chats: one DSH member runner (the liaison and DSH staff, gated like coding turns) and one runner per
     // coding tool, with the executable, model and subprocess setup of the coding sessions.
     const dshMembers = new DshMemberRunner(ctx, { scope: brainScope, gate, logger: ctx.logger, inputAttachments })
@@ -784,12 +886,12 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
       executable: () => executable(tool === 'codex' ? opts.codex?.executable || 'codex' : 'claude'), ...tool === 'codex' && opts.codex?.model && { model: opts.codex.model } })
     const codexMembers = codingMembers('codex'), claudeMembers = codingMembers('claude-code')
     releases.push(() => codexMembers.dispose(), () => claudeMembers.dispose())
-    const groupHost = new WorkspaceGroupHost({ root: realpathSync(root), scope: brainScope, store: workspaceStore, approvals: gate, logger: ctx.logger,
+    const groupHost = new WorkspaceGroupHost({ root: realpathSync(root), scope: brainScope, store: workspaceStore, approvals: gate, logger: ctx.logger, experience,
       runners: { dsh: dshMembers, codex: codexMembers, 'claude-code': claudeMembers },
       roster: workspaceId => groupRoster({ workspaceId, staff: staffStore.view(workspaceId).members, native: brain.staff(), defaults: modelDefaults(),
         context: id => staffStore.context(workspaceId, id), liaisonName: LIAISON_AUTHOR }) })
     releases.push(() => groupHost.dispose())
-    const v2Routes = workspaceV2Routes({ staff:staffStore, store: workspaceStore, source: dialogue, timeZone, approvals: gate, groups: groupHost, inputAttachments,
+    const v2Routes = workspaceV2Routes({ staff:staffStore, store: workspaceStore, source: dialogue, timeZone, approvals: gate, groups: groupHost, inputAttachments, learning, learningProblem,
       coordinate: llmEngagementCoordinator(() => ctx.get('llm'), liaisonModel),
       // The liaison reviews new results with its own model, and reminds the owner when an order still falls short.
       review: llmAcceptanceReviewer(() => ctx.get('llm'), liaisonModel),
@@ -798,7 +900,7 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
       remind: (key, text, order, options) => { outbox.enqueue(key, text, new Date(), undefined, { ...order && { order }, ...options?.localOnly && { localOnly: true } }) } })
     releases.push(() => v2Routes.dispose())
     v2Routes.recover()
-    releases.push(...registerTools(ctx, { ...deps, calendarWeek: day => calendarRoutes.week(day), personDetail:historyRoutes.personDetail, isLiaison, lookup, readOnlyExecution: (id: string) => executors.readOnly(id), executionBinding: (id: string) => executors.binding(id), followUps, ui, control: opts.control, importer, exporter, superhub, modelDefaults, workspaceStore, staffStore, assign: v2Routes.assign, follow: v2Routes.follow, orderFollowup: v2Routes.followup, groups: groupHost, inputAttachments }))
+    releases.push(...registerTools(ctx, { ...deps, calendarWeek: day => calendarRoutes.week(day), personDetail:historyRoutes.personDetail, isLiaison, lookup, readOnlyExecution: (id: string) => executors.readOnly(id), executionBinding: (id: string) => executors.binding(id), followUps, ui, control: opts.control, importer, exporter, superhub, modelDefaults, workspaceStore, staffStore, learning, assign: v2Routes.assign, follow: v2Routes.follow, orderFollowup: v2Routes.followup, groups: groupHost, inputAttachments }))
     for (const agent of ctx.agents.list?.() ?? []) rooms.attachContext(agent)
     const legacyRoutes = runtimeRoutes({ ...deps, approvals, chat, liaisonSeen, followUps, custom, exporter, superhub, inputAttachments, llm: () => ctx.get('llm') })
     const workspaceRoutes = superhubWorkspaceRoutes({ scope: brainScope, engine, brain, trace, superhub, goals, saa, rooms, commands: () => approvals.list() })
@@ -896,7 +998,9 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
     }
 
     const tick = () => {
-      void engine.tickClock().catch(e => ctx.logger.warn('时钟检查失败：%s', String(e)))
+      void engine.tickClock((rule, slot) => {
+        if (rule.id === 'weekly-dream') void learning.scheduled(slot).catch(learningProblem)
+      }).catch(e => ctx.logger.warn('时钟检查失败：%s', String(e)))
       void v2Routes.followup.tick().catch(e => ctx.logger.warn('工单周报检查失败：%s', String(e)))
       try { v2Routes.notices.collect() } catch (error) { ctx.logger.warn('工单交付提醒待重试：%s', String(error)) }
       void engine.sweepRemote().catch(e => ctx.logger.warn('工作电脑超时检查失败：%s', String(e)))

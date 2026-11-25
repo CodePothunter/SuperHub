@@ -34,7 +34,10 @@ export interface Agent {
     append?(type: string, data: unknown): unknown
   }
   readonly ctx?: {
-    systemPrompt?: { section(section: { name: string; order: number; text: string | (() => string); interpolate?: boolean }): () => void }
+    systemPrompt?: {
+      section(section: { name: string; order: number; text: string | (() => string); interpolate?: boolean }): () => void
+      context?(context: {name: string; order: number; text: () => string; interpolate?: boolean; required?: boolean}): () => void
+    }
     tools?: {
       restrict(filter: { allow?: readonly string[]; deny?: readonly string[] }): () => void
       guard?: Tools['guard']
@@ -168,6 +171,9 @@ export interface Tools {
 /** 最后一个公开模型请求瀑布入口，只读取工具名，不接触对话内容。适配器的历史投影在它之后。 */
 export interface LlmToolRequest {
   readonly sessionId?: string
+  readonly system?: string
+  readonly messages?: readonly {readonly role: string; readonly source?: {readonly kind: string};
+    readonly content: readonly {readonly type: string; readonly text?: string}[]}[]
   readonly tools?: readonly { readonly name: string }[]
   readonly toolHistory?: {
     readonly tools: readonly { readonly name: string }[]
@@ -241,7 +247,7 @@ export interface HostContext {
   on?(name: 'tools/change', listener: () => void): () => void
   on?(name: 'agent/created', listener: (event: { readonly agent: Agent }) => void): () => void
   on?(name: 'agent/pre-step', listener: (event: {readonly agent: Agent}, next: () => Promise<StepDecision>) => Promise<StepDecision>, options?: {prepend?: boolean}): () => void
-  on?(name: 'llm/stream', listener: (options: LlmToolRequest, next: () => AsyncIterable<unknown>) => AsyncIterable<unknown>): () => void
+  on?(name: 'llm/stream', listener: (options: LlmToolRequest, next: () => AsyncIterable<unknown>) => AsyncIterable<unknown>, options?: {prepend?: boolean}): () => void
   on?(name: 'tools/execute', listener: (call: NativeToolCall, next: () => Promise<unknown>) => Promise<unknown>): () => void
   /** 工具执行前的策略瀑布（dsh-tools pipeline）：可等待；`deny` 的理由给模型看，之后不再执行 guard 与工具体。 */
   on?(name: 'tools/pre-execute', listener: (call: NativeToolCall, next: () => Promise<PreToolDecision>) => Promise<PreToolDecision>): () => void

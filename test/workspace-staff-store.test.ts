@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { WorkspaceStaffStore } from '../src/dsh/workspace-staff-store.ts'
 import { workspaceFingerprint } from '../src/dsh/superhub-goals.ts'
+import { renderExperience } from '../src/core/workspace-experience.ts'
 
 const roots: string[] = []
 afterEach(()=>{ for (const directory of roots.splice(0)) rmSync(directory,{recursive:true,force:true}) })
@@ -158,5 +159,113 @@ describe('已归档工作区的幕僚',()=>{
     expect(()=>f.store.apply('alpha',{action:'create',name:'竞品观察员',brief:'另一份职责描述写得足够长',uniqueName:true,requestId:'liaison-2'})).toThrow('本工作区已有专属幕僚「竞品观察员」')
     expect(()=>f.store.apply('alpha',{action:'create',name:'画师',brief:'画图',portraitShape:'plane',requestId:'liaison-3'})).toThrow('头像造型')
     expect(f.store.view().members.some(m=>m.name==='竞品观察员' && !m.homeWorkspaceId)).toBe(false)
+  })
+})
+
+it('matches a legacy Chinese topic split into single characters only inside its authorized workspace', () => {
+  const f = setup()
+  const stored = f.apply('alpha','learn',{text:'访谈结束复述约定。甲的虚构访谈对象。'}).memories[0]!
+  expect(f.store.selectExperience({workspaceId:'alpha',staffId:'researcher',task:'核对访谈方法'}).entries.map(row=>row.id))
+    .toContain(stored.id)
+  expect(f.store.selectExperience({workspaceId:'alpha',staffId:'researcher',task:'整理公司财报'}).entries).toEqual([])
+  expect(f.store.selectExperience({workspaceId:'beta',task:'核对访谈方法'}).entries).toEqual([])
+})
+
+describe('共享智能体经验',()=>{
+  it('升级旧经验为具名专属，并按来源区、接收身份和任务适用性选取',()=>{
+    const f = setup()
+    const path = join(f.root,'ops','superhub-staff',workspaceFingerprint('my-brain')+'.json')
+    const legacy = JSON.parse(readFileSync(path,'utf8')) as Record<string,unknown>
+    const old = {id:'old-experience',staffId:'researcher',workspaceId:'alpha',text:'缺陷修复检查同类调用路径',
+      status:'active',version:3,at:'2026-11-19T13:00:00Z'}
+    writeFileSync(path,JSON.stringify({...legacy,schema:1,memories:[old]}))
+    const request = {task:'处理登录缺陷',taskTypes:['缺陷修复']}
+    expect(f.store.selectExperience({...request,workspaceId:'alpha'}).entries).toEqual([])
+    expect(f.store.selectExperience({...request,workspaceId:'alpha',staffId:'researcher'}).entries)
+      .toEqual([expect.objectContaining({id:old.id,version:3})])
+    expect(f.store.selectExperience({...request,workspaceId:'beta',staffId:'researcher'}).entries).toEqual([])
+    expect(f.open().experienceMemories('alpha')[0]).toMatchObject({audience:'staff',...old})
+    const common = (workspaceId: string | undefined, text: string, taskTypes: string[]) => f.store.apply(workspaceId,
+      {action:'learn',audience:'shared',requestId:randomUUID(),text,taskTypes})
+    common(undefined,'提交版本前保存测试回执',['缺陷修复'])
+    common('alpha','甲区登录缺陷需要覆盖旧账号',['缺陷修复'])
+    common('beta','乙区内部登录方案',['缺陷修复'])
+    common('alpha','研读采购报价',['采购'])
+    const alpha = f.store.selectExperience({...request,workspaceId:'alpha'})
+    expect(alpha.entries.map(x=>x.text)).toEqual(['甲区登录缺陷需要覆盖旧账号','提交版本前保存测试回执'])
+    expect(alpha.authorized).toHaveLength(3)
+    const beta = f.open().selectExperience({...request,workspaceId:'beta'})
+    expect(beta.entries.map(x=>x.text)).toEqual(['乙区内部登录方案','提交版本前保存测试回执'])
+    const delegated = f.store.selectExperience({...request,workspaceId:'alpha',delegated:[{id:old.id,version:3}]})
+    expect(delegated.entries.some(ref=>ref.id===old.id)).toBe(true)
+    expect(f.store.selectExperience({...request,workspaceId:'beta',delegated:[{id:old.id,version:3}]}).authorized)
+      .not.toContainEqual({id:old.id,version:3})
+    expect(f.store.selectExperience({workspaceId:'alpha',task:'编排行政日历'}).entries).toEqual([])
+    expect(renderExperience({...alpha,behavior:'共同偏好'})).toMatch(/^共同偏好\n\n/)
+  })
+
+  it('只分享批准文字，限制用途并将派生权限绑到共享版本',()=>{
+    const f = setup()
+    const input = {action:'learn',audience:'shared',requestId:'source',text:'访谈含内部名字张三与联系方式',
+      evidence:[{id:'message-a',kind:'owner',workspaceId:'alpha',quote:'甲区私密原话'}]}
+    const source = f.store.apply('alpha',input).sharedExperiences![0]!
+    const shared = f.store.apply('alpha',{action:'share',audience:'shared',requestId:'share',memoryId:source.id,
+      sourceVersion:source.version,targetAudience:'shared',targetWorkspaceId:'beta',text:'续约前安排访谈',
+      purpose:'客户续约',expiresAt:'2026-11-22T00:00:00Z'}).shares[0]!
+    expect(f.store.selectExperience({workspaceId:'beta',task:'客户投诉'}).authorized).toEqual([])
+    expect(f.store.selectExperience({workspaceId:'beta',task:'客户投诉',domains:['客户续约'],taskTypes:['客户续约']}).authorized).toEqual([])
+    expect(f.store.selectExperience({workspaceId:'beta',task:'客户续约作为接口人补充',purposeTask:'客户投诉'}).authorized).toEqual([])
+    const selected = f.store.selectExperience({workspaceId:'beta',task:'客户续约'})
+    expect(selected.entries).toEqual([{id:shared.id,version:1,shareId:shared.id,text:'续约前安排访谈',
+      purpose:'客户续约',workspaceId:'beta',staffId:undefined}])
+    const rendered = renderExperience(selected)
+    expect(rendered).toContain('续约前安排访谈')
+    expect(rendered).not.toMatch(/张三|message-a|甲区私密原话/)
+    expect(()=>f.store.experienceVersion('beta',source.id,1)).toThrow('此处没有')
+    f.store.apply('beta',{action:'learn',audience:'shared',requestId:'derived',text:'续约经验的衍生整理',
+      dependencies:[{id:shared.id,version:1}]})
+    const derived = f.store.experienceMemories('beta')[0]!
+    expect(()=>f.store.apply('beta',{action:'share',audience:'shared',requestId:'share-derived',
+      memoryId:derived.id,sourceVersion:derived.version,targetAudience:'shared',targetWorkspaceId:'alpha',text:derived.text}))
+      .toThrow('原有共享未覆盖这次接收范围')
+    expect(f.store.selectExperience({workspaceId:'beta',task:'其他类型续约'}).entries).toEqual([])
+    f.at('2026-11-22T00:00:00Z')
+    expect(()=>f.store.assertExperienceCurrent(selected)).toThrow('授权已经变化')
+    expect(f.open().experienceMemories('beta')).toMatchObject([{status:'retired',reason:'来源经验或共享授权已失效'}])
+  })
+
+  it('幂等登记真实送达，批次遇旧版本保持原状，停用后可审阅及恢复旧版本',()=>{
+    const f = setup()
+    const source = f.store.apply('alpha',{action:'learn',audience:'shared',requestId:'learn',text:'登录缺陷按历史账号复测'})
+      .sharedExperiences![0]!
+    const selection = f.store.selectExperience({workspaceId:'alpha',task:'复测登录缺陷'})
+    const target = {sessionId:'group-one',nativeSessionId:'native-one',executorId:'temp-one',turnId:'reply-1',orderId:'order-1'}
+    const readDelivery = () => f.open().experienceDeliveries({workspaceId:'alpha',sessionId:'group-one'})
+    expect(readDelivery()).toEqual([])
+    f.store.recordExperienceDelivery(selection,target)
+    f.open().recordExperienceDelivery(selection,target)
+    expect(readDelivery()).toMatchObject([{...target,entries:[{id:source.id,version:1}]}])
+    const evidence = {kind:'owner',id:'message-id',workspaceId:'alpha'}
+    const feedback = {id:'feedback-id',memory:{id:source.id,version:1},kind:'owner-correction',evidence,sessionId:'group-one'}
+    const revise = {action:'revise',audience:'shared',memoryId:source.id,version:1,text:'登录缺陷按账号类型复测'}
+    const batch = {id:'change-set',basedOn:[source],changes:[revise,{action:'feedback',feedback}]}
+    const stale = {id:'stale-set',basedOn:[source],changes:[{action:'learn',audience:'shared',text:'可能使已停用经验复活'}]}
+    expect(()=>f.store.applyExperienceBatch('alpha',{id:'failed-set',changes:[revise,{...revise,version:5}]}))
+      .toThrow('经验已变化')
+    expect(f.open().experienceMemories('alpha')).toMatchObject([{version:1,text:source.text}])
+    expect(f.store.applyExperienceBatch('alpha',batch)).toBe('applied')
+    expect(f.open().applyExperienceBatch('alpha',batch)).toBe('duplicate')
+    expect(()=>f.store.applyExperienceBatch('alpha',stale)).toThrow('经验已经变化')
+    expect(f.store.experienceVersion('alpha',source.id,1).text).toBe(source.text)
+    expect(f.store.experienceMemories('alpha')).toMatchObject([{version:2,feedback:[{kind:'owner-correction',memory:{version:1}}]}])
+    expect(()=>f.store.assertExperienceCurrent(selection)).toThrow('经验或使用授权已经变化')
+    const apply = (action: string, version: number, extra: Record<string,unknown> = {}) => f.store.apply('alpha',
+      {action,audience:'shared',version,memoryId:source.id,requestId:randomUUID(),...extra})
+    apply('retire',2,{reason:'这项流程不再适用'})
+    expect(f.store.selectExperience({workspaceId:'alpha',task:'复测登录缺陷'}).entries).toEqual([])
+    expect(f.store.view('alpha').sharedExperiences).toMatchObject([{version:3,status:'retired',reason:'这项流程不再适用'}])
+    apply('restore',3,{restoreVersion:1})
+    expect(f.open().selectExperience({workspaceId:'alpha',task:'复测登录缺陷'}).entries)
+      .toMatchObject([{id:source.id,version:4,text:source.text}])
   })
 })

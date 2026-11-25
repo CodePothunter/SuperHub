@@ -15,6 +15,7 @@ import { nameProblem } from '../core/mentions.ts'
 import type { Staff } from '../core/model.ts'
 import { LIAISON_AUTHOR } from '../core/workspace-v2.ts'
 import type { StaffContext, StaffMember } from '../core/workspace-staff.ts'
+import { renderExperience, type ExperienceEntry, type ExperienceRef, type ExperienceSelection, type WorkspaceExperiencePort } from '../core/workspace-experience.ts'
 import type { ModelSelection } from './ports.ts'
 import { teammateSelection, type ModelDefaults } from './staff-models.ts'
 import { dialogueKey } from './workspace-speaker-id.ts'
@@ -25,6 +26,31 @@ export const GROUP_MEMBERS_FILE = 'members.json'
 export const LIAISON_MEMBER_ID = 'liaison'
 
 export type GroupMemberKind = 'dsh' | 'codex' | 'claude-code'
+export type ExperienceAccess = WorkspaceExperiencePort
+
+/** Resume only while every version the executor might have seen is still authorized for the task. */
+export function experienceRevoked(selection: ExperienceSelection, history: readonly ExperienceRef[] | undefined): boolean {
+  return (history ?? []).some(old => !selection.authorized.some(current => current.id === old.id && current.version === old.version))
+}
+
+export function experienceHistory(history: readonly ExperienceRef[] = [], entries: readonly ExperienceRef[] = []): ExperienceRef[] {
+  const versions = new Map(history.map(ref => [ref.id, ref.version]))
+  for (const {id, version} of entries) versions.set(id, version)
+  return [...versions].map(([id, version]) => ({id, version}))
+}
+
+export function experienceDelta(selection: ExperienceSelection, history: readonly ExperienceRef[] = []): ExperienceEntry[] {
+  return selection.entries.filter(entry => !history.some(ref => ref.id === entry.id && ref.version === entry.version))
+}
+
+export function experiencePrompt(selection: ExperienceSelection, entries = selection.entries): string {
+  const refs = experienceHistory([], selection.entries)
+  return [
+    '〔本轮参考经验〕仅按本轮列出的编号和版本参考历史经验。主人本轮的话及工单约定优先。',
+    JSON.stringify(refs),
+    renderExperience(selection, entries),
+  ].filter(Boolean).join('\n')
+}
 
 /** 名册里的一位成员：调度用的 id / 名字 / 管理员，加上运行与身份所需的资料。 */
 export interface GroupRosterMember extends GroupMember {
@@ -54,6 +80,7 @@ export interface GroupContext {
   sessions: GroupMemberSessions
   /** 命令把关与命令结束的留痕（`commands.jsonl`）。 */
   commandsPath: string
+  experience?: ExperienceAccess
 }
 
 /** 一次被叫。`prompt` 是引擎按 design §3 拼好的话；`identity` 是成员身份与群规则（DSH 进系统提示，编程工具首轮放在开头）。 */
@@ -73,10 +100,13 @@ export interface MemberCall extends MemberInputs {
   prompt: string
   recapInputs?: MemberInputs
   /** 成员的原生会话不得不重开时（续接失败），换用「最近 12 行」版本的话。 */
-  recap?: () => string
+  recap?: (authorizedOnly?: boolean) => string
+  /** For a new native session after revocation, replay only direct owner inputs. */
+  ownerRecapInputs?: MemberInputs
+  experience?: ExperienceSelection
   workOrderId?: string
 }
-export type MemberReattach = Omit<MemberCall, 'prompt' | 'recap' | 'recapInputs' | keyof MemberInputs>
+export type MemberReattach = Omit<MemberCall, 'prompt' | 'recap' | 'recapInputs' | 'ownerRecapInputs' | keyof MemberInputs>
 export interface MemberWords extends MemberInputs { id: string; text: string }
 /** Staging or native attachment admission failed for this receiver. Queuing the same delivery cannot fix it. */
 export class MemberInputError extends Error {}
@@ -187,7 +217,21 @@ export function groupRoster(input: {
  * 成员在本群的原生会话：DSH 会话 id，或编程工具的 thread / 会话 id；`cwd` 不同就是另一场会话。`memories` 是开这场会话以来
  * 给过它的本区经验（每条的指纹）：有经验被撤回（重置、收回共享）时，旧会话里的系统提示 / 开场白还留着它，所以换一场新会话。
  */
-export interface MemberSessionBinding { kind: GroupMemberKind; cwd: string; session?: string; at: string; memories?: string[]; workOrderId?: string; inputScoped?: true }
+export interface MemberSessionBinding {
+  kind: GroupMemberKind
+  cwd: string
+  session?: string
+  at: string
+  memories?: string[]
+  /** Versions possibly exposed, including uncertain transport outcomes. Actual receipts live in the experience store. */
+  experience?: ExperienceRef[]
+  /** Versions confirmed as taken, used to prevent duplicate payloads on a safe continuation. */
+  experienceSeen?: ExperienceRef[]
+  /** Once a binding lost access, new sessions must continue to filter historical replies. */
+  ownerReplayOnly?: true
+  workOrderId?: string
+  inputScoped?: true
+}
 
 /** 经验的指纹（只存指纹，不在映射里再存一份原文）。 */
 export const memoryMarks = (memories: readonly string[] | undefined) => [...new Set((memories ?? []).map(text => dialogueKey('member-memory', text).slice(0, 16)))]
@@ -202,7 +246,7 @@ export const seenMemories = (binding: Pick<MemberSessionBinding, 'memories'> | u
   [...new Set([...fresh ? [] : binding?.memories ?? [], ...memoryMarks(member.memories)])]
 /** 正在跑的一回合投递了什么：DSH 会话里那条请求的 id，第几次推送，以及已经转给调度器的最后一个会话事件序号。 */
 export interface LiveInputSteer { request: string; id: string; refs: ChatInputAttachment[] }
-export interface LiveCallBinding { memberId: string; session: string; request: string; push: number; eventSeq?: number; at: string; inputAttachments?: ChatInputAttachment[]; inputSteers?: LiveInputSteer[] }
+export interface LiveCallBinding { memberId: string; session: string; request: string; push: number; eventSeq?: number; at: string; inputAttachments?: ChatInputAttachment[]; inputSteers?: LiveInputSteer[]; experience?: ExperienceRef[] }
 interface MembersFile { version: 1; members: Record<string, MemberSessionBinding>; live: Record<string, LiveCallBinding>; orders?: Record<string, MemberSessionBinding> }
 
 const emptyMembers = (): MembersFile => ({ version: 1, members: {}, live: {} })
@@ -260,6 +304,12 @@ export class GroupMemberSessions {
 
   member(memberId: string): MemberSessionBinding | undefined { return this.read().members[memberId] }
 
+  hasLegacyExperience() {
+    const {members, orders} = this.read()
+    return [...Object.values(members), ...Object.values(orders ?? {})]
+      .some(binding => !!binding.memories?.length || binding.ownerReplayOnly === true)
+  }
+
   /** Keep the original text-only thread until the first material arrives. Thereafter native history belongs to its order. */
   native(memberId: string, workOrderId?: string): MemberSessionBinding | undefined {
     const latest = this.member(memberId)
@@ -278,6 +328,9 @@ export class GroupMemberSessions {
     if (previous?.inputScoped) binding = {...binding, inputScoped: true}
     if (previous && previous.kind === binding.kind && previous.cwd === binding.cwd && previous.session === binding.session
       && previous.workOrderId === binding.workOrderId && previous.inputScoped === binding.inputScoped
+      && previous.ownerReplayOnly === binding.ownerReplayOnly
+      && JSON.stringify(previous.experience) === JSON.stringify(binding.experience)
+      && JSON.stringify(previous.experienceSeen) === JSON.stringify(binding.experienceSeen)
       && JSON.stringify(previous.memories ?? []) === JSON.stringify(binding.memories ?? [])) return
     const next = {...binding, at: new Date(this.now()).toISOString()}
     this.write({ ...data, members: { ...data.members, [memberId]: next }, ...next.inputScoped && {orders: {...data.orders, [orderBinding(memberId, binding.workOrderId)]: next}} })

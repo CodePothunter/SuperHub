@@ -7,6 +7,7 @@ import type { ChatInputAttachment } from '../src/core/chat-attachments.ts'
 import { GroupEngine, GROUP_ADMIN_NOTE, GROUP_DELIVERY, linkedGroupFiles, memberIdentity, memberPrompt, type GroupEngineOptions } from '../src/dsh/workspace-group-engine.ts'
 import { groupRoster, GroupMemberSessions, LIAISON_MEMBER_ID, type GroupRosterMember, type MemberCall, type MemberCallSink, type MemberReattach, type MemberRunner } from '../src/dsh/workspace-group-members.ts'
 import { GROUP_LIMITS, type GroupEffect } from '../src/dsh/workspace-group-scheduler.ts'
+import { WorkspaceStaffStore } from '../src/dsh/workspace-staff-store.ts'
 
 const roots: string[] = []
 function temp() { const p = mkdtempSync(join(tmpdir(), 'chief-group-engine-')); roots.push(p); return p }
@@ -58,7 +59,8 @@ const ROSTER: GroupRosterMember[] = [
 
 const flush = () => new Promise(resolve => setTimeout(resolve, 0))
 
-function setup(options: { dir?: string; roster?: GroupRosterMember[]; dsh?: FakeRunner; codex?: FakeRunner; now?: () => number } = {}) {
+function setup(options: { dir?: string; roster?: GroupRosterMember[]; dsh?: FakeRunner; codex?: FakeRunner; now?: () => number;
+  experience?: GroupEngineOptions['experience'] } = {}) {
   const dir = options.dir ?? temp()
   const dsh = options.dsh ?? new FakeRunner(), codex = options.codex ?? new FakeRunner()
   const effects: GroupEffect[] = []
@@ -66,7 +68,7 @@ function setup(options: { dir?: string; roster?: GroupRosterMember[]; dsh?: Fake
   const engineOptions: GroupEngineOptions = {
     scope: 'brain', workspaceId: 'w1', groupId: 'g1', dir: join(dir, 'group'), workDir: () => join(dir, 'project'),
     info: () => ({ workspaceName: '方舟评测', goal: '评测方舟模型服务', title: '端点排查' }),
-    roster: () => roster, runners: { dsh, codex }, onEffects: rows => effects.push(...rows),
+    roster: () => roster, runners: { dsh, codex }, onEffects: rows => effects.push(...rows), experience: options.experience,
     approvals: { pending: filter => [{ id: 'a1', workspaceId: filter.workspaceId!, sessionId: filter.sessionId!, workOrderId: null, turnId: 'c3.1', tool: 'codex', memberId: 'eng',
       command: 'rm -rf build', cwd: dir, reason: '删除文件', requestedAt: '2026-11-24T00:00:00.000Z', expiresAt: '2026-11-24T00:30:00.000Z' }] },
     ...options.now && { now: options.now },
@@ -76,6 +78,90 @@ function setup(options: { dir?: string; roster?: GroupRosterMember[]; dsh?: Fake
   const lines = () => engine.ledger.all().map(line => `${line.kind}:${line.author}:${line.text}`)
   return { engine, dsh, codex, effects, lines, dir, setRoster: (next: GroupRosterMember[]) => { roster = next } }
 }
+
+describe('组装成员可见的经验和群历史', () => {
+  it('将成员行关联到实际原生会话的经验版本，并在换成员、撤回和重启后滤掉无范围授权的回放', async () => {
+    const dir = temp()
+    const store = new WorkspaceStaffStore(dir,'brain',()=>[],()=>{})
+    const join = (name: string, requestId: string) => store.apply('w1',{action:'create',name,brief:'团队协作',requestId}).members.find(member=>member.name===name)!
+    const lead = join('研究员','lead'), teammate = join('新成员','teammate')
+    const roster = [ROSTER[0]!,{id:lead.id,name:lead.name,kind:'dsh' as const},{id:teammate.id,name:teammate.name,kind:'dsh' as const}]
+    store.apply('w1',{action:'learn',audience:'shared',text:'检查缓存路径：协作例程',requestId:'shared'})
+    store.apply('w1',{action:'learn',staffId:lead.id,text:'检查缓存路径：专属依据',requestId:'private'})
+    const local = store.experienceMemories('w1')
+    const t = setup({dir,roster,experience:store})
+    await t.engine.start()
+    t.engine.ownerSay('@研究员 先列公开结果', {workOrderId:'w'})
+    const publicWork = t.dsh.last(lead.id)
+    expect(publicWork.call.experience?.entries).toEqual([])
+    publicWork.sink.finished(publicWork.call.callId,{text:'可传递的普通团队回报',toolCalls:0,status:'completed'})
+    t.engine.ownerSay('@研究员 检查缓存路径', {workOrderId:'w'})
+    const restricted = t.dsh.last(lead.id)
+    expect(restricted.call.experience?.entries.map(row=>row.id).sort()).toEqual(local.map(row=>row.id).sort())
+    restricted.sink.finished(restricted.call.callId,{text:'专属资料摘录及其结论',toolCalls:0,status:'completed'})
+    expect(t.engine.ledger.all().find(line=>line.text==='专属资料摘录及其结论')?.experienceRefs)
+      .toEqual(expect.arrayContaining(local.map(({id,version})=>({id,version}))))
+    expect(t.engine.projectLiaisonHistory(t.engine.ledger.all(),t.engine.ledger.lastSeq,'w').map(line=>line.text))
+      .not.toContain('专属资料摘录及其结论')
+
+    t.engine.ownerSay('@新成员 检查缓存路径', {workOrderId:'w'})
+    const first = t.dsh.last(teammate.id)
+    expect(first.call.prompt).toContain('可传递的普通团队回报')
+    expect(first.call.prompt).not.toContain('专属资料摘录及其结论')
+    first.sink.finished(first.call.callId,{text:'共享经验衍生成果',toolCalls:0,status:'completed'})
+    const shared = local.find(row=>row.audience==='shared')!
+    store.apply('w1',{action:'retire',audience:'shared',memoryId:shared.id,version:shared.version,requestId:'retire'})
+    t.engine.dispose()
+
+    const reopened = setup({dir,roster,experience:store})
+    await reopened.engine.start()
+    reopened.engine.ownerSay('@研究员 检查缓存路径', {workOrderId:'w'})
+    const current = reopened.dsh.last(lead.id).call
+    expect(current.recap?.()).toContain('可传递的普通团队回报')
+    expect(current.recap?.()).not.toContain('共享经验衍生成果')
+    expect(current.recap?.()).not.toContain('专属资料摘录及其结论')
+  })
+
+  it('使用主人来源判断共享用途，成员交接文本不能代替授权', async () => {
+    const dir = temp()
+    const store = new WorkspaceStaffStore(dir,'brain',()=>[],()=>{})
+    store.apply('w2',{action:'learn',audience:'shared',text:'续约专用的私有经验',requestId:'source'})
+    const [memory] = store.experienceMemories('w2')
+    store.apply('w2',{action:'share',audience:'shared',memoryId:memory!.id,sourceVersion:memory!.version,
+      targetWorkspaceId:'w1',targetAudience:'shared',text:'续约专用的外区摘要',purpose:'续约',requestId:'grant'})
+    const eng = store.apply('w1',{action:'create',name:'工程师',brief:'执行',requestId:'engineer'}).members[0]!
+    const t = setup({dir,roster:[ROSTER[0]!,{id:eng.id,name:'工程师',kind:'codex'}],experience:store})
+    await t.engine.start()
+    t.engine.ownerSay('核对软硬件库存',{workOrderId:'w'})
+    const liaison = t.dsh.last('liaison')
+    liaison.sink.finished(liaison.call.callId,{text:'@工程师 附带查一下续约',toolCalls:0,status:'completed'})
+    const call = t.codex.last(eng.id).call
+    expect(call.prompt).toContain('附带查一下续约')
+    expect(call.experience?.authorized).toEqual([])
+  })
+
+  it('经验撤回后不发布先前缓冲的中途发言', async () => {
+    const dir = temp()
+    const store = new WorkspaceStaffStore(dir,'brain',()=>[],()=>{})
+    const [memory] = store.apply('w1',{action:'learn',audience:'shared',text:'版本缓存需要回归测试',requestId:'learn'}).sharedExperiences!
+    let now = Date.now()
+    const t = setup({dir,experience:store,roster:[ROSTER[0]!],now:()=>now})
+    await t.engine.start()
+    t.engine.ownerSay('查询版本缓存',{workOrderId:'w'})
+    const {call,sink} = t.dsh.last('liaison')
+    expect(call.experience?.entries).toHaveLength(1)
+    sink.stepped(call.callId,'第一句已公开中途发言')
+    sink.stepped(call.callId,'根据所获经验继续核查的缓冲文字')
+    expect(t.engine.ledger.all().map(line=>line.text)).not.toContain('根据所获经验继续核查的缓冲文字')
+    store.apply('w1',{action:'retire',audience:'shared',memoryId:memory!.id,version:memory!.version,requestId:'retire'})
+    now += GROUP_LIMITS.stepGapMs
+    t.engine.tick()
+    sink.finished(call.callId,{text:'撤回之后迟到的结果',status:'completed',toolCalls:0})
+    expect(t.engine.ledger.all().map(line=>line.text)).not.toContain('根据所获经验继续核查的缓冲文字')
+    expect(t.engine.ledger.all().map(line=>line.text)).not.toContain('撤回之后迟到的结果')
+    expect(t.lines().some(line=>line.includes('本轮经验授权已变化'))).toBe(true)
+  })
+})
 
 describe('AC1：主人不 @ → 接口人 @工程师 → 工程师交回 → 接口人只被唤醒一次', () => {
   it('runs the whole relay with the right prompts', async () => {

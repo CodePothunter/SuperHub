@@ -119,6 +119,10 @@ export interface CodingTurnOptions {
   inputAttachments?: readonly CodingInput[]
   onCommand?: (event: CodingCommandEvent) => void
   onSession?: (sessionId: string) => void
+  /** Recheck the prompt's grants immediately before sending it. */
+  beforeInput?: () => void
+  /** The first input was accepted by turn/start or taken by Claude (not merely written to its stdin). */
+  onInputAccepted?: (sessionId: string) => void
   /** The running turn accepts owner words through this function until it ends. */
   onSteerable?: (steer: CodingSteer) => void
   launch?: CodingLaunch
@@ -434,12 +438,14 @@ async function codexProtocol({output, input, prompt, cwd, signal, stop, options,
       finally { clearTimeout(timer); trusted = undefined }
     }
     signal.throwIfAborted()
+    options.beforeInput?.()
     const begun = await request('turn/start', {threadId, input: codexInput(prompt, options.inputAttachments)})
     const turn = record(begun.turn)
     if (typeof turn?.id !== 'string' || !turn.id) throw new Error('编程工具返回的消息格式无法识别。')
     turnId = turn.id
     state.started = true
     turnOpen = true
+    options.onInputAccepted?.(threadId)
     for (const [name, params] of early.splice(0)) notify(name, params)
     options.onSteerable?.(async (id, text, files) => {
       if (!turnOpen || !threadId || !turnId) return 'rejected'
@@ -471,6 +477,7 @@ async function claudeProtocol({output, input, prompt, options, state, signal}: P
   const {publish, onCommand, onSession} = options
   const written: {id?: string; text: string; taken: boolean}[] = []
   let closed = false, lines = 0, results = 0, lastText = ''
+  let confirmed = false, firstTaken = false
   const pendingTools = new Map<string, {name: string; command: string}>()
   const send = async (text: string, files: readonly CodingInput[] = [], id?: string) => {
     const content: Record<string, unknown>[] = [{type: 'text', text}]
@@ -484,16 +491,25 @@ async function claudeProtocol({output, input, prompt, options, state, signal}: P
     }
     signal.throwIfAborted()
     if (closed || input.writableEnded || input.destroyed) return false
+    if (id === undefined) options.beforeInput?.()
     written.push({id, text: blockText(content), taken: false})
     if (id) state.interjections.push({id, delivered: false})
     input.write(JSON.stringify({type: 'user', message: {role: 'user', content}}) + '\n')
     return true
   }
   const close = () => { if (!closed) { closed = true; input.end() } }
+  const accepted = () => {
+    state.started = true
+    firstTaken = true
+    if (confirmed || !state.sessionId) return
+    confirmed = true
+    options.onInputAccepted?.(state.sessionId)
+  }
   const session = (id: unknown) => {
     if (typeof id !== 'string' || !id || id === state.sessionId) return
     state.sessionId = id
     onSession?.(id)
+    if (firstTaken) accepted()
   }
   if (!await send(prompt, options.inputAttachments)) throw new Error('Claude Code 的输入已关闭')
   options.onSteerable?.(async (id, text, files) => await send(text, files, id) ? 'pending' : 'rejected')
@@ -507,10 +523,12 @@ async function claudeProtocol({output, input, prompt, options, state, signal}: P
       lines++
       const message = record(event.message)
       if (event.type === 'user' && event.isReplay === true) {
+        session(event.session_id)
         const text = blockText(message?.content)
         const entry = written.find(row => !row.taken && row.text === text) ?? written.find(row => !row.taken)
         if (entry) {
           entry.taken = true
+          if (entry === written[0] && entry.text === text) accepted()
           const steered = entry.id ? state.interjections.find(row => row.id === entry.id) : undefined
           if (steered) steered.delivered = true
         }
@@ -543,6 +561,8 @@ async function claudeProtocol({output, input, prompt, options, state, signal}: P
         state.authRefused = true
       } else if (event.type === 'assistant' && !event.parent_tool_use_id && !event.error && !event.isApiErrorMessage) {
         if (!message || !Array.isArray(message.content)) continue
+        session(event.session_id)
+        accepted()
         state.authenticatedOutput = true
         const text = blocks.filter(block => block?.type === 'text' && typeof block.text === 'string').map(block => block!.text).join('\n')
         if (text.trim()) {
@@ -553,6 +573,8 @@ async function claudeProtocol({output, input, prompt, options, state, signal}: P
         session(event.session_id)
         state.terminal = true
         state.failed = event.is_error === true || event.subtype !== 'success'
+        if (!state.failed && (typeof event.num_turns === 'number' && event.num_turns > 0
+          || event.num_turns === undefined && typeof event.result === 'string' && event.result.trim())) accepted()
         results++
         if (!state.failed && typeof event.result === 'string' && event.result.trim() && event.result !== lastText) publish(results === 1 ? 'result' : 'result-' + results, event.result)
         lastText = ''

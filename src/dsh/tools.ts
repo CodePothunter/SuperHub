@@ -45,6 +45,8 @@ import { BRIEF_GUIDE } from './workspace-order-brief.ts'
 import type { V2Workspace } from '../core/workspace-v2.ts'
 import { HANDOFF_LIMIT, archivedRefusal, mutationKey, type WorkspaceV2Store } from './workspace-v2-store.ts'
 import type { WorkspaceStaffStore } from './workspace-staff-store.ts'
+import type { ExperienceLearning } from './workspace-experience-learning.ts'
+import type { RoomExperienceGrant, RoomExperienceScope } from './rooms.ts'
 import type { WorkspaceGroupHost } from './workspace-group-host.ts'
 import type { workspaceV2Routes } from './workspace-v2.ts'
 import { effectiveModel, type ModelDefaults } from './staff-models.ts'
@@ -127,7 +129,7 @@ export interface FollowUps {
   cancel(id: string): boolean
 }
 
-export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomExecution?: RequestRoomExecution; connectors?: Connectors; isLiaison: (id: string) => boolean; lookup: AgentLookup; worklines?: Worklines; readOnlyExecution?: (id: string) => boolean; executionBinding?: (id: string) => { ticketId: string; assignmentId: string } | undefined; followUps: FollowUps; ui: UiControl; control: ChiefControl; importer: Importer; exporter: Exporter; superhub?: SuperhubIntake; inputAttachments?: ChatAttachments; groups?: Pick<WorkspaceGroupHost, 'refresh'>; modelDefaults?: () => ModelDefaults; workspaceStore: WorkspaceV2Store; staffStore?:WorkspaceStaffStore; assign?: ReturnType<typeof workspaceV2Routes>['assign']; follow?: ReturnType<typeof workspaceV2Routes>['follow']; orderFollowup:OrderFollowupAccess; calendarWeek: (day?: string) => Promise<CalendarWeek>; personDetail: (id:string) => Promise<HistoryDetail> }): (() => void)[] {
+export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomExecution?: RequestRoomExecution; connectors?: Connectors; isLiaison: (id: string) => boolean; lookup: AgentLookup; worklines?: Worklines; readOnlyExecution?: (id: string) => boolean; executionBinding?: (id: string) => { ticketId: string; assignmentId: string } | undefined; followUps: FollowUps; ui: UiControl; control: ChiefControl; importer: Importer; exporter: Exporter; superhub?: SuperhubIntake; inputAttachments?: ChatAttachments; groups?: Pick<WorkspaceGroupHost, 'refresh'>; modelDefaults?: () => ModelDefaults; workspaceStore: WorkspaceV2Store; staffStore?:WorkspaceStaffStore; learning?: ExperienceLearning; assign?: ReturnType<typeof workspaceV2Routes>['assign']; follow?: ReturnType<typeof workspaceV2Routes>['follow']; orderFollowup:OrderFollowupAccess; calendarWeek: (day?: string) => Promise<CalendarWeek>; personDetail: (id:string) => Promise<HistoryDetail> }): (() => void)[] {
   const { engine, brain, roster, inputAttachments } = deps
   const attachmentWriteGuard = (agent: Agent | undefined) => {
     if (agent && deps.isLiaison(agent.id) && nativeAttachmentOnlyTurn(agent.session?.snapshotEvents() ?? [])) {
@@ -293,13 +295,17 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
     register({
       ...WORKSPACE_TOOL,
       parameters: { type: 'object', required: ['action'], properties: {
-        action: { type: 'string', enum: ['list', 'create', 'set_directory', 'assign', 'list_staff', 'remember_staff', 'list_orders', 'read_order', 'follow_order'] },
+        action: { type: 'string', enum: ['list', 'create', 'set_directory', 'assign', 'list_staff', 'remember_staff', 'remember_experience', 'list_orders', 'read_order', 'follow_order'] },
         name: { type: 'string', description: '主人点名的工作区。创建时保留原名，交办时可省略；set_directory 时省略即当前所在工作区。' },
         directory: { type: 'string', description: '主人原话里明确给出的项目目录绝对路径（照录，可含 ~）。create 可选：新工作区的默认项目目录；set_directory 必填，空字符串表示解除绑定；assign 可选：只在主人本轮原话为这一单明确给出目录时填写，本单开一个在该目录干活的群，覆盖工作区默认目录。目录须已存在、属于主人本人，不能是根目录、系统目录、家目录本身或第二大脑内部目录；不合法时返回原因，什么也不保存、不建单。' },
         title:{type:'string',maxLength:48,description:'assign 必填。'+BRIEF_GUIDE},
         promise:{type:'string',maxLength:160,description:'assign 必填，用一句话说明这张工单应交付的结果。'},
         reporting: {type:'string', enum: ENGAGEMENT_REPORTING, description:'assign 或 follow_order 的成果汇报约定。each 为每个已验收的分项，milestone 为主人指定的阶段，final 为整个成果。新工单默认 final；补充原单时只在主人明确改了汇报约定才填，并在 handoff 中说明对应阶段。按项执行的顺序不等于按项汇报。'},
-        quote:{type:'string',maxLength:3000,description:'remember_staff 只用主人本轮明确要求记住的连续原话。'},
+        quote:{type:'string',maxLength:3000,description:'remember_staff 和 remember_experience 只用主人本轮明确要求今后执行、更正或停用的连续原话。'},
+        experience_action:{type:'string',enum:['remember','revise','retire'],description:'remember_experience 的操作。修订、停用时必须引用本轮可核对的条目编号和版本。'},
+        experience_id:{type:'string',description:'修订、停用经验时使用本轮可核对的现有编号。'},
+        experience_version:{type:'integer',minimum:1,description:'修订、停用经验时使用本轮可核对的现有版本。'},
+        global_scope_quote:{type:'string',description:'只有主人明确要求所有工作区使用同一做法时，才用连续原话注明全局范围。'},
         staff_name:{type:'string',description:'主人本轮点名的本区幕僚：照录主人的称呼，交办会在群里直接 @ 这位幕僚。可用 list_staff 核对。主人只提 Codex、Claude Code 等工具名时不填。'},
         session_title:{type:'string',maxLength:48,description:'可选的新会话短名。沿用现有会话时保留已有名称。'},
         work_order_id: { type: 'string', description: 'read_order 与 follow_order 使用的实际工单标识，由接单回执或 list_orders 提供；本段对话最近 assign 的工单（不必是最后一张）直接用那次回执里的 order.id。' },
@@ -330,6 +336,29 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
           if (!shown || !deps.staffStore) throw new Error('请从目标工作区打开接口人，以核对可接单的幕僚。')
           return {members:deps.staffStore.view(shown.workspace.id).members.map(({id,name,brief,memberships})=>({id,name,brief,duty:memberships[0]?.duty}))}
         }
+        if (args.action === 'remember_experience') {
+          if (archivedHere) refuseArchived(archivedHere)
+          if (origin?.operation === 'read' || !deps.learning) throw new Error('请由主人明确提出今后要沿用、更正或停用的做法。')
+          const quote = str(args.quote)
+          const action = args.experience_action ?? 'remember'
+          if (!quote || !source.text.includes(quote) || action !== 'remember' && action !== 'revise' && action !== 'retire') {
+            throw new Error('请引用主人本轮要求的连续原话，并核对经验操作。')
+          }
+          const id = str(args.experience_id), version = args.experience_version
+          const memory = id && typeof version === 'number' && Number.isSafeInteger(version) && version > 0 ? {id, version} : undefined
+          if (action !== 'remember' && !memory) throw new Error('请先核对要更正或停用的经验及其版本。')
+          const globalScope = str(args.global_scope_quote)
+          if (globalScope && !source.text.includes(globalScope) || !focus && !globalScope) {
+            throw new Error('请在工作区登记本区经验，或引用主人明确授权全局使用的原话。')
+          }
+          const workspaceId = globalScope ? undefined : focus?.workspace.id
+          const requestId = createHash('sha256').update(JSON.stringify(['owner-experience', source.requestId, action, id, quote])).digest('hex')
+          deps.learning.correct({requestId, source: {id: source.requestId, text: source.text, workspaceId,
+            sessionId: conversationId, orderId: workspaceId ? focus?.order?.id : undefined, messageId: source.messageId},
+            quote, workspaceId, memory, action})
+          deps.groups?.refresh(workspaceId)
+          return {message: action === 'retire' ? '已停用指定经验。' : workspaceId ? '已保存为本区共同经验。' : '已保存为本脑共同经验。', quote}
+        }
         if (args.action === 'remember_staff') {
           if (archivedHere) refuseArchived(archivedHere)
           if (origin?.operation === 'read' || !focus || !deps.staffStore) throw new Error('请从幕僚所在工作区明确提出要记住的做法。')
@@ -339,8 +368,16 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
           if (members.length !== 1) throw new Error('本区没有唯一匹配的幕僚，请核对姓名。')
           const staffId = members[0]!.id
           const orderId = focus.order?.staffId === staffId ? focus.order.id : undefined
-          deps.staffStore.apply(focus.workspace.id,{action:'learn',staffId,text:quote,orderId,
-            requestId:createHash('sha256').update(JSON.stringify(['staff-owner',staffId,source.requestId,quote])).digest('hex')})
+          if (deps.learning) {
+            const requestId = createHash('sha256').update(JSON.stringify(['staff-owner',staffId,source.requestId,quote])).digest('hex')
+            deps.learning.correct({requestId, source:{id:source.requestId, text:source.text, workspaceId:focus.workspace.id,
+              sessionId:conversationId, orderId, messageId:source.messageId}, quote, staffId,
+              workspaceId:focus.workspace.id, action:'remember'})
+            deps.groups?.refresh(focus.workspace.id)
+          } else {
+            deps.staffStore.apply(focus.workspace.id,{action:'learn',staffId,text:quote,orderId,
+              requestId:createHash('sha256').update(JSON.stringify(['staff-owner',staffId,source.requestId,quote])).digest('hex')})
+          }
           return {message:'已把本轮原话记为这位幕僚的本区经验，可以从幕僚卡更正或重置。',name:named,quote}
         }
         if (args.action === 'list_orders' || args.action === 'read_order') {
@@ -502,7 +539,10 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
         '主人只是问配置事实（「谁用什么模型」）时不用开讨论，先用 chief_staff list、chief_settings show 直接回答。主人只要求记下（备忘）时不要开讨论。',
         'request_id 为本次稳定标识。ticket 可关联已存在的正式工单。',
       ].join('\n'),
-      parameters: { type: 'object', required: ['action'], properties: { action: { type: 'string', enum: ['discuss', 'create', 'list', 'read'] }, request_id: { type: 'string' }, room: { type: 'string' }, title: { type: 'string' }, text: { type: 'string' }, ticket: { type: 'string' } } },
+      parameters: { type: 'object', required: ['action'], properties: { action: { type: 'string', enum: ['discuss', 'create', 'list', 'read'] }, request_id: { type: 'string' }, room: { type: 'string' }, title: { type: 'string' }, text: { type: 'string' }, ticket: { type: 'string' },
+        experience_grants: {type:'array', maxItems:5, description:'仅转交主人本轮明确指定的本区专属经验，逐字核对经验编号、接收的成员名和用途。',
+          items:{type:'object', required:['id','version','recipient','purpose'], properties:{id:{type:'string'},version:{type:'integer',minimum:1},recipient:{type:'string'},purpose:{type:'string'}}}},
+      } },
       output: { schema: OBJECT, render: (_a, v) => textOut(v), presentationMeta: (args, value) => {
         const action = (args as { action?: string }).action, room = value as { id?: string; title?: string; requestId?: string }
         return ['discuss', 'create'].includes(action ?? '') && room.id
@@ -513,6 +553,7 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
         if (!deps.rooms) throw new Error('讨论未启用')
         if (args.action === 'list') return deps.rooms.index(String(args.title ?? ''))
         let roomText = String(args.text ?? ''), roomRequest = String(args.request_id ?? ''), roomTitle = String(args.title ?? '')
+        let experienceScope: RoomExperienceScope | undefined
         if (deps.superhub && (args.action === 'discuss' || args.action === 'create')) {
           // 方案 A：接口人理解主人意图后开讨论（是否该开由接口人判断，系统不解读文字）。主人本轮原话作为来源附在首条消息里。
           const { source, sessionId } = ownerSource(execution)
@@ -520,18 +561,37 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
           roomText = brief && brief !== said ? `接口人转述：${brief.slice(0, 8000)}\n主人原话：「${said.slice(0, 20000)}」` : said
           roomTitle = str(args.title) ?? (brief ?? said).split('\n')[0]!.slice(0, 60)
           roomRequest = `liaison-${createHash('sha256').update(JSON.stringify([sessionId, source.requestId, args.action, args.room ?? '', roomTitle, roomText])).digest('hex')}`
+          const focus = deps.workspaceStore.focus(deps.superhub.ownerTurnOrigin(source)?.context)
+          if (!focus && Array.isArray(args.experience_grants) && args.experience_grants.length) throw Error('请从原工作区明确转交经验。')
+          if (focus) {
+            const grants: RoomExperienceGrant[] = []
+            for (const value of Array.isArray(args.experience_grants) ? args.experience_grants : []) {
+              if (!value || typeof value !== 'object') throw Error('请提供主人明确允许转交的经验、接收人和用途。')
+              const {id, version, recipient, purpose} = value as Record<string, unknown>
+              if (typeof id !== 'string' || typeof version !== 'number' || !Number.isSafeInteger(version) || version < 1 ||
+                typeof recipient !== 'string' || !recipient || typeof purpose !== 'string' || !purpose ||
+                ![id, recipient, purpose].every(part => said.includes(part))) throw Error('经验、接收人和用途须能与主人本轮原话核对。')
+              const row = deps.staffStore?.experienceVersion(focus.workspace.id, id, version)
+              if (!row || row.status !== 'active' || row.audience !== 'staff') throw Error('该版本的本区专属经验暂不可转交。')
+              grants.push({id, version, recipient, purpose})
+            }
+            experienceScope = {workspaceId: focus.workspace.id, orderId: focus.order?.id, grants}
+          }
         }
         if (args.action === 'discuss') {
           if (args.ticket && !engine.views().some(v => v.ticket.id === args.ticket)) throw new Error(`没有工单 ${String(args.ticket)}，未发出讨论。可用 chief_brief 查看现有工单编号。`)
           const result = await deps.rooms.discuss(roomRequest, roomTitle, roomText,
-            args.room ? String(args.room) : undefined, args.ticket ? String(args.ticket) : undefined, !!deps.superhub)
+            args.room ? String(args.room) : undefined, args.ticket ? String(args.ticket) : undefined, !!deps.superhub, experienceScope)
           if ('ambiguous' in result && result.ambiguous) return { ...result, message: `有 ${result.choices?.length ?? 0} 个同名讨论，未发出。请用 room 指定要沿用的讨论，或换一个标题新建。` }
           const next = result.requestId ? '有结果后会回到这段接口人对话。' : '结论和待办会出现在讨论里。'
           return { ...result, message: `已${result.reused ? '在讨论' : '新建讨论'}「${result.title}」发出，讨论成员会接着处理。${next}` }
         }
         if (args.action === 'create') {
           const room = await deps.rooms.create(roomRequest, roomTitle)
-          if (roomText) await deps.rooms.say(room.id, `start-${room.id}`, roomText)
+          if (roomText) {
+            deps.rooms.bindExperienceScope(room.id, `start-${room.id}`, experienceScope)
+            await deps.rooms.say(room.id, `start-${room.id}`, roomText)
+          }
           return { ...room, message: `已新建讨论「${room.title}」${roomText ? '并发出首条消息' : ''}。` }
         }
         const roomId = String(args.room ?? '')

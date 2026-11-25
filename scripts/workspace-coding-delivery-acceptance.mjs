@@ -176,7 +176,7 @@ try {
   assert.equal(new URLSearchParams(new URL(mobile.url()).hash.slice(4)).get('order'),checklistId)
   await button(mobile,'今天').click()
   await mobile.getByRole('button',{name:/试点研发.*交给团队制作并验证报名页/}).click()
-  await mobile.getByRole('button',{name:/给周五试点做一个手机报名页/}).click()
+  await mobile.getByRole('button',{name:/^给周五试点做一个手机报名页/}).click()
   await openOrderInfo(mobile)
   const mobileFiles = mobile.getByRole('region',{name:'交付成果'})
   await button(mobileFiles,'查看报名页源码').click()

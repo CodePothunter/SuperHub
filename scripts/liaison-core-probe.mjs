@@ -122,9 +122,12 @@ export function apply(ctx) {
       const current = ctx.agents.get(request.sessionId)?.model?.current?.()
       const text = JSON.stringify(request)
       const currentPrompt = (request.messages ?? []).filter(message => message.role === 'system').map(message => textOf(message.content)).filter(Boolean).at(-1) ?? ''
+      const currentContext = (request.messages ?? []).filter(message => message.source?.kind === 'runtime-context')
+        .map(message => textOf(message.content)).at(-1) ?? ''
+      const turnPrompt = currentContext.includes('本轮主人从') ? currentContext : currentPrompt
       const row = { session: request.sessionId, provider: request.provider, model: request.model, ...request.reasoningEffort ? { reasoningEffort: request.reasoningEffort } : {},
-        currentWorkspace: currentPrompt.includes('本轮主人从「工作区」发言。当前项目数据'),
-        calendarDate: /本轮主人从「日历」发言。当前选中日期为 (\d{4}-\d{2}-\d{2})。/.exec(currentPrompt)?.[1],
+        currentWorkspace: turnPrompt.includes('本轮主人从「工作区」发言。当前项目数据'),
+        calendarDate: /本轮主人从「日历」发言。当前选中日期为 (\d{4}-\d{2}-\d{2})。/.exec(turnPrompt)?.[1],
         productGuide: currentPrompt.includes('你是 SuperHub 的接口人'),
         workspaceTool: (request.tools ?? []).some(tool => tool.name === 'chief_workspace'),
         ...(process.env.CHIEF_ACCEPTANCE_MEDIA === '1' && { media: (request.messages ?? []).flatMap(message => {

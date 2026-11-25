@@ -302,7 +302,7 @@ export class Engine {
   }
 
   /** 检查时钟规则：每条规则只发最近一个到期时刻，去重键保证不重复。 */
-  async tickClock(): Promise<void> {
+  async tickClock(onDue?: (rule: ClockRule, slot: string) => void): Promise<void> {
     const now = this.now()
     for (const rule of this.brain.rules()) {
       let slot: Date | undefined
@@ -315,6 +315,7 @@ export class Engine {
       if (now.getTime() - slot.getTime() > grace) continue
       const key = slotKey(slot, this.options.timeZone)
       await this.receive({ source: 'clock', dedupe: `clock:${rule.id}:${key}`, text: rule.text, meta: { rule: rule.id, slot: key } })
+      onDue?.(rule, key)
     }
   }
 

@@ -11,7 +11,7 @@ import { mentionSegments, type MentionSegment } from '../core/mentions.ts'
 import { LIAISON_MEMBER_ID } from './workspace-group-members.ts'
 import { GROUP_COMMANDS_FILE, type GroupEngine, type GroupDeliveryOutcome } from './workspace-group-engine.ts'
 import type { WorkspaceGroupHost } from './workspace-group-host.ts'
-import { GROUP_LEDGER_FILE, readGroupLedger, type GroupAttachment, type GroupLine } from './workspace-group-ledger.ts'
+import { GROUP_LEDGER_FILE, memberCompletionEvidenceId, readGroupLedger, type GroupAttachment, type GroupLine } from './workspace-group-ledger.ts'
 import { HOST_ID, OWNER_ID, type GroupEffect } from './workspace-group-scheduler.ts'
 import { dialogueKey, groupLeadId, liaisonSpeakerId, workspaceSpeakerId } from './workspace-speaker-id.ts'
 import { appendCommandLog, readCommandLog } from './workspace-command-log.ts'
@@ -24,6 +24,8 @@ import { ACCEPTANCE_TIMEOUT_MS, ORIGINAL_LIMIT, RESULTS_LIMIT, type AcceptanceRe
 import { publishedOutputs, workspaceOutputs, type OutputSource } from './workspace-outputs.ts'
 import type { OrderBrief } from './workspace-order-brief.ts'
 import type { WorkspaceStaffStore } from './workspace-staff-store.ts'
+import type { ExperienceEvidence } from '../core/workspace-experience.ts'
+import type { ExperienceLearning } from './workspace-experience-learning.ts'
 import { WorkspaceFollowup } from './workspace-followup.ts'
 import { fileVersion, groupResults, WorkspaceResultNotices, type GroupResultLine, type StoredResult } from './workspace-notices.ts'
 import { directoryLocks, type DirectoryHolder, type DirectoryLocks } from './directory-locks.ts'
@@ -36,6 +38,8 @@ export interface WorkspaceApprovals {
 }
 interface Options {
   inputAttachments?: Pick<ChatAttachments, 'resolve' | 'grant'>
+  learning?: ExperienceLearning
+  learningProblem?: (error: unknown) => void
   staff?:WorkspaceStaffStore; store: WorkspaceV2Store; source: V2DialogueSource; timeZone?: string; now?: () => Date; approvals?: WorkspaceApprovals
   /** The liaison's acceptance review of new results. Absent: results are not reviewed. */
   review?: AcceptanceReviewer
@@ -155,7 +159,7 @@ export function earlierResults(notices: StoredResult[], orderId: string, turnId:
 }
 
 /** Mounted behind serveApi's authenticated desktop/mobile gateways, under the active brain lock. */
-export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shanghai', now, approvals, review, coordinate, remind, locks = directoryLocks, judge, groups, inputAttachments }: Options) {
+export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shanghai', now, approvals, review, coordinate, remind, locks = directoryLocks, judge, groups, inputAttachments, learning, learningProblem }: Options) {
   const scope = store.scope
   const flights = new Map<string, InFlight>()
   let disposed = false
@@ -168,6 +172,30 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     groups && {collect: () => collectGroupResults(), attachment: (notice, fileId) => groupResultFile(notice, fileId)})
   const reviews = new AbortController()
   const reviewing = new Set<string>()
+  function learnResult(result: StoredResult, deferred = false) {
+    if (!learning || result.at < learning.startedAt || !result.text.trim() || result.kind === 'weekly') return
+    const evidence: ExperienceEvidence = {kind: 'delivery', id: result.id, workspaceId: result.workspaceId,
+      sessionId: result.sessionId, orderId: result.orderId, messageId: result.messageId, version: result.version}
+    const signal = {id: 'delivery:' + result.id, workspaceId: result.workspaceId, sessionId: result.sessionId,
+      orderId: result.orderId, kind: 'delivery' as const, summary: result.text, evidence: [evidence]}
+    if (deferred) {
+      try { learning.observe(signal) } catch (error) { learningProblem?.(error) }
+    } else void learning.settle(signal).catch(error => learningProblem?.(error))
+  }
+  function learnOwnerWords(session: V2Session, line: GroupLine) {
+    if (!learning || line.at < learning.startedAt || !line.text.trim()) return
+    void learning.interpretOwner({id: 'group:' + session.id + ':' + line.seq, text: line.text, workspaceId: session.workspaceId,
+      sessionId: session.id, orderId: line.workOrderId, messageId: lineId(line.seq)}).catch(error => learningProblem?.(error))
+  }
+  function learnReview(row: {workspaceId: string; sessionId: string; orderId: string; turnId: string}, outcome: AcceptanceOutcome) {
+    if (!learning || outcome.kind !== 'verdict') return
+    const {workspaceId, sessionId, orderId, turnId} = row
+    const evidence: ExperienceEvidence = {kind:'model-review', id:turnId, workspaceId, sessionId, orderId}
+    try {
+      learning.observe({id:'model-review:' + turnId, kind:'review', workspaceId, sessionId, orderId,
+        summary:outcome.verdict === 'pass' ? '模型评议认为交付满足本轮约定。' : '模型评议发现尚未满足的交付要求。', evidence:[evidence]})
+    } catch (error) { learningProblem?.(error) }
+  }
   /** Owner words being read by the liaison, by request: a retry of the same words waits for the same reading. */
   const judging = new Map<string, Promise<Awaited<ReturnType<typeof judgeCommand>>>>()
   const shown = (order: V2Delegation) => store.present(order, timeZone, now?.())
@@ -303,9 +331,11 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       const generation = workOrderId ? store.delegation(session.workspaceId, workOrderId).generation : undefined
       const line = engine.note({speaker: 'owner', text, workOrderId, requestId: mutation.id, inputAttachments: refs,
         engagement: {callId: mutation.id, triggerSeq: engine.ledger.lastSeq + 1, generation, answerTo}})
+      learnOwnerWords(session, line)
       return {session: store.session(session.workspaceId, session.id), messageId: lineId(line.seq), deliveries: []}
     }
     const {line, deliveries} = engine.say(text, {requestId: mutation.id, ...(workOrderId && {workOrderId}), inputAttachments: refs})
+    if (!replay) learnOwnerWords(session, line)
     const wait = new Promise<'pending'>(resolve => setTimeout(() => resolve('pending'), STEER_REPLY_WAIT_MS).unref?.())
     const rows = await Promise.all(deliveries.map(async row => ({memberId: row.memberId, outcome: await Promise.race([row.outcome, wait]) as GroupDeliveryOutcome})))
     current()
@@ -326,7 +356,6 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       let context
       try { context = staff.context(session.workspaceId, call.member.id) } catch { return call.member.name + ' 已不在本工作区' }
       try { staff.assertCurrent({...context, token: call.member.token ?? context.token}) } catch { return call.member.name + ' 可见的资料刚刚变了，这一次没有叫它，请再叫一次' }
-      if (call.workOrderId) try { staff.markUsed(context, call.workOrderId) } catch { /* the record of used experience is best effort */ }
     }
     if (call.workOrderId) return store.chargeGroupCall(session.workspaceId, session.id, call.workOrderId)
   }
@@ -367,7 +396,55 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
 
   /** Lines of each group already checked for results in this process (the board keeps the last one that published). */
   const groupScanned = new Map<string, number>()
+  const memberLearningScanned = new Map<string, number>()
+  const memberLearningRetry = new Set<string>()
   let groupsCollected = false
+
+  function learnGroupMembers(session: V2Session, lines: readonly GroupLine[], deferred = false, delivered: readonly StoredResult[] = []) {
+    if (!learning || !staff) return
+    const {id: sessionId, workspaceId} = session
+    const from = memberLearningScanned.get(sessionId) ?? 0
+    const last = lines.at(-1)?.seq ?? from
+    if (last <= from && !delivered.length) return
+    const formal = new Map(delivered.map(result => [result.messageId, result]))
+    const outcomes = lines.flatMap(line => {
+      const delivery = formal.get(lineId(line.seq))
+      const isDelivery = !!delivery && delivery.workspaceId === workspaceId && delivery.sessionId === sessionId && delivery.orderId === line.workOrderId
+      if (line.at < learning.startedAt || !line.memberCallId || !line.memberCompleted && !isDelivery
+        || line.seq <= from && !isDelivery || [LIAISON_MEMBER_ID, OWNER_ID, HOST_ID].includes(line.speakerId)) return []
+      const id = memberCompletionEvidenceId(sessionId, line, isDelivery)
+      return id ? [{line, id, callId: line.memberCallId}] : []
+    })
+    if (outcomes.length) {
+      if (archived(workspaceId)) return
+      const members = new Set(staff.view(workspaceId).members.map(member => member.id))
+      const orders = new Set(store.view(workspaceId).orders.filter(order => order.sessionId === sessionId).map(order => order.id))
+      for (const {line, id, callId} of outcomes) {
+        if (!members.has(line.speakerId) || line.workOrderId && !orders.has(line.workOrderId)) continue
+        const evidence: ExperienceEvidence = {kind: 'group', id, workspaceId, sessionId, orderId: line.workOrderId,
+          messageId: lineId(line.seq), quote: line.text.slice(0, 3000)}
+        const signal = {id, kind: 'delivery' as const, workspaceId, sessionId, orderId: line.workOrderId, staffId: line.speakerId,
+          summary: line.text, sourceTurnIds: [callId], sourceExperienceRefs: line.experienceRefs, evidence: [evidence]}
+        // Advance the scan only after the source has a durable learning receipt or a pending record.
+        learning.observe(signal)
+        if (!deferred) void learning.settle(signal).catch(error => learningProblem?.(error))
+      }
+    }
+    memberLearningScanned.set(sessionId, last)
+  }
+
+  function groupMemberLearning(session: V2Session, lines: readonly GroupLine[], deferred = false, delivered?: readonly StoredResult[]) {
+    try {
+      if (memberLearningRetry.has(session.id)) {
+        delivered = [...store.groupEvidence(), ...store.resultNotices()].filter(result => result.sessionId === session.id)
+      }
+      learnGroupMembers(session, lines, deferred, delivered)
+      memberLearningRetry.delete(session.id)
+    } catch (error) {
+      memberLearningRetry.add(session.id)
+      learningProblem?.(error)
+    }
+  }
   /** Publish results of every group's new lines: all groups the first time (from their ledgers), then the running ones. */
   function collectGroupResults() {
     if (disposed || !groups) return
@@ -400,7 +477,10 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     const scanned = groupScanned.get(session.id)
     const from = Math.max(saved ?? 0, scanned ?? 0)
     const last = lines.at(-1)?.seq ?? from
-    if (last <= from && !acceptance) return
+    if (last <= from && !acceptance) {
+      groupMemberLearning(session, lines)
+      return
+    }
     const since = saved === undefined && scanned === undefined ? (now?.() ?? new Date()).getTime() - GROUP_RESULTS_SINCE_MS : undefined
     const orders = new Set(store.view(session.workspaceId).orders.filter(order => order.sessionId === session.id).map(order => order.id))
     let base: string | undefined
@@ -430,6 +510,9 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     const delivering = rows.some(row => row.files.length) || results.length > 0
     const record = store.publishGroupResults(session.workspaceId, session.id, delivering ? last : saved ?? 0, results, acceptance)
     groupScanned.set(session.id, last)
+    groupMemberLearning(session, lines, false, results)
+    const published = new Set(store.resultNotices().map(row => row.id))
+    for (const result of results) if (published.has(result.id)) learnResult(result)
     return record
   }
   /** A group result's file as it was delivered: its kept copy, or the line's file while it still has that version. */
@@ -577,13 +660,19 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     const engine = await groupEngine(session)
     const line = engine.ledger.get(job.seq)
     if (!line || (job.answerTo && !job.decision && !store.ownerAction(job.answerTo))) { store.closeEngagement(job.id); return }
+    const triggerSeq = job.triggerSeq ?? job.seq
     let routed = job
     if (!job.decision) {
       const order = job.orderId && store.delegation(session.workspaceId, job.orderId)
       const original = order && (order.hasOriginal ? store.orderOriginal(session.workspaceId, order.id).text : order.promise)
-      const history = engine.ledger.all().filter(row => row.kind !== 'progress' && (row.workOrderId === job.orderId || row.seq === job.triggerSeq))
+      const history = engine.projectLiaisonHistory(engine.ledger.all().filter(row => row.kind !== 'progress' &&
+        (row.workOrderId === job.orderId || row.seq === job.triggerSeq)), triggerSeq, job.orderId)
+      const visibleLine = history.find(row => row.seq === line.seq)
+      const source = visibleLine ?? {...line, text:'成员已交回结果，当前接口人未获准读取其中的经验来源。', attachments:undefined, quote:undefined}
+      const experienceRefs = [...new Map(history.flatMap(row => row.experienceRefs ?? [])
+        .map(ref=>[JSON.stringify(ref),ref] as const)).values()]
       const evidence = new Map((order ? store.groupEvidence(order.id) : []).map(row => [row.messageId!, row]))
-      const sourceLine = engagementMessage(session, line, evidence)
+      const sourceLine = engagementMessage(session, source, visibleLine ? evidence : new Map())
       const recent = history.slice(-16)
       const earlier = history.slice(0, -16).filter(row => row.seq === job.triggerSeq || order &&
         (row.engagement || row.speakerId === OWNER_ID || row.quote || evidence.has(lineId(row.seq)))).slice(-64)
@@ -606,6 +695,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         decision = {kind: 'wait', reason: '接口人暂时无法核实本轮结果，请在原会话重试或调整交办。'}
       }
       if (disposed || !store.engagementActive(job.id) || (job.turn !== 'owner' && ownerSeen !== latestOwnerSeq())) return
+      if (!engine.canUseLiaisonExperience(experienceRefs, triggerSeq, job.orderId)) return
       const selected = new Set(engine.members().map(member => member.id))
       const busy = engine.workInFlight().filter(member => member.workOrderId === job.orderId)
       const memberIds = [...new Set(decision.memberIds ?? [])].filter(id => selected.has(id) && !busy.some(member => member.id === id))
@@ -645,15 +735,19 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       const existingQuestion = pending.find(row => row.question === decision.text || lineSeq(row.messageId) === decision.sourceSeq)
       const sameMessage = line.speakerId === LIAISON_MEMBER_ID && decision.text && line.text.includes(decision.text)
       const question = decision.kind === 'ask' && decision.text && !existingQuestion ? sameMessage ? line :
-        engine.note({speaker: 'liaison', text: decision.text, workOrderId: job.orderId, ref: job.id + '-question'}) : undefined
+        engine.note({speaker: 'liaison', text: decision.text, workOrderId: job.orderId, ref: job.id + '-question', experienceRefs}) : undefined
       const revised = order && ownerSource && job.turn === 'liaison' ? {reporting: decision.reporting, promise: decision.promise} : undefined
-      const recorded = store.recordEngagement(job, decision, question, intake, answer, revised)
+      const recorded = store.recordEngagement(job, {...decision, experienceRefs}, question, intake, answer, revised)
       if (!recorded) return
       if (recorded.generation !== job.generation && job.orderId) engine.stopOrder(job.orderId, '主人更新了交办范围，按新约定继续。')
       routed = recorded
     }
     if (disposed || !store.engagementActive(job.id)) return
     const decision = routed.decision!
+    if (!engine.canUseLiaisonExperience(decision.experienceRefs ?? [], triggerSeq, routed.orderId)) {
+      store.closeEngagement(job.id)
+      return
+    }
     const order = routed.orderId && store.delegation(session.workspaceId, routed.orderId)
     const report = decision.kind === 'deliver' ? decision.text : decision.report
     const final = decision.kind === 'deliver' && decision.final !== false
@@ -663,13 +757,15 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     if (publication) {
       const id = workspaceFingerprint([scope, session.id, order.id, order.generation, checkpoint])
       const cited = new Set(decision.evidenceSeqs ?? [])
-      const refs = engine.ledger.all().filter(item => item.workOrderId === order.id && item.kind === 'message' && !item.ref &&
+      const visible = engine.projectLiaisonHistory(engine.ledger.all(), triggerSeq, order.id)
+      const refs = visible.filter(item => item.workOrderId === order.id && item.kind === 'message' && !item.ref &&
         item.speakerId !== OWNER_ID && item.speakerId !== HOST_ID && (cited.size ? cited.has(item.seq) : final && !!item.engagement))
       const index = refs.slice(-30).map(item => '- 群消息 #' + item.seq + ' · ' + item.author)
       const text = index.length ? report + '\n\n**核对记录**\n' + index.join('\n') : report
-      const delivered = engine.note({speaker: 'liaison', text, workOrderId: order.id, ref: 'delivery-' + id})
-      const attachments = [...new Map(store.groupEvidence(order.id).filter(row =>
-        !cited.size || cited.has(lineSeq(row.messageId) ?? 0)).flatMap(row => row.attachments).map(file => [file.version,file])).values()]
+      const delivered = engine.note({speaker: 'liaison', text, workOrderId: order.id, ref: 'delivery-' + id, experienceRefs:decision.experienceRefs})
+      const allowed = new Set(visible.map(item=>lineId(item.seq)))
+      const attachments = [...new Map(store.groupEvidence(order.id).filter(row => row.messageId && allowed.has(row.messageId) &&
+        (!cited.size || cited.has(lineSeq(row.messageId) ?? 0))).flatMap(row => row.attachments).map(file => [file.version,file])).values()]
       result = {id, workspaceId: session.workspaceId, sessionId: session.id, orderId: order.id, messageId: lineId(delivered.seq),
         title: final ? '工单回报' : '阶段回报', at: delivered.at, read: false, kind: final ? 'report' : 'partial',
         requestId: 'checkpoint:' + order.generation + ':' + checkpoint, version: workspaceFingerprint([text,attachments]), text, attachments}
@@ -678,8 +774,10 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       if (store.engagementActive(job.id)) {
         const original = routed.intakeSeq ? engine.ledger.get(routed.intakeSeq) : undefined
         if (original && original.speakerId === OWNER_ID) grantGroupFiles(session, routed.orderId, original.inputAttachments)
-        engine.dispatchEngagement(job.id, decision.memberIds, decision.text, routed.orderId, original?.speakerId === OWNER_ID ?
-          {original: original.text, inputAttachments: original.inputAttachments} : undefined)
+        engine.dispatchEngagement(job.id, decision.memberIds, decision.text, routed.orderId, {
+          experienceRefs: decision.experienceRefs,
+          ...(original?.speakerId === OWNER_ID && {original: original.text, inputAttachments: original.inputAttachments}),
+        })
       }
     } else if (job.turn === 'owner' && decision.resolved?.length && decision.kind === 'none') {
       if (!order || order.remainingTurns) engine.dispatchEngagement(job.id, [LIAISON_MEMBER_ID], '主人已答复待回应事项：' + line.text, routed.orderId)
@@ -690,22 +788,25 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     }
     const waitUntil = decision.kind === 'wait' && decision.reviewAt && Date.parse(decision.reviewAt) > +(now?.() ?? new Date()) ? decision.reviewAt : undefined
     if (decision.kind === 'wait' && !order && (!waitUntil || (job.attempts ?? 0) >= 2)) {
-      engine.note({speaker: 'liaison', text: decision.reason ?? decision.text ?? '等待依赖更新后继续。', ref: job.id + '-wait'})
+      engine.note({speaker: 'liaison', text: decision.reason ?? decision.text ?? '等待依赖更新后继续。', ref: job.id + '-wait', experienceRefs:decision.experienceRefs})
     }
     store.closeEngagement(job.id, result, waitUntil, decision.waitForMember)
+    if (result && store.resultNotices().some(row => row.id === result.id)) learnResult(result)
   }
 
-  function recoverEngagement() {
-    if (!coordinate || !groups || disposed) return
+  function recoverGroupLedger() {
+    if ((!coordinate && !learning) || !groups || disposed) return
+    const delivered = learning ? [...store.groupEvidence(), ...store.resultNotices()] : []
     for (const session of store.rosterSessions()) {
-      if (session.closed || archived(session.workspaceId)) continue
+      if (archived(session.workspaceId)) continue
       try {
         const loaded = groups.loaded(session.id)
         const lines = loaded?.started ? loaded.ledger.all() : readGroupLedger(join(groups.paths(session).dir, GROUP_LEDGER_FILE))
-        queueEngagement(session, lines)
+        groupMemberLearning(session, lines, true, delivered.filter(result => result.sessionId === session.id))
+        if (coordinate && !session.closed) queueEngagement(session, lines)
       } catch { /* the ledger remains available to inspect and retry */ }
     }
-    runEngagement()
+    if (coordinate) runEngagement()
   }
 
   /** Files a group line links (inside the group's working directory), as the liaison reads them for its review. */
@@ -728,9 +829,11 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       const order = store.delegation(row.workspaceId, row.orderId)
       const session = store.session(row.workspaceId, row.sessionId)
       engine = await groupEngine(session)
-      const results = (row.group?.results ?? []).flatMap(seq => engine!.ledger.get(seq) ?? []).filter(line => line.kind !== 'event' && (line.workOrderId ?? row.orderId) === row.orderId)
+      const batch = (row.group?.results ?? []).flatMap(seq => engine!.ledger.get(seq) ?? []).filter(line => line.kind !== 'event' && (line.workOrderId ?? row.orderId) === row.orderId)
+      const trigger = batch[0]?.replyTo ?? batch[0]?.seq ?? 0
+      const results = engine.projectLiaisonHistory(batch, trigger, row.orderId)
       if (orderEnded(order) || order.paused || order.generation !== row.generation) outcome = {kind: 'skipped', reason: '工单已变更'}
-      else if (!results.length) outcome = {kind: 'failed', reason: '本批成果暂不可读，未能验收'}
+      else if (!results.length || results.length < batch.length) outcome = {kind: 'failed', reason: '本批成果部分来源需要主人核对，未能自动验收'}
       else {
         let original = order.promise
         try { if (order.hasOriginal) original = store.orderOriginal(order.workspaceId, order.id).text } catch { /* the promise stands in */ }
@@ -738,15 +841,18 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         const later = laterOwnerWords(messages, session, order.id, original)
         // What members of this order handed back before this batch (newest kept): already delivered, so not a gap.
         const first = Math.min(...results.map(line => line.seq))
-        const before = engine.ledger.all().filter(line => line.seq < first && line.kind === 'message' && line.workOrderId === order.id
-          && line.speakerId !== OWNER_ID && line.speakerId !== LIAISON_MEMBER_ID && line.speakerId !== HOST_ID).map(line => line.author + '：' + line.text.trim().slice(0, 600)).join('\n---\n')
+        const history = engine.projectLiaisonHistory(engine.ledger.all().filter(line => line.seq < first && line.kind === 'message' && line.workOrderId === order.id
+          && line.speakerId !== OWNER_ID && line.speakerId !== LIAISON_MEMBER_ID && line.speakerId !== HOST_ID), trigger, row.orderId)
+        const before = history.map(line => line.author + '：' + line.text.trim().slice(0, 600)).join('\n---\n')
         const earlier = before.length > ORIGINAL_LIMIT ? before.slice(-ORIGINAL_LIMIT) : before
         const evidence = {messages: results.map(line => ({id: lineId(line.seq), role: 'agent' as const, author: line.author, at: line.at, text: line.author + '：' + line.text})),
           attachments: groupFiles(session, results)}
         if (disposed) return
         const verdict = await review!({title: order.title, promise: order.promise, original: original.slice(0, ORIGINAL_LIMIT), ...(later && {later}), ...(earlier && {earlier}),
           results: resultSummary(evidence)}, AbortSignal.any([reviews.signal, AbortSignal.timeout(ACCEPTANCE_TIMEOUT_MS)]))
-        outcome = {kind: 'verdict', ...verdict}
+        const refs = [...history,...results].flatMap(line=>line.experienceRefs ?? [])
+        outcome = engine.canUseLiaisonExperience(refs,trigger,row.orderId) ?
+          {kind: 'verdict', ...verdict} : {kind:'skipped',reason:'本批成果的经验授权已变更'}
       }
     } catch (error) {
       if (disposed) return
@@ -755,6 +861,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     }
     if (disposed) return
     const {note} = store.finishAcceptance(row.turnId, outcome)
+    learnReview(row, outcome)
     if (outcome.kind === 'failed') {
       try {
         const order = store.delegation(row.workspaceId, row.orderId)
@@ -784,12 +891,15 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       catch { /* the order page and 「今天」 still show it */ }
     }
     if (row.pass) tell('done', order, turnId, '「' + order.title + '」已完成，接口人验收通过。打开工单查看成果。')
+    const originalRows = engine.ledger.all().filter(line => line.workOrderId === row.orderId && line.seq <= Math.max(...row.group?.results ?? []))
+    const trigger = originalRows.find(line => line.seq === row.group?.results[0])?.replyTo ?? row.group?.results[0] ?? 0
+    const experienceRefs = engine.projectLiaisonHistory(originalRows, trigger, row.orderId).flatMap(line=>line.experienceRefs ?? [])
     let line: GroupLine
     if (row.followUp === 'group') {
       engine.refreshMembers()
       const names = (row.group?.done ?? []).flatMap(id => engine.members().find(member => member.id === id)?.name ?? [])
-      line = engine.liaisonSay((names.length ? names.map(name => '@' + name).join(' ') + ' ' : '') + row.note, {workOrderId: row.orderId, ref: 'acceptance-' + turnId})
-    } else line = engine.note({speaker: 'liaison', text: row.note, workOrderId: row.orderId, ref: 'acceptance-' + turnId})
+      line = engine.liaisonSay((names.length ? names.map(name => '@' + name).join(' ') + ' ' : '') + row.note, {workOrderId: row.orderId, ref: 'acceptance-' + turnId, experienceRefs})
+    } else line = engine.note({speaker: 'liaison', text: row.note, workOrderId: row.orderId, ref: 'acceptance-' + turnId, experienceRefs})
     store.acceptancePosted(turnId, lineId(line.seq))
   }
   /** Held words the owner hands on in a group: the line already in the group calls whom it addresses (once, by request). */
@@ -1068,6 +1178,12 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     if (saved.completed) stopOrderWork(session.workspaceId, orderId, starts)
     postCommand(saved.requestId)
     const command = saved.command
+    if (learning && saved.completed) {
+      const evidence: ExperienceEvidence = {kind: 'owner-acceptance', id: saved.requestId, workspaceId: session.workspaceId,
+        sessionId: session.id, orderId, messageId: command.ownerMessageId, quote: text.slice(0, 1000)}
+      try { learning.observe({id: 'owner-acceptance:' + saved.requestId, workspaceId: session.workspaceId, sessionId: session.id,
+        orderId, kind: 'owner-accepted', summary: '主人确认结束工单。' + text, evidence: [evidence]}) } catch (error) { learningProblem?.(error) }
+    }
     return {outcome: command.outcome, ...(command.resolved && {resolved: command.resolved.kind})}
   }
   /**
@@ -1211,6 +1327,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     }
     if (disposed) return
     const {note, followUp} = store.finishAcceptance(row.turnId, outcome)
+    learnReview(row, outcome)
     if (outcome.kind === 'failed') {
       // Only a failure the order now shows (not one a newer verdict superseded) is the owner's to know.
       try {
@@ -1313,18 +1430,41 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     if (seg[1] === 'staff' || seg[1] === 'workspaces' && child === 'staff') {
       if (!staff || seg.length !== (seg[1] === 'staff' ? 2 : 4)) return workspaceError(404,'找不到幕僚操作')
       const local = seg[1] === 'staff' ? undefined : workspaceId
+      const sharedOnly = url.searchParams.get('experience') === 'shared'
       const impact = url.searchParams.get('impact')
-      if (local && method === 'GET' && url.searchParams.get('recipients') === '1') {
+      const recipients = url.searchParams.get('recipients') === '1'
+      if (sharedOnly && (impact || recipients)) return workspaceError(400,'请选择共同经验操作')
+      if (local && method === 'GET' && recipients) {
         return ok({workspaceId:local,members:staff.view(local).members.map(({id,name})=>({id,name}))})
       }
-      if (method === 'GET') return ok(impact ? {impact:staff.impact(impact,local)} : staff.view(local))
+      if (method === 'GET') {
+        const memoryId = url.searchParams.get('memory')
+        if (memoryId) {
+          const version = Number(url.searchParams.get('version'))
+          if (!Number.isSafeInteger(version) || version < 1) return workspaceError(400, '请选择有效的经验版本')
+          return ok({memory: staff.experienceVersion(local, memoryId, version, sharedOnly)})
+        }
+        return ok(impact ? {impact:staff.impact(impact,local)} : staff.view(local,sharedOnly))
+      }
       if (local) store.writable(local)
+      if (body.action === 'organize') {
+        if (!learning) return workspaceError(503, '经验整理服务暂不可用')
+        mutationKey(seg, body)
+        const organized = await learning.flush(local)
+        current()
+        groups?.refresh(local)
+        return ok({...staff.view(local,sharedOnly), organized})
+      }
+      if (sharedOnly && body.audience !== 'shared') return workspaceError(400,'请从幕僚页面管理专属经验')
+      if (['proposed','witnessedToken','evidence','observed','source','discoveredBy','dependencies'].some(key => body[key] !== undefined)) {
+        return workspaceError(400, '从经验页面手动保存时，来源为本人操作；请从原会话登记其他证据')
+      }
       if (body.orderId !== undefined) {
         if (!local || typeof body.orderId !== 'string') return workspaceError(400,'请选择本区原工单')
         const order = store.delegation(local,body.orderId)
-        if (order.staffId !== body.staffId) return workspaceError(409,'这张工单由其他人负责')
+        if (body.audience !== 'shared' && order.staffId !== body.staffId) return workspaceError(409,'这张工单由其他人负责')
       }
-      const applied = staff.apply(local,body)
+      const applied = staff.apply(local,body,sharedOnly)
       // Joining, leaving or a new duty or experience changes who is in the workspace's groups and what they know.
       groups?.refresh(local)
       return ok(applied)
@@ -1388,7 +1528,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
           for (const row of store.unpostedAcceptances()) if (row.workspaceId === workspaceId) post(row.turnId)
           for (const row of store.unpostedCommands()) if (row.workspaceId === workspaceId) postCommand(row.requestId)
           runAcceptances()
-          recoverEngagement()
+          recoverGroupLedger()
         }
         return ok(restored)
       }
@@ -1458,7 +1598,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
             if (closed) {
               groups?.loaded(session.id)?.stop()
               store.stopEngagement(session.id)
-            } else recoverEngagement()
+            } else recoverGroupLedger()
           }
           return ok(result)
         }
@@ -1675,6 +1815,9 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   }
   return Object.assign(route, { assign, follow, followup, notices, recover() {
     if (disposed) return
+    if (learning) for (const result of store.resultNotices()) {
+      if (result.messageId?.startsWith('g-') && !archived(result.workspaceId)) learnResult(result, true)
+    }
     // Turns a restart cut off: the owner hears it once, then the board forgets the mark.
     const interrupted = store.interruptedTurns()
     for (const row of interrupted) for (const orderId of row.orderIds) {
@@ -1694,7 +1837,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     // yet in their group are posted.
     if (groups) void groups.boot().then(() => postGroupStarts()).catch(() => { /* retried on the next start */ })
     runAcceptances()
-    recoverEngagement()
+    recoverGroupLedger()
   }, dispose() {
     disposed = true
     reviews.abort()

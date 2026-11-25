@@ -11,6 +11,18 @@ import { beforeDispatch, CodingTurnError, codingTurn, executable, processSummary
 import { dialogueKey, groupOutcome, ownerMessageId, WorkspaceGroups, type GroupMember } from './workspace-v2-group.ts'
 import { liaisonSpeakerId, workspaceSpeakerId } from './workspace-speaker-id.ts'
 import { checkProjectDirectory } from './project-directory.ts'
+import type { ExperienceRef, ExperienceSelection, WorkspaceExperiencePort } from '../core/workspace-experience.ts'
+import { experienceDelta, experienceHistory, experiencePrompt, experienceRevoked } from './workspace-group-members.ts'
+
+export interface CodingExperienceResult {
+  workspaceId: string
+  sessionId: string
+  orderId?: string
+  turnId: string
+  messages: {id: string; text: string}[]
+  commands: {itemId: string; command: string; exitCode: number; outputTail?: string}[]
+  recovered: boolean
+}
 
 interface Options {
   ctx: HostContext
@@ -19,6 +31,8 @@ interface Options {
   codex?: { executable: string; model?: string }
   claudeExecutable?: string
   staff?: StaffRunOptions
+  experience?: WorkspaceExperiencePort
+  onCodingResult?: (result: CodingExperienceResult) => void
   /** Command gate: installs the PreToolUse hook for each coding turn. Absent: tools run without hooks. */
   gate?: { open(turn: GateTurn, write: (line: GateLine) => void): GateLease }
   /** How long Codex has to confirm hook trust for a gated thread (default 5 s). */
@@ -28,6 +42,9 @@ interface Options {
 }
 interface Turn {
   staffToken?: string
+  experience?: ExperienceRef[]
+  experienceStaffId?: string
+  experienceTask?: string
   id: string; text: string; state: 'sent' | 'done' | 'unknown' | 'unsent'; workOrderId?: string | null; silent?: boolean; single?: boolean; deliveryIssue?: string; replyIds?: string[]
   /** Coding tool process of this turn; absent for group turns and older journals. */
   process?: V2TurnProcess
@@ -67,7 +84,7 @@ export function turnWords(input: Pick<V2TurnInput, 'text' | 'liaison'>): string 
 }
 /** A message as earlier history for a model: a relayed original stays with the liaison's words. */
 const spoken = ({author, text, quote}: V2Message) => ({author, text: quote ? text + '\n\n' + quote.label + '：\n' + quote.text : text})
-interface NativeSession { tool: CodingTool; sessionId: string; at: string }
+interface NativeSession { tool: CodingTool; sessionId: string; at: string; experience?: ExperienceRef[]; experienceSeen?: ExperienceRef[] }
 /** The title of a coding session in the owner's Codex / Claude Code history: 〈工作区名〉 · 〈会话名〉. */
 export function nativeSessionName(workspace: string | undefined, session: string): string {
   // One line in the tool's history: control characters and line breaks become spaces.
@@ -82,6 +99,9 @@ interface Journal {
   attachments: V2Attachment[]
   turns: Turn[]
   members: GroupMember[]
+  groupLead?: string
+  groupExperience?: ExperienceRef[]
+  groupExperienceTask?: string
   /** The first order may keep using the original working copy. Later orders have sibling directories. */
   workRootOrder?: string | null
   /**
@@ -277,6 +297,8 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
     const signal = AbortSignal.any([outer, shutdown.signal, control.signal, AbortSignal.timeout(CODING_TURN_LIMIT_MS)])
     const lead = groups.leadId(session.workspaceId, session.id)
     let group: Awaited<ReturnType<WorkspaceGroups['prepare']>> | undefined
+    let groupSelection: ExperienceSelection | undefined
+    let groupReopened = false
     let binary: string | undefined
     const job = input.context?.delegations.find(row => row.id === orderId && row.workspaceId === session.workspaceId && row.sessionId === session.id)
     const staff = job?.staffId ? prepareStaffRun(ctx,options.staff,session.workspaceId,job.staffId) : undefined
@@ -286,7 +308,23 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
     const subprocess = ctx.get('subprocess')
     try {
       if (staff) options.staff!.current(staff.member)
-      else if (session.kind === 'group' && session.executor === 'dsh') group = await groups.prepare(lead, location.work, session.title, signal, journal.members.some(m => m.id === lead))
+      else if (session.kind === 'group' && session.executor === 'dsh') {
+        const task = [job?.title, job?.promise, input.text].filter(Boolean).join('\n')
+        const purposeTask = input.liaison && input.liaison.handoff === undefined ? '' : input.text
+        groupSelection = options.experience?.selectExperience({workspaceId:session.workspaceId,task,purposeTask})
+        if (groupSelection && experienceRevoked(groupSelection, journal.groupExperience)) {
+          groupReopened = true
+          journal.groupLead = lead + '-' + randomUUID().slice(0,8)
+          journal.members = []
+          journal.groupExperience = []
+        }
+        const groupLead = journal.groupLead ?? lead
+        group = await groups.prepare(groupLead, location.work, session.title, signal, journal.members.some(m => m.id === groupLead))
+        if (groupSelection) {
+          journal.groupExperience = experienceHistory(journal.groupExperience, groupSelection.entries)
+          journal.groupExperienceTask = purposeTask
+        }
+      }
       else {
         if (session.kind !== 'coding' || session.executor === 'dsh') throw beforeDispatch('本场会话的来源类型不匹配。')
         binary = selectedBinary(session)
@@ -326,11 +364,12 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
     const existingReplies = new Set(journal.messages.filter(m => m.role === 'agent').map(m => m.id))
     // Words queued from a busy turn are already in the transcript; they are this turn's words, not earlier history.
     const own = new Set([userId, ...merged.map(row => ownerMessageId(lead, row.id))])
-    const earlier = journal.messages.filter(m => !own.has(m.id) && messageWorkOrder(session, m) === orderId).map(spoken)
+    const earlier = journal.messages.filter(m => !own.has(m.id) && messageWorkOrder(session, m) === orderId)
     if (old) journal.turns[journal.turns.indexOf(old)] = turn
     else journal.turns.push(turn)
-    if (group && !journal.members.length) journal.members.push({id: lead, name: 'lead'})
+    if (group && !journal.members.length) journal.members.push({id: group.lead.id, name: 'lead'})
     const live = new Map<string, CommandLine>()
+    let codingResult: CodingExperienceResult | undefined
     running.set(location.journal, live)
     try {
     const opening: V2Message = liaison ? {id: userId, role: 'agent', author: LIAISON_AUTHOR, speakerId: liaisonSpeakerId(lead), text: liaison.handoff ?? input.text,
@@ -372,10 +411,28 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
     try {
       const reportGuide = '实际提交纯文字工单结果时，第一行写「工单回报」或「阶段回报」，随后说明结果和仍未完成的事项。提问、计划和过程更新直接说。'
       const context = [contextText(input, orderId), orderId && reportGuide].filter(Boolean).join('\n')
+      const experience = options.experience
+      const ownerTask = merged.at(-1)?.text ?? (input.liaison && input.liaison.handoff === undefined ? '' : input.text)
+      const select = (task: string, staffId?: string, purposeTask = ownerTask): ExperienceSelection | undefined => experience?.selectExperience({
+        workspaceId: session.workspaceId, staffId,
+        task: [job?.title, job?.promise, task].filter(Boolean).join('\n'), purposeTask,
+        ...session.kind === 'coding' && !staffId && {domains: ['软件工程']},
+      })
+      const assertCurrent = (selection: ExperienceSelection | undefined, prior?: readonly ExperienceRef[]) => {
+        if (!selection || !experience) return
+        experience.assertExperienceCurrent(selection)
+        if (prior?.length && experienceRevoked(experience.selectExperience(selection.query), prior)) {
+          throw new Error('本轮使用的经验授权已变化。请从当前范围重新发起。')
+        }
+      }
+      const acceptsSupplement = (selection: ExperienceSelection | undefined, prior: readonly ExperienceRef[] | undefined, text: string) => {
+        if (!selection || !experience) return true
+        try {
+          const current = experience.selectExperience({...selection.query,purposeTask:text})
+          return !experienceRevoked(current,[...selection.entries,...prior ?? []])
+        } catch { return false }
+      }
       if (staff && job && options.staff) {
-        const authorized = new Set(journal.turns.filter(t=>t.workOrderId === job.id && t.state === 'done' && t.staffToken === staff.member.token)
-          .flatMap(t=>staffMessages(lead,t)))
-        const prior = journal.messages.filter(m=>authorized.has(m.id)).map(spoken)
         // One staff turn is one model call. Owner words stop the call and the same turn runs again with them. They count
         // as taken only once that answer is published; a failed rerun leaves them for the next turn.
         const added: V2Interjection[] = []
@@ -387,12 +444,27 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
           return 'pending'
         })
         let answer: Awaited<ReturnType<typeof staff.answer>> | undefined
+        let picked: ExperienceSelection | undefined, retained: ExperienceRef[] = []
         while (!answer) {
           const used = added.length
           const said = [words, ...added.map(row => OWNER_LABEL + row.text)].join('\n\n')
+          const selection = select(said, staff.member.staffId, added.at(-1)?.text ?? ownerTask)
+          const historical = journal.turns.filter(t => t.workOrderId === job.id && t.state === 'done' && t.staffToken === staff.member.token
+            && (!selection || t.experience && !experienceRevoked(selection, t.experience)))
+          const priorRefs = historical.reduce((all, row) => experienceHistory(all, row.experience), [] as ExperienceRef[])
+          const authorized = new Set(historical.flatMap(t=>staffMessages(lead,t)))
+          const prior = journal.messages.filter(m=>authorized.has(m.id)).map(spoken)
           try {
-            const result = await staff.answer(context,prior,said,AbortSignal.any([signal, attempt.signal]))
-            if (added.length === used) answer = result
+            assertCurrent(selection, priorRefs)
+            const result = await staff.answer(context,prior,said,AbortSignal.any([signal, attempt.signal]), selection, () => {
+              if (selection?.entries.length && experience) {
+                try { experience.recordExperienceDelivery(selection, {
+                  turnId: input.id, executorId: staff.member.staffId, sessionId: session.id, orderId: job.id,
+                }) } catch (error) { ctx.logger?.warn('具名幕僚的经验回执没记下：%s', String(error)) }
+              }
+              assertCurrent(selection, priorRefs)
+            })
+            if (added.length === used) { answer = result; picked = selection; retained = priorRefs }
           } catch (error) {
             if (signal.aborted || !attempt.signal.aborted) throw error
           }
@@ -402,91 +474,166 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
         const {reply,proposal} = answer
         signal.throwIfAborted()
         options.staff.current(staff.member)
-        options.staff.used(staff.member,job.id)
-        const derived = proposal && staff.member.memories.some(memory=>memory.shared)
-        if (proposal && !derived) options.staff.propose(staff.member,job.id,input.id,proposal)
+        assertCurrent(picked, retained)
+        if (picked) {
+          turn.experience = experienceHistory(retained, picked.entries)
+          turn.experienceStaffId = staff.member.staffId
+          turn.experienceTask = picked.query.purposeTask ?? ownerTask
+        }
+        else options.staff.used(staff.member,job.id)
+        const borrowed = new Set(staff.member.memories.filter(memory=>memory.shared).map(memory=>memory.id))
+        const derived = proposal && (picked
+          ? picked.entries.some(memory=>memory.shareId) || retained.some(memory=>borrowed.has(memory.id))
+          : borrowed.size > 0)
+        if (proposal && !derived) options.staff.propose(staff.member,job.id,input.id,proposal,picked)
         const output = derived ? reply + '\n\n本轮引用了可撤回的共享资料，经验建议仅保存在原工单。' : reply
         publish(journal,[{id:'m-'+dialogueKey(lead,input.id,staff.member.staffId).slice(0,32),role:'agent',author:staff.member.name,
           speakerId:workspaceSpeakerId(lead,'staff',staff.member.staffId),workOrderId:job.id,at:new Date().toISOString(),text:output}],location.work,true)
         for (const row of added) resolve(row.id, 'steered')
       } else if (group) {
         const instruction = '你在本工作区的具名讨论群中。需要协作者时使用本群原生团队工具，并让实际参与者自己发言。向群成员发送的文字会出现在群记录中。需要交付文件时，将全文放在 Markdown 围栏代码块里，首行写三个反引号、markdown、text 或 html，再写 title="文件名"。要引用本轮发言，可在消息开头单独写〔回复原话 "' + userId + '"〕。' + SPEAKER_GUIDE + '\n' + context
+        const selection = groupSelection
+        const behavior = selection && experiencePrompt(selection)
+        const recap = groupReopened && earlier.filter(message => message.speakerId === 'owner').slice(-12).map(spoken)
+        const ownerContext = recap && recap.length ? '同一工单此前的主人原话：\n' + JSON.stringify(recap) : ''
         const settled = new Map<string, boolean>()
         const root = group.lead.id
         // Read while the turn runs: the lead's answers after steered words belong to this turn's order as well.
         const orders = groupOrders(journal)
         steerWith(words => {
+          if (!acceptsSupplement(selection,journal.groupExperience,words.text)) return Promise.resolve('rejected')
           if (orderId) orders.set(words.id, orderId)
           return groups.steer(root, input.id, words.id, OWNER_LABEL + words.text)
         })
         try {
-          await groups.run(group.lead, group.teams, input.id, words, instruction, signal, (rows, members) => {
+          await groups.run(group.lead, group.teams, input.id, words, [instruction,behavior,ownerContext].filter(Boolean).join('\n\n'), signal, (rows, members) => {
             const changed = publish(journal, rows, location.work, true)
             if (changed || JSON.stringify(members) !== JSON.stringify(journal.members)) {
               journal.members = members
               save(location.journal, journal)
             }
-          }, orders, settled)
+          }, orders, settled, selection && {
+            canonical:lead,
+            validate: () => assertCurrent(selection,journal.groupExperience),
+            confirmed: nativeSessionId => {
+              if (!selection.entries.length || !experience) return
+              try { experience.recordExperienceDelivery(selection, {
+                turnId:input.id, executorId:nativeSessionId === root ? 'liaison' : nativeSessionId, sessionId:session.id, nativeSessionId, orderId,
+              }) } catch (error) { ctx.logger?.warn('原生讨论的经验回执没记下：%s', String(error)) }
+            },
+          })
         } finally {
           for (const [id, taken] of settled) resolve(id, taken ? 'steered' : 'missed')
         }
       } else {
         const tool: CodingTool = session.executor === 'codex' ? 'codex' : 'claude-code'
+        const selection = select(words)
+        // A thread continued with another directory would silently move there; each directory keeps its own session.
+        const nativeKey = project ?? (relative(root, workDir) || '.')
+        const known = journal.native?.[nativeKey]
+        const revoked = !!selection && experienceRevoked(selection, known?.experience)
+        const resumable = known?.tool === tool && !revoked ? known.sessionId : undefined
+        const invalidReplies = new Set(selection ? journal.turns.filter(row => experienceRevoked(selection,row.experience))
+          .flatMap(row => row.replyIds ?? []) : [])
+        const replayable = earlier.filter(message => message.speakerId === 'owner' || !revoked && !invalidReplies.has(message.id)).map(spoken)
         // A continued native session already holds the earlier conversation; only this turn is sent.
         const prompt = (replay: boolean) => [project
           ? '你在主人的项目目录中工作（就是当前工作目录），按项目自己的约定行事，不要在项目里另建 SuperHub 的文件。需要把文本、Markdown 或 HTML 文件交给主人查看时，用相对路径的 Markdown 链接附在回复中。' + SPEAKER_GUIDE
           : '你在独立的工作区会话中直接回复。交付本会话生成的文本、Markdown 或 HTML 文件时，用相对路径的 Markdown 链接附在回复中。' + SPEAKER_GUIDE,
-          context, replay && earlier.length ? '本场会话已公开的发言（按顺序，保留上下文）\n' + JSON.stringify(earlier) : '',
+          context, replay && replayable.length ? '本场会话已公开的发言（按顺序，保留上下文）\n' + JSON.stringify(replayable) : '',
           '本轮发言\n' + words].filter(Boolean).join('\n\n')
-        // A thread continued with another directory would silently move there; each directory keeps its own session.
-        const nativeKey = project ?? (relative(root, workDir) || '.')
-        const known = journal.native?.[nativeKey]
-        const resumable = known?.tool === tool ? known.sessionId : undefined
         turn.startedAt = new Date().toISOString()
         turn.cwd = workDir
         let steer: CodingSteer | undefined
-        steerWith(async said => steer ? steer(said.id, OWNER_LABEL + said.text) : 'rejected')
+        steerWith(async said => {
+          const previous = turn.resumed ? known?.experience : undefined
+          if (!acceptsSupplement(selection,previous,said.text)) return 'rejected'
+          assertCurrent(selection, previous)
+          return steer ? steer(said.id, OWNER_LABEL + said.text) : 'rejected'
+        })
         const settle = (result: CodingTurnResult | undefined) => {
           for (const row of result?.interjections ?? []) resolve(row.id, row.delivered ? 'steered' : 'missed')
           steer = undefined
         }
-        const run = (resume?: string) => codingTurn(subprocess!, tool, binary!, workDir, prompt(!resume), signal, {
-          launch: {model: tool === 'codex' ? options.codex?.model : undefined, ...(resume && {resume}), ...(lease && {extraArgs: lease.args}),
-            name: nativeSessionName(input.context?.workspace.name, session.title)},
-          ...(lease && {env: lease.env}),
-          ...(lease && tool === 'codex' && {gate: lease, ...(options.codexTrustWaitMs !== undefined && {trustWaitMs: options.codexTrustWaitMs})}),
-          onSteerable: handle => { steer = handle },
-          publish: (item, text) => {
-            signal.throwIfAborted()
-            const row: V2Message = {id: 'm-' + dialogueKey(lead, input.id, item).slice(0, 32), role: 'agent', author: tool === 'codex' ? 'Codex' : 'Claude Code',
-              speakerId: workspaceSpeakerId(lead, 'executor', tool),
-              at: new Date().toISOString(), text, ...(orderId && {workOrderId:orderId})}
-            if (publish(journal, [row], workDir)) save(location.journal, journal)
-          },
-          onSession: sessionId => {
+        const results: CodingExperienceResult['commands'] = []
+        let revokedDuringRun = false
+        const run = (resume?: string) => {
+          const history = resume ? known?.experience : undefined
+          if (selection) turn.experience = experienceHistory(history, selection.entries)
+          const seen = resume ? known?.experienceSeen : undefined
+          const sent = selection ? experienceDelta(selection, seen) : []
+          const current = () => {
+            try { assertCurrent(selection, history) }
+            catch { revokedDuringRun = true; throw new Error('编程工具使用的经验授权已变化，请在当前范围重新发起。') }
+          }
+          let nativeSession: string | undefined, submitting = false
+          const saveBinding = (sessionId: string, taken = false) => {
             if (signal.aborted) return
             turn.nativeSessionId = sessionId
-            journal.native = {...journal.native, [nativeKey]: {tool, sessionId, at: new Date().toISOString()}}
+            journal.native = {...journal.native, [nativeKey]: {tool, sessionId, at: new Date().toISOString(),
+              ...selection && {experience: experienceHistory(history, submitting ? sent : []),
+                experienceSeen: experienceHistory(seen, taken ? sent : [])}}}
             save(location.journal, journal)
-          },
-          onCommand: event => {
-            const id = 'c-' + dialogueKey(lead, input.id, event.itemId).slice(0, 32)
-            const at = new Date().toISOString()
-            const row: CommandLine = live.get(id) ?? {kind: 'command', id, itemId: event.itemId, turnId: input.id, workOrderId: orderId ?? null, at,
-              tool: event.tool, command: event.command, cwd: workDir}
-            if (event.phase === 'start') { live.set(id, row); return }
-            live.delete(id)
-            appendCommandLog(location.commands, {...row, endedAt: at, ...(event.exitCode !== undefined && {exitCode: event.exitCode}),
-              ...(event.failed && {failed: true}), ...(event.outputTail && {outputTail: event.outputTail}), ...(event.unmatched && {unmatched: true})})
-          },
-        })
+          }
+          const body = prompt(!resume)
+          return codingTurn(subprocess!, tool, binary!, workDir, selection ? experiencePrompt(selection, sent) + '\n\n' + body : body, signal, {
+            launch: {model: tool === 'codex' ? options.codex?.model : undefined, ...(resume && {resume}), ...(lease && {extraArgs: lease.args}),
+              name: nativeSessionName(input.context?.workspace.name, session.title)},
+            ...(lease && {env: lease.env}),
+            ...(lease && tool === 'codex' && {gate: lease, ...(options.codexTrustWaitMs !== undefined && {trustWaitMs: options.codexTrustWaitMs})}),
+            onSteerable: handle => { steer = handle },
+            beforeInput: () => {
+              current()
+              submitting = true
+              if (nativeSession && selection) saveBinding(nativeSession)
+            },
+            onInputAccepted: nativeSessionId => {
+              if (selection) saveBinding(nativeSessionId, true)
+              if (selection?.entries.length && experience) {
+                try {
+                  experience.recordExperienceDelivery(selection, {turnId: input.id, executorId:tool, sessionId:session.id, nativeSessionId, orderId})
+                } catch (error) { ctx.logger.warn('编程工具的经验回执没记下：%s', String(error)) }
+              }
+              current()
+            },
+            publish: (item, text) => {
+              signal.throwIfAborted()
+              current()
+              const row: V2Message = {id: 'm-' + dialogueKey(lead, input.id, item).slice(0, 32), role: 'agent', author: tool === 'codex' ? 'Codex' : 'Claude Code',
+                speakerId: workspaceSpeakerId(lead, 'executor', tool),
+                at: new Date().toISOString(), text, ...(orderId && {workOrderId:orderId})}
+              if (publish(journal, [row], workDir)) {
+                if (selection) (turn.replyIds ??= []).push(row.id)
+                save(location.journal, journal)
+              }
+            },
+            onSession: sessionId => {
+              nativeSession = sessionId
+              saveBinding(sessionId)
+            },
+            onCommand: event => {
+              current()
+              const id = 'c-' + dialogueKey(lead, input.id, event.itemId).slice(0, 32)
+              const at = new Date().toISOString()
+              const row: CommandLine = live.get(id) ?? {kind: 'command', id, itemId: event.itemId, turnId: input.id, workOrderId: orderId ?? null, at,
+                tool: event.tool, command: event.command, cwd: workDir}
+              if (event.phase === 'start') { live.set(id, row); return }
+              live.delete(id)
+              appendCommandLog(location.commands, {...row, endedAt: at, ...(event.exitCode !== undefined && {exitCode: event.exitCode}),
+                ...(event.failed && {failed: true}), ...(event.outputTail && {outputTail: event.outputTail}), ...(event.unmatched && {unmatched: true})})
+              if (event.command && typeof event.exitCode === 'number' && !event.unmatched) {
+                results.push({itemId:row.id, command:event.command, exitCode:event.exitCode, outputTail:event.outputTail})
+              }
+            },
+          }).then(result => { current(); return result })
+        }
         let result: CodingTurnResult
         if (resumable) turn.resumed = resumable
         try { result = await run(resumable) }
         catch (error) {
           settle(error instanceof CodingTurnError ? error.result : undefined)
           // Only a continuation that never reached the model is retried, as a new session with the public history.
-          if (!resumable || !(error instanceof CodingTurnError) || error.result.started || signal.aborted) throw error
+          if (!resumable || revokedDuringRun || !(error instanceof CodingTurnError) || error.result.started || signal.aborted) throw error
           turn.resumeFailure = processSummary(error.result.process)
           delete turn.resumed
           if (journal.native?.[nativeKey]?.sessionId === resumable) delete journal.native[nativeKey]
@@ -498,12 +645,16 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
         turn.process = result.process
         if (result.model) turn.model = result.model
         turn.endedAt = new Date().toISOString()
+        const earlierFailure = journal.turns.slice(0, journal.turns.indexOf(turn)).findLast(row => row.workOrderId === turn.workOrderId)
+        codingResult = {workspaceId:session.workspaceId, sessionId:session.id, orderId, turnId:input.id,
+          messages:[], commands:results, recovered:earlierFailure?.state === 'unknown'}
       }
       signal.throwIfAborted()
       turn.state = 'done'
       // Liaison notes posted meanwhile (acceptance verdicts) are not the executor's answer.
       const replies = journal.messages.filter(m => m.role === 'agent' && m.id !== userId && !existingReplies.has(m.id) && m.speakerId !== liaisonSpeakerId(lead))
       turn.replyIds = replies.map(message => message.id)
+      if (codingResult) codingResult.messages = replies.map(({id,text}) => ({id,text}))
       turn.silent = replies.length === 0
       turn.single = !staff && !group && replies.length === 1
     } catch (error) {
@@ -539,6 +690,10 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
       entry.steer = undefined
       if (!shutdown.signal.aborted) save(location.journal, journal)
     }
+    if (turn.state === 'done' && codingResult && !shutdown.signal.aborted) {
+      try { options.onCodingResult?.(codingResult) }
+      catch (error) { ctx.logger.warn('编程回合的经验材料没记下：%s', String(error)) }
+    }
     } finally {
       entry.steer = undefined
       lease?.close()
@@ -552,13 +707,19 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
   async function refreshGroup(session: V2Session, location: SessionFiles) {
     const stored = load(location.journal)
     if (!stored.members.length || pending.has(location.journal) || !ctx.get('sessionQuery')) return
-    const lead = groups.leadId(session.workspaceId, session.id)
+    const canonical = groups.leadId(session.workspaceId, session.id)
+    const lead = stored.groupLead ?? canonical
+    const authorized = () => !stored.groupExperience?.length || !options.experience || !experienceRevoked(options.experience.selectExperience({
+      workspaceId:session.workspaceId, task:stored.groupExperienceTask ?? '',
+    }), stored.groupExperience)
+    if (!authorized()) return
     const idle = groups.idleMembers(lead, location.work)
     const members = idle || stored.members
-    const {messages,events} = await groups.observe(lead, members, AbortSignal.any([shutdown.signal, AbortSignal.timeout(2000)]), groupOrders(stored))
+    const {messages,events} = await groups.observe(lead, members, AbortSignal.any([shutdown.signal, AbortSignal.timeout(2000)]), groupOrders(stored), canonical)
     shutdown.signal.throwIfAborted()
-    if (pending.has(location.journal)) return
+    if (pending.has(location.journal) || !authorized()) return
     const current = load(location.journal)
+    if (stored.groupLead !== current.groupLead) return
     let changed = publish(current, messages, location.work, true)
     if (idle && JSON.stringify(idle) === JSON.stringify(groups.idleMembers(lead, location.work))) {
       if (JSON.stringify(current.members) !== JSON.stringify(idle)) { current.members = idle; changed = true }
@@ -572,7 +733,14 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
     staffSources(session,orderId,token) {
       const journal = load(files(session).journal)
       const lead = groups.leadId(session.workspaceId,session.id)
-      return new Set(journal.turns.filter(t=>t.state === 'done' && t.workOrderId===orderId && t.staffToken===token)
+      const current = (turn: Turn) => {
+        if (!options.experience || !turn.experience?.length) return true
+        try {
+          return !experienceRevoked(options.experience.selectExperience({workspaceId:session.workspaceId,
+            task:turn.experienceTask ?? turn.text, staffId:turn.experienceStaffId}), turn.experience)
+        } catch { return false }
+      }
+      return new Set(journal.turns.filter(t=>t.state === 'done' && t.workOrderId===orderId && t.staffToken===token && current(t))
         .flatMap(t=>staffMessages(lead,t)))
     },
     workDirectory(session, workOrderId) {

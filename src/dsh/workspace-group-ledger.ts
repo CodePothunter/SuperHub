@@ -11,6 +11,7 @@
 import { closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, unlinkSync, writeFileSync, writeSync, constants } from 'node:fs'
 import { join } from 'node:path'
 import { isChatInputAttachment, type ChatInputAttachment } from '../core/chat-attachments.ts'
+import type { ExperienceRef } from '../core/workspace-experience.ts'
 
 export const GROUP_LEDGER_FILE = 'ledger.jsonl'
 export const GROUP_SEEN_FILE = 'seen.json'
@@ -53,8 +54,21 @@ export interface GroupLine {
   requestId?: string
   /** A completed member turn the liaison must account for, replayable from the ledger. */
   engagement?: { callId: string; triggerSeq: number; generation?: number; answerTo?: string; memberId?: string; by?: string }
+  /** Host attribution for posted member replies, including in groups without a coordinator. */
+  memberCallId?: string
+  /** The reply is the substantive result of a normally completed call. */
+  memberCompleted?: true
+  /** Versions whose content may have influenced this line. An empty array is a checked, unrestricted line. */
+  experienceRefs?: ExperienceRef[]
 }
 export type GroupLineInput = Omit<GroupLine, 'seq' | 'at' | 'mentions'> & { mentions?: string[] }
+
+export function memberCompletionEvidenceId(sessionId: string, line: GroupLine, formalDelivery = false) {
+  const completed = line.memberCallId ? line.memberCompleted : line.engagement?.memberId === line.speakerId && !!line.engagement.callId
+  if (line.ref === undefined && line.text.trim() && (line.kind === 'message' && completed || formalDelivery && line.kind !== 'event')) {
+    return `group-member:${sessionId}:${line.seq}:${line.speakerId}`
+  }
+}
 
 /** 调度器只依赖这一个写入口。 */
 export interface GroupSay { say(line: GroupLineInput): GroupLine }
@@ -76,6 +90,11 @@ function validEngagement(value: unknown): boolean {
   return typeof row.callId === 'string' && row.triggerSeq !== undefined && optionalSeq(row.triggerSeq) && optionalSeq(row.generation) && optionalString(row.answerTo) && optionalString(row.memberId) && optionalString(row.by)
 }
 
+function validExperienceRefs(value: unknown): boolean {
+  return value === undefined || Array.isArray(value) && value.every(item => item && typeof item.id === 'string'
+    && Number.isSafeInteger(item.version) && item.version > 0)
+}
+
 /** 账本里的一行是否完整可用；读不出的行（撕裂的半行、被手改坏的行）一律跳过。 */
 function validLine(value: unknown): value is GroupLine {
   if (!value || typeof value !== 'object') return false
@@ -85,6 +104,9 @@ function validLine(value: unknown): value is GroupLine {
     && typeof line.speakerId === 'string' && line.speakerId !== '' && typeof line.author === 'string' && typeof line.text === 'string'
     && Array.isArray(line.mentions) && line.mentions.every(id => typeof id === 'string')
     && optionalSeq(line.replyTo) && optionalString(line.workOrderId) && optionalString(line.batchId) && optionalString(line.event) && validEngagement(line.engagement)
+    && optionalString(line.memberCallId)
+    && (line.memberCompleted === undefined || line.memberCompleted === true && line.kind === 'message' && !!line.memberCallId)
+    && validExperienceRefs(line.experienceRefs)
     && (line.all === undefined || line.all === true) && optionalString(line.ref) && optionalString(line.requestId)
     && (line.inputAttachments === undefined || Array.isArray(line.inputAttachments) && line.inputAttachments.every(isChatInputAttachment))
     && (line.quote === undefined || (!!line.quote && typeof line.quote === 'object' && typeof (line.quote as {label?: unknown}).label === 'string'
@@ -174,6 +196,9 @@ export class GroupLedger implements GroupSay {
       ...input.ref !== undefined && { ref: input.ref },
       ...input.requestId !== undefined && { requestId: input.requestId },
       ...input.engagement && { engagement: { ...input.engagement } },
+      ...input.memberCallId && { memberCallId: input.memberCallId },
+      ...input.memberCompleted && { memberCompleted: input.memberCompleted },
+      ...input.experienceRefs && { experienceRefs: input.experienceRefs.map(ref => ({...ref})) },
     }
     if (!validLine(line)) throw new Error('群账本的行格式不对。')
     mkdirSync(this.dir, { recursive: true })

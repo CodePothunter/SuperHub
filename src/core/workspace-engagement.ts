@@ -1,3 +1,5 @@
+import type { ExperienceRef } from './workspace-experience.ts'
+
 /** One pending request for the owner, linked to its original group message. */
 export interface OwnerAction {
   id: string
@@ -66,6 +68,8 @@ export interface EngagementDecision {
   report?: string
   sourceSeq?: number
   evidenceSeqs?: number[]
+  /** The host stamps versions that informed a durable handoff. */
+  experienceRefs?: ExperienceRef[]
 }
 
 export type EngagementCoordinator = (input: EngagementInput, signal: AbortSignal) => Promise<EngagementDecision>

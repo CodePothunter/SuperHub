@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { V2Session, V2TurnInput } from '../src/core/workspace-v2.ts'
+import type { ExperienceEntry, WorkspaceExperiencePort } from '../src/core/workspace-experience.ts'
 import type { Agent, HostContext, NativeTeamMember, SessionEventLike, StepDecision } from '../src/dsh/ports.ts'
 import { turnWords, createV2DialogueSource } from '../src/dsh/workspace-v2-dialogue.ts'
 import { dialogueKey, groupSpeech, ownerMessageId } from '../src/dsh/workspace-v2-group.ts'
@@ -25,8 +26,9 @@ const codexDone = {type:'turn.completed',usage:{input_tokens:12,output_tokens:8}
 const options = (ctx: HostContext, root: string) => ({ctx,root,scope:'brain-a',codex:{executable:process.execPath,model:'configured-model'},claudeExecutable:process.execPath})
 
 function nativeHost(blocked = false, joining?: 'delayed' | 'broken' | 'foreign') {
-  const members = new Map<string, {agent: Agent; name:string; log:SessionEventLike[]; inherited:number}>()
+  const members = new Map<string, {agent: Agent; name:string; log:SessionEventLike[]; inherited:number; parentSession?: string}>()
   const listeners = new Set<(event:{agent: Agent})=>void>()
+  const sessionEvents = new Set<(session:{id:string},event:SessionEventLike)=>void>()
   type Guard = (call:{name:string;agent:Agent}) => string | undefined
   const guards = new Set<Guard>(), local = new Map<string,Guard>()
   const sections = new Map<string,()=>string>()
@@ -46,7 +48,7 @@ function nativeHost(blocked = false, joining?: 'delayed' | 'broken' | 'foreign')
         return ()=>{}
       }) as NonNullable<NonNullable<Agent['ctx']>['tools']>['restrict'],guard:fn=>{local.set(id,fn);return ()=>{}}}
     }}
-    members.set(id,{agent,name,log,inherited:0})
+    members.set(id,{agent,name,log,inherited:0,parentSession})
     for(const notify of listeners) notify({agent})
     return agent
   }
@@ -55,7 +57,8 @@ function nativeHost(blocked = false, joining?: 'delayed' | 'broken' | 'foreign')
       id:leadId,role:a.id===leadId?'lead':'teammate',name:members.get(a.id)!.name} : undefined,
     listMembers: () => {
       provisioning = (joining === 'delayed' || joining === 'foreign') && members.has('native-teammate') && joiningPolls++ === 0
-      return Array.from(members.values(),({agent,name}):NativeTeamMember=>({id:agent.id,name,role:agent.id===leadId?'lead':'teammate',
+      return Array.from(members.values()).filter(({agent,parentSession}) => agent.id === leadId || parentSession === leadId)
+        .map(({agent,name}):NativeTeamMember=>({id:agent.id,name,role:agent.id===leadId?'lead':'teammate',
         status:agent.id !== leadId && provisioning ? 'provisioning' : 'inactive',diagnostics:[]}))
     }
   }
@@ -63,7 +66,9 @@ function nativeHost(blocked = false, joining?: 'delayed' | 'broken' | 'foreign')
   const append = (id:string,type:string,data:unknown) => {
     const {log}=members.get(id)!
     clock = Math.max(Date.now(), clock + 1)
-    log.push({seq:log.length+1,type,data,time:clock})
+    const event = {seq:log.length+1,type,data,time:clock}
+    log.push(event)
+    for (const listener of sessionEvents) listener({id},event)
   }
   const ctx = {
     get:(name:string) => {
@@ -82,6 +87,11 @@ function nativeHost(blocked = false, joining?: 'delayed' | 'broken' | 'foreign')
     tools:{guard:(fn:Guard)=>{guards.add(fn);return ()=>guards.delete(fn)}},
     on:(event:string,fn:(event:{agent:Agent})=>void)=>{
       if (event === 'agent/pre-step') { step = fn as unknown as PreStep; return ()=>{step=undefined} }
+      if (event === 'session/event') {
+        const listener = fn as unknown as (session:{id:string},event:SessionEventLike)=>void
+        sessionEvents.add(listener)
+        return ()=>sessionEvents.delete(listener)
+      }
       listeners.add(fn)
       return ()=>listeners.delete(fn)
     },
@@ -115,6 +125,7 @@ function nativeHost(blocked = false, joining?: 'delayed' | 'broken' | 'foreign')
         append(leadId,'user/message',owner)
         if (blocked) return {accepted:true}
         const worker = add('native-teammate','researcher',leadId)
+        sections.get(worker.id)?.()
         append(worker.id,'user/message',{id:'inherited',source:{kind:'agent-message',senderSessionId:leadId},content:[text('inherited private')]})
         members.get(worker.id)!.inherited=1
         const reply = {id:'native-relay',source:{kind:'agent-message',form:'relay',senderSessionId:worker.id},content:[text('Team message from researcher:'),text('我已核对原文。')]}
@@ -136,6 +147,35 @@ function nativeHost(blocked = false, joining?: 'delayed' | 'broken' | 'foreign')
 }
 
 describe('workspace-bound native dialogue sources', () => {
+  it('legacy workgroup rotates the native discussion while preserving the canonical owner-message identities', async () => {
+    const root = temp(), host = nativeHost()
+    const group: V2Session = {...session,kind:'group',executor:'dsh'}
+    let active: ExperienceEntry[] = [{id:'notes',version:1,text:'先做旧版笔记'}]
+    const recordExperienceDelivery = vi.fn()
+    const experience: WorkspaceExperiencePort = {
+      selectExperience:query=>({query,scope:'brain-a',authority:'v1',entries:active,authorized:active}),
+      assertExperienceCurrent:()=>{},
+      recordExperienceDelivery,
+    }
+    const source = createV2DialogueSource({...options(host.ctx,root),experience})
+    await source.send(group,turn,signal())
+    const first = host.facts
+    expect(first.narrow).toContain(active[0]!.text)
+    expect(recordExperienceDelivery).toHaveBeenCalledTimes(2)
+    active = [{id:'notes',version:2,text:'采用新版笔记'}]
+    const next = {...turn,id:'two',text:'这次仍要整理纪要'}
+    await source.send(group,next,signal())
+    expect(host.facts.leadId).not.toBe(first.leadId)
+    expect(host.facts.narrow).toContain(active[0]!.text)
+    expect(host.facts.narrow).not.toContain('旧版笔记')
+    const messages = (await source.read(group)).messages.filter(m=>m.role==='user')
+    expect(messages.map(m=>[m.id,m.text])).toEqual([
+      [ownerMessageId(first.leadId,turn.id),turn.text],
+      [ownerMessageId(first.leadId,next.id),next.text],
+    ])
+    source.dispose()
+  })
+
   it('publishes only explicit coding speech and immutable scoped files, retaining both sides and narrowed context across restart', async () => {
     const root = temp(), outside = join(root,'other.md')
     writeFileSync(outside, 'other-workspace')

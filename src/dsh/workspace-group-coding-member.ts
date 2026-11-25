@@ -16,7 +16,7 @@ import type { CodingGate, GateLease } from './coding-gate.ts'
 import type { Logger, Subprocess } from './ports.ts'
 import { appendCommandLog, type CommandLine } from './workspace-command-log.ts'
 import { codingTurn, CodingTurnError, processSummary, type CodingInput, type CodingSteer, type CodingTool } from './workspace-v2-coding.ts'
-import { memberInputs, memoriesRevoked, seenMemories, type MemberCall, type MemberCallSink, type MemberInputs, type MemberReattach, type MemberRunner, type MemberSteer, type MemberWords } from './workspace-group-members.ts'
+import { experienceDelta, experienceHistory, experiencePrompt, experienceRevoked, memberInputs, memoriesRevoked, seenMemories, type MemberCall, type MemberCallSink, type MemberInputs, type MemberReattach, type MemberRunner, type MemberSteer, type MemberWords } from './workspace-group-members.ts'
 
 /** 一次被叫最长跑多久（与编程会话的单轮上限相同）。 */
 export const MEMBER_TURN_LIMIT_MS = 4 * 60 * 60_000
@@ -128,7 +128,7 @@ export class CodingMemberRunner implements MemberRunner {
   }
 
   /**
-   * 跑一次推送。兑现于工具接下这句话（Codex `turn/start` 成功、Claude Code 写入首条消息）；之前失败就拒绝，
+   * 跑一次推送。兑现于工具接下这句话（Codex `turn/start` 成功、Claude Code 认领或实际处理首条消息）；之前失败就拒绝，
    * 不报 `finished`。之后的结局都经 `finished` 报回。
    */
   private push(run: Run, text: string, first: boolean): Promise<void> {
@@ -139,7 +139,9 @@ export class CodingMemberRunner implements MemberRunner {
     run.active = true
     run.pending = undefined
     run.steer = undefined
-    void this.turn(run, text, first, accept).then(outcome => {
+    void this.turn(run, text, first, accept).catch((error: unknown) => ({
+      status: 'failed' as const, text: '', detail: error instanceof Error ? error.message : String(error),
+    })).then(outcome => {
       run.active = false
       run.steer = undefined
       if (!accepted) {
@@ -167,13 +169,20 @@ export class CodingMemberRunner implements MemberRunner {
     const subprocess = this.options.subprocess(), binary = this.options.executable()
     if (!subprocess || !binary) return { status: 'failed', text: '', detail: `当前宿主没有可用的 ${label(tool)}` }
     const known = call.group.sessions.native(call.member.id, call.workOrderId)
+    const access = call.group.experience
+    const selection = access && call.experience && (first ? call.experience
+      : access.selectExperience({...call.experience.query, task: call.experience.query.task + '\n' + text,
+        purposeTask: call.experience.query.purposeTask ?? call.experience.query.task}))
     // A revoked experience is still in the thread's opening words: start a new thread (with the recent lines) instead.
-    const resumable = known?.kind === tool && known.cwd === call.group.workDir && !memoriesRevoked(known, call.member) ? known.session : undefined
+    const revoked = selection ? !!known?.memories?.length || experienceRevoked(selection, known?.experience) : memoriesRevoked(known, call.member)
+    const ownerReplayOnly = !!selection && (revoked || known?.ownerReplayOnly === true)
+    const resumable = known?.kind === tool && known.cwd === call.group.workDir && !revoked ? known.session : undefined
     const opening = (body: string) => [call.identity, body].filter(Boolean).join('\n\n')
     const commands = new Map<string, CommandLine>()
     const turnId = `${call.callId}.${run.push}`
     const who = { memberId: call.member.id, memberName: call.member.name }
-    const attempt = async (resume: string | undefined, prompt: string, materials?: MemberInputs) => {
+    let invalid = false
+    const attempt = async (resume: string | undefined, body: string, materials?: MemberInputs) => {
       let lease: GateLease | undefined
       try {
         lease = this.options.gate?.open({ workspaceId: call.group.workspaceId, sessionId: call.group.groupId, ...call.workOrderId && { orderId: call.workOrderId },
@@ -186,27 +195,71 @@ export class CodingMemberRunner implements MemberRunner {
       try {
         const signal = AbortSignal.any([run.controller.signal, AbortSignal.timeout(MEMBER_TURN_LIMIT_MS)])
         const inputs = await this.inputs(materials, signal)
+        const history = resume ? known?.experience : undefined
+        const seen = resume ? known?.experienceSeen : undefined
+        const sent = selection ? experienceDelta(selection, seen) : []
+        const prompt = selection ? experiencePrompt(selection, sent) + '\n\n' + body : body
+        let currentSession: string | undefined, submitting = false
+        const current = () => {
+          if (!selection || !access) return
+          try {
+            access.assertExperienceCurrent(selection)
+            if (experienceRevoked(access.selectExperience(selection.query), history)) throw new Error('群成员的经验授权已变化，请重新叫这位成员。')
+          } catch {
+            invalid = true
+            throw new Error('群成员的经验授权已变化，请重新叫这位成员。')
+          }
+        }
+        const rememberBinding = (session: string, taken = false) => {
+          if (run.controller.signal.aborted) return
+          call.group.sessions.setMember(call.member.id, { kind: tool, cwd: call.group.workDir, session, workOrderId: call.workOrderId,
+            ...((inputs?.length || run.scoped) && {inputScoped: true}),
+            ...ownerReplayOnly && {ownerReplayOnly:true},
+            ...(selection ? {experience: experienceHistory(history, submitting ? sent : []),
+              experienceSeen: experienceHistory(seen, taken ? sent : [])}
+              : {memories: seenMemories(known, call.member, session !== resumable)}) })
+        }
         return await codingTurn(subprocess, tool, binary, call.group.workDir, prompt, signal, {
           inputAttachments: inputs,
           launch: { ...tool === 'codex' && this.options.model && { model: this.options.model }, ...resume && { resume }, ...lease && { extraArgs: lease.args },
             name: [call.group.workspaceName, call.group.title, call.member.name].filter(Boolean).join(' · ') },
           ...lease && { env: lease.env },
           ...lease && tool === 'codex' && { gate: lease, ...this.options.trustWaitMs !== undefined && { trustWaitMs: this.options.trustWaitMs } },
-          onSteerable: steer => { run.steer = steer; accept() },
+          onSteerable: steer => {
+            run.steer = (id, words, files) => { current(); return steer(id, words, files) }
+            if (!selection) accept()
+          },
+          beforeInput: () => {
+            current()
+            submitting = true
+            if (currentSession && selection) rememberBinding(currentSession)
+          },
           onSession: session => {
-            if (run.controller.signal.aborted) return
-            try { call.group.sessions.setMember(call.member.id, { kind: tool, cwd: call.group.workDir, session, workOrderId: call.workOrderId,
-              ...((inputs?.length || run.scoped) && {inputScoped: true}), memories: seenMemories(known, call.member, session !== resumable) }) }
+            currentSession = session
+            try { rememberBinding(session) }
             catch (error) { this.options.logger?.warn('群成员 %s 的原生会话没记下：%s', call.member.name, String(error)) }
+          },
+          onInputAccepted: session => {
+            if (selection) rememberBinding(session, true)
+            accept()
+            if (selection?.entries.length && access) {
+              try { access.recordExperienceDelivery(selection, {
+                turnId, executorId: call.member.id, sessionId: call.group.groupId, nativeSessionId: session, orderId: call.workOrderId,
+              }) }
+              catch (error) { this.options.logger?.warn('群成员 %s 的经验回执没记下：%s', call.member.name, String(error)) }
+            }
+            current()
           },
           publish: (_item, said) => {
             if (!run.active) return
+            current()
             sink.touched(call.callId)
             if (run.pending !== undefined) sink.stepped(call.callId, run.pending)
             run.pending = said
           },
           onCommand: event => {
             if (!run.active) return
+            current()
             sink.touched(call.callId)
             const id = 'c-' + randomUUID()
             if (event.phase === 'start') {
@@ -223,7 +276,7 @@ export class CodingMemberRunner implements MemberRunner {
             this.log(call, { ...row, endedAt: new Date().toISOString(), ...event.exitCode !== undefined && { exitCode: event.exitCode },
               ...event.failed && { failed: true }, ...event.outputTail && { outputTail: event.outputTail }, ...event.unmatched && { unmatched: true } })
           },
-        })
+        }).then(result => { current(); return result })
       } finally {
         lease?.close()
         for (const row of commands.values()) this.log(call, { ...row, unfinished: true })
@@ -233,15 +286,17 @@ export class CodingMemberRunner implements MemberRunner {
     try {
       try {
         const recap = !resumable && first
-        await attempt(resumable, resumable ? text : opening(recap ? call.recap?.() ?? text : text),
-          recap ? call.recapInputs ?? call : first ? call : undefined)
+        if (revoked && selection && !first) throw new Error('群成员的经验授权已变化，请重新叫这位成员。')
+        await attempt(resumable, resumable ? text : opening(recap ? call.recap?.(ownerReplayOnly) ?? text : text),
+          recap ? ownerReplayOnly ? call.ownerRecapInputs ?? {} : call.recapInputs ?? call : first ? call : undefined)
       } catch (error) {
         // Only a continuation that never reached the model starts over, as a new session with the recent lines.
-        if (!resumable || !(error instanceof CodingTurnError) || error.result.started || run.controller.signal.aborted) throw error
+        if (!resumable || invalid || !(error instanceof CodingTurnError) || error.result.started || run.controller.signal.aborted) throw error
         this.options.logger?.warn('群成员 %s 的 %s 会话续接失败，改开新会话：%s', call.member.name, label(tool), processSummary(error.result.process))
         run.pending = undefined
-        const history = [call.recap?.() ?? text, ...(run.extraInputs ?? []).map(words => words.text)].join('\n\n')
-        const recap = call.recapInputs ?? call, extra = run.extraInputs ?? []
+        const history = [call.recap?.(ownerReplayOnly) ?? text, ...(run.extraInputs ?? []).map(words => words.text)].join('\n\n')
+        const recap = ownerReplayOnly ? call.ownerRecapInputs ?? {} : call.recapInputs ?? call
+        const extra = run.extraInputs ?? []
         const refs = new Map([...memberInputs(recap), ...extra.flatMap(memberInputs)].map(ref => [ref.id, ref]))
         const current = (extra.at(-1) ?? recap).inputAttachments
         for (const ref of current ?? []) refs.delete(ref.id)
@@ -250,7 +305,8 @@ export class CodingMemberRunner implements MemberRunner {
       return { status: 'completed', text: run.pending ?? '' }
     } catch (error) {
       if (run.cancelled) return { status: 'cancelled', text: '' }
-      if (run.pending !== undefined) { sink.stepped(call.callId, run.pending); run.pending = undefined }
+      if (run.pending !== undefined && !invalid) sink.stepped(call.callId, run.pending)
+      run.pending = undefined
       const detail = error instanceof Error ? error.message : String(error)
       return { status: 'failed', text: '', detail: detail.slice(0, 300) }
     }

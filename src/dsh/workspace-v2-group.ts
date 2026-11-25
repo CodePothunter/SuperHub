@@ -27,7 +27,7 @@ export function groupOutcome(events: readonly Event[], request: string): 'done' 
 }
 
 /** DSH inbox provenance identifies the speaker. A teammate's scratch transcript is private. */
-export function groupSpeech(lead: string, sources: Source[], orders?: ReadonlyMap<string, string>): V2Message[] {
+export function groupSpeech(lead: string, sources: Source[], orders?: ReadonlyMap<string, string>, canonical = lead): V2Message[] {
   const names = new Map(sources.map(s => [s.id, s.name]))
   const rows: V2Message[] = [], ids = new Set<string>(), aliases = new Map<string, string>()
   const display = (id: string) => id === lead ? '讨论接口人' : names.get(id)!
@@ -36,7 +36,7 @@ export function groupSpeech(lead: string, sources: Source[], orders?: ReadonlyMa
     const add = (event: Event, suffix: string, text: string, sender: string, ownerId?: string, messageId?: string) => {
       if (!text.trim() || !Number.isFinite(event.time)) return
       const raw = source.id + ':' + event.seq + suffix
-      const id = ownerId ? ownerMessageId(lead, ownerId) : 'g-' + dialogueKey(lead, source.id, messageId || raw).slice(0, 32)
+      const id = ownerId ? ownerMessageId(canonical, ownerId) : 'g-' + dialogueKey(lead, source.id, messageId || raw).slice(0, 32)
       aliases.set(raw, id)
       if (ids.has(id)) return
       ids.add(id)
@@ -86,7 +86,13 @@ export function groupSpeech(lead: string, sources: Source[], orders?: ReadonlyMa
 }
 
 /** `allowed`: owner words steered into this turn (RPC id → text), admitted by the pre-step filter like the request. */
-type LiveTurn = { request: string; text: string; instructions: string; limit: number; allowed: Map<string, string>; signal: AbortSignal }
+interface ExperienceTurn {
+  canonical: string
+  validate(): void
+  confirmed(memberId: string): void
+}
+type LiveTurn = { request: string; text: string; instructions: string; limit: number; allowed: Map<string, string>; signal: AbortSignal;
+  experience?: ExperienceTurn; projected: Set<string>; recorded: Set<string> }
 /** Owner RPC ids the lead's session took: spliced into a step or claimed as a user message. */
 function takenRequests(events: readonly Event[]): Set<string> {
   const taken = new Set<string>()
@@ -118,6 +124,7 @@ export class WorkspaceGroups {
       if (!root) return
       const turn = this.active.get(root), teams = ctx.get('agentTeams')
       if (!turn || !teams || !teamTools.includes(execution.name)) return '这场讨论只可在本群内协作。'
+      try { turn.experience?.validate() } catch { return '这场讨论的经验授权已改变，请重新开始本轮。' }
       const actor = ctx.agents.get(execution.agent.id) as unknown as Agent | undefined
       if (!actor || teams.tryMembership(actor)?.root.id !== root) return '发言者还未加入本群。'
       if (turn.limit-- <= 0) return '本轮讨论已达到协作次数上限，请用现有消息回答。'
@@ -137,6 +144,7 @@ export class WorkspaceGroups {
       if (!turn) return {kind: 'reject'}
       const result = await next()
       if (result.kind === 'reject' || this.active.get(root) !== turn) return {kind: 'reject'}
+      try { turn.experience?.validate() } catch { return {kind:'reject'} }
       const teams = ctx.get('agentTeams'), member = teams?.tryMembership(agent)
       if (!teams || member?.root.id !== root) return {kind: 'reject'}
       const ids = new Set(teams.listMembers(member.root).map(m => m.id))
@@ -152,6 +160,15 @@ export class WorkspaceGroups {
     if (preStep) this.releases.push(preStep)
     const created = ctx.on?.('agent/created', ({agent}) => { const root = this.rootOf(agent.id, agent); if (root) this.attach(agent, root) })
     if (created) this.releases.push(created)
+    const reported = ctx.on?.('session/event', (session,event) => {
+      if (event.type !== 'assistant/message' && event.type !== 'tool/call') return
+      const root = this.rootOf(session.id)
+      const turn = root && this.active.get(root)
+      if (!turn || !turn.experience || !turn.projected.has(session.id) || turn.recorded.has(session.id)) return
+      turn.recorded.add(session.id)
+      turn.experience.confirmed(session.id)
+    })
+    if (reported) this.releases.push(reported)
     this.guarded = !!guard && !!created && !!preStep
     for (const agent of ctx.agents?.list?.() || []) {
       const root = this.rootOf(agent.id, agent)
@@ -180,8 +197,13 @@ export class WorkspaceGroups {
     // Native team tools are agent-scoped. DSH's allow filter accepts only global tool names.
     agent.ctx.tools.restrict({allow: []})
     agent.ctx.tools.guard(call => !binding.current() || !teamTools.includes(call.name) ? '这场讨论只可在获准回合内使用本群工具。' : undefined)
-    agent.ctx.systemPrompt.section({name: 'superhub-v2-group', order: 80, interpolate: false,
-      text: () => binding.current()?.instructions || '这场工作区讨论当前没有已派发的回合。'})
+    agent.ctx.systemPrompt.section({name: 'superhub-v2-group', order: 80, interpolate: false, text: () => {
+      const turn = binding.current()
+      if (!turn) return '这场工作区讨论当前没有已派发的回合。'
+      turn.experience?.validate()
+      if (turn.experience) turn.projected.add(agent.id)
+      return turn.instructions
+    }})
     pinned.set(agent, binding)
     this.attached.add(agent)
   }
@@ -225,9 +247,9 @@ export class WorkspaceGroups {
     if (agent?.id !== member.id || !agent.session) throw new Error('群成员的历史发言暂不可读。')
     return agent.session.snapshotEvents()
   }
-  async observe(lead: string, members: GroupMember[], signal: AbortSignal, orders?: ReadonlyMap<string, string>) {
+  async observe(lead: string, members: GroupMember[], signal: AbortSignal, orders?: ReadonlyMap<string, string>, canonical = lead) {
     const sources = await Promise.all(members.map(async m => ({...m, events: await this.events(m, signal)})))
-    return {messages: groupSpeech(lead, sources, orders), events: sources.find(s => s.id === lead)?.events ?? []}
+    return {messages: groupSpeech(lead, sources, orders, canonical), events: sources.find(s => s.id === lead)?.events ?? []}
   }
   idleMembers(root: string, cwd: string) {
     const lead = this.ctx.agents?.get(root) as unknown as Agent | undefined
@@ -282,7 +304,8 @@ export class WorkspaceGroups {
     for (const id of ids) settled.set(id, seen.has(id) && !removed.has(id))
   }
   async run(lead: Agent, teams: NativeTeams, request: string, text: string, instructions: string, signal: AbortSignal,
-    update: (messages: V2Message[], members: GroupMember[]) => void, orders?: ReadonlyMap<string, string>, settled = new Map<string, boolean>()) {
+    update: (messages: V2Message[], members: GroupMember[]) => void, orders?: ReadonlyMap<string, string>, settled = new Map<string, boolean>(),
+    experience?: ExperienceTurn) {
     const root = lead.id
     let stopped = false
     const cancel = () => {
@@ -296,11 +319,12 @@ export class WorkspaceGroups {
         agent?.cancel?.({kind: 'hook', reason: '本轮工单已停止'}, {keepInbox: false})
       }
     }
-    const live: LiveTurn = {request, text, instructions, limit: 32, allowed: new Map(), signal}
+    const live: LiveTurn = {request, text, instructions, limit: 32, allowed: new Map(), signal, experience, projected:new Set(), recorded:new Set()}
     this.active.set(root, live)
     signal.addEventListener('abort', cancel, {once: true})
     try {
       signal.throwIfAborted()
+      experience?.validate()
       await this.ctx.sessionController.prompt({requestId: request, sessionId: root, mode: 'queue', content: [{type:'text', text}]}, signal)
       while (!signal.aborted) {
         const members: NativeTeamMember[] = teams.listMembers(lead)
@@ -313,8 +337,9 @@ export class WorkspaceGroups {
           if (teams.tryMembership(lead)?.root.id !== root || binding && binding.root.id !== root) throw new Error('群成员的原生归属不匹配。')
           return false
         })
-        const observed = await this.observe(root, readable, signal, orders)
+        const observed = await this.observe(root, readable, signal, orders, experience?.canonical)
         signal.throwIfAborted()
+        experience?.validate()
         update(observed.messages, readable.map(({id, name}) => ({id, name})))
         // An enqueued (spliced) prompt may still belong to a future turn. Settle only its claimed input.
         const outcome = groupOutcome(observed.events, request)

@@ -310,7 +310,8 @@ export class LiaisonChat {
     private readonly workReplies?: () => TicketReplyReceipt[],
     private readonly orderLabel?: (workspaceId:string,orderId:string) => string | undefined,
     private readonly discussionResults?: (receipts: readonly DiscussionReceipt[], options?: { historical?: boolean }) => Promise<DiscussionResult[]>,
-    private readonly input?: { service: ChatAttachments; forRequest: AttachmentLookup }) {
+    private readonly input?: { service: ChatAttachments; forRequest: AttachmentLookup },
+    private readonly beforeDelivery?: (requestId: string, text: string) => Promise<void>) {
     this.parts = typeof session === 'string' ? fixedParts(session) : session
   }
 
@@ -391,6 +392,7 @@ export class LiaisonChat {
 
   private async deliver(text: string, mode: 'auto' | 'queue' | 'steer', requestId: string, refs: readonly ChatInputAttachment[]): Promise<void> {
     await this.parts.ready()
+    await this.beforeDelivery?.(requestId,text)
     this.delivering++
     try {
       const agent = await this.agent() // 确保会话已存在并带上接口人的设定

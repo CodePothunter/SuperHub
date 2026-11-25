@@ -90,6 +90,14 @@ function openGoals(md: string | undefined): string {
 
 const join = (parts: { title: string; body: string }[]) => parts.map(p => `${p.title}：\n${p.body}`).join('\n\n')
 
+/** Model context shared with delegated executors contains only work preferences and agreements. */
+export function confirmedWorkBehavior(docs: BrainDocs): string {
+  const preferences = pick(docs.me, ['偏好'])
+  const agreements = pick(docs.agents, ['我希望幕僚团怎样帮我', '协作约定', '原则'])
+  const text = join([...preferences, ...agreements])
+  return text ? '主人已确认的协作约定和工作偏好（本轮要求优先）：\n' + clip(text, 1600) : ''
+}
+
 function clip(text: string, limit: number): string {
   return text.length <= limit ? text : `${text.slice(0, limit - 20).replace(/\n[^\n]*$/, '')}\n（太长，已截断）`
 }

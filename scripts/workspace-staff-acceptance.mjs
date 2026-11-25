@@ -1,7 +1,7 @@
 /** Exercise both real owner transports and the scoped model input before and after reset and restart. */
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { copyFileSync, mkdirSync } from 'node:fs'
+import { copyFileSync, mkdirSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { acceptanceHost, until } from './acceptance-host.mjs'
@@ -41,7 +41,7 @@ try {
   await host.api('/settings',{liaisonModel:'deepseek-official/deepseek-flash'})
   const {scope} = await host.api('/v2/bootstrap')
   const query = '?scope=' + encodeURIComponent(scope)
-  const api = (path, data) => host.api(path + query, data && {...data,scope,requestId:randomUUID()})
+  const api = (path, data) => host.api(path + (path.includes('?') ? '&' + query.slice(1) : query), data && {...data,scope,requestId:randomUUID()})
   const project = async name => (await api('/v2/workspaces',{name,goal:'完成访谈验收'})).workspace.id
   const source = await project('访谈甲组')
   const target = await project('研发乙组')
@@ -113,7 +113,27 @@ try {
   await host.api('/chat',{scope,sessionId,text:'请轮值访谈研究员记住本区做法：乙的独立经验。',mode:'auto',
     request_id:randomUUID(),context:{surface:'workspace',selectedId:target}})
   await until(async ()=>(await api(staff(target))).memories.some(m=>m.staffId===staffId && m.text===independent),'从接口人登记本区原话')
-  const ask = '核对本轮获准的访谈方法'
+  await host.api('/chat',{scope,sessionId,text:'以后本区访谈结束都先核对原始录音。',mode:'auto',
+    request_id:randomUUID(),context:{surface:'workspace',selectedId:source}})
+  const common = await until(async () => (await api(staff(source))).sharedExperiences?.find(memory=>memory.text.includes('核对原始录音')), '进经验库的原话')
+  assert.ok(common.evidence.some(evidence=>evidence.quote === '以后本区访谈结束都先核对原始录音。'))
+  async function confirmLiaison(id, message, expected) {
+    const text = '请你自己核对访谈流程' + message
+    await host.api('/chat',{scope,sessionId,text,mode:'auto',request_id:randomUUID(),context:{surface:'workspace',selectedId:id}})
+    await until(async () => {
+      const recent = (await host.api('/chat')).messages
+      const at = recent.findLastIndex(row=>row.text === text)
+      return at >= 0 && recent.slice(at + 1).some(row=>row.text === expected)
+    },expected)
+  }
+  await confirmLiaison(source,'（甲区）','已收到本区共同经验。')
+  await confirmLiaison(target,'（乙区）','本轮没有这条共同经验。')
+  const storedStaff = join(host.brain,'ops','superhub-staff')
+  const deliveries = Object.values(JSON.parse(readFileSync(join(storedStaff,readdirSync(storedStaff).find(name=>name.endsWith('.json'))),'utf8')).deliveries)
+  assert.ok(deliveries.some(row=>row.workspaceId===source && row.executorId==='liaison' &&
+    row.entries.some(entry=>entry.id===common.id && entry.version===common.version)))
+  assert.ok(!deliveries.some(row=>row.workspaceId===target && row.entries.some(entry=>entry.id===common.id)))
+  const ask = '核对本轮获准的访谈方法和独立经验'
   async function assign(id) {
     const {order} = await api(workspace(id)+'/orders',{staffId,title:ask,promise:'核对当前可用记录'})
     assert.equal(order.staffId,staffId)
@@ -135,10 +155,11 @@ try {
   const {order:original}=await (await firstOrder).json()
   assert.equal(original.staffId,staffId)
   const originalReply=await replies(source,original,1)
-  assert.ok(originalReply.includes(method) && originalReply.includes(sourceOnly) && !originalReply.includes(independent))
+  assert.ok(originalReply.includes(method) && originalReply.includes(sourceOnly) && originalReply.includes('先核对原始录音') && !originalReply.includes(independent), originalReply)
   const unseen=await assign(target)
   const isolated=await replies(target,unseen,1)
-  assert.ok(isolated.includes(independent) && !isolated.includes(method) && !isolated.includes(sourceOnly))
+  assert.ok(isolated.includes(independent) && !isolated.includes(method) && !isolated.includes(sourceOnly) && !isolated.includes('先核对原始录音'), isolated)
+  console.log('PASS 本区共同经验在接口人和幕僚的实际请求中生效，另一工作区隔离')
   async function verifyConversationPortrait(page,base,id,order,expected) {
     await page.goto(base + '/#v2?' + new URLSearchParams({scope,view:'workspace',workspace:id,panel:'execution',session:order.sessionId,order:order.id}))
     const row=page.locator('[data-message-id]').filter({has:page.locator('.v2-byline strong',{hasText:name})}).first()
@@ -183,11 +204,50 @@ try {
   await button(mobile,'更换头像').click()
   await capturePicker(mobile.getByRole('dialog',{name:'更换头像'}),'mobile')
   await button(mobile,'取消').click()
+  await mobile.goto(cardUrl(host.mobileBase,source))
+  const workspaceNav = mobile.getByRole('navigation',{name:'工作区版面'})
+  await button(workspaceNav,'经验').click()
+  assert.equal(await button(workspaceNav,'经验').getAttribute('aria-current'),'page')
+  assert.match(mobile.url(),/[?&]panel=experience(?:&|$)/)
+  const sections = await workspaceNav.getByRole('button').allTextContents()
+  assert.deepEqual(sections,['概览','执行','产物','幕僚','经验'])
+  assert.ok(await workspaceNav.evaluate(el => [...el.querySelectorAll('button')].every(button => {
+    const bounds = button.getBoundingClientRect()
+    return bounds.left >= 0 && bounds.right <= window.innerWidth && bounds.height >= 44
+  })))
+  const commonRegion = mobile.getByRole('region',{name:'本区共同经验'})
+  const commonCard = commonRegion.getByRole('article').filter({hasText:'先核对原始录音'})
+  await commonCard.waitFor()
+  assert.ok(await mobile.locator('.v2-page').evaluate(el=>el.scrollWidth<=el.clientWidth+1))
+  const sharedProjection = await api(staff(source)+'?experience=shared')
+  assert.deepEqual(sharedProjection.members,[])
+  assert.deepEqual(sharedProjection.memories,[])
+  assert.ok(!JSON.stringify(sharedProjection).includes(sourceOnly))
+  await commonCard.getByText('查看依据',{exact:true}).click()
+  await commonCard.getByText('主人原话',{exact:true}).waitFor()
+  const correction = '本区访谈交接先核对原始录音并确认摘要。'
+  await button(commonCard,'更正').click()
+  await mobile.getByRole('dialog',{name:'更正经验'}).getByRole('textbox',{name:'经验内容',exact:true}).fill(correction)
+  await button(mobile,'保存更正').click()
+  await commonCard.getByText(correction,{exact:true}).waitFor()
+  await button(commonCard,'停用').click()
+  await until(async () => (await api(staff(source))).sharedExperiences?.some(memory=>memory.id===common.id && memory.status==='retired'),'手机停用共同经验')
+  await commonCard.getByText('历史版本',{exact:true}).click()
+  await button(commonCard,'版本 '+common.version).click()
+  await button(commonCard,'恢复这个版本').click()
+  await until(async () => (await api(staff(source))).sharedExperiences?.some(memory=>memory.id===common.id && memory.status==='active' && memory.text===common.text),'手机恢复共同经验')
+  console.log('PASS 320px 工作区经验页展示共同经验及依据，专属经验未透传，可更正、停用和恢复')
   await mobile.goto(cardUrl(host.mobileBase,source,staffId))
   await button(mobile,'重置本区记忆').click()
   const confirm = button(mobile,'确认重置')
   await confirm.waitFor()
-  assert.ok(await mobile.locator('.v2-page').evaluate(el=>el.scrollWidth<=el.clientWidth+1))
+  const metrics = await mobile.locator('.v2-page').evaluate(el=>{
+    const right = el.getBoundingClientRect().right
+    const overflowing = [...el.querySelectorAll('*')].filter(node=>node.getBoundingClientRect().right > right + 1)
+      .slice(0,8).map(node=>({name:node.tagName,class:node.className,text:node.textContent?.slice(0,80)}))
+    return {width:el.clientWidth,scroll:el.scrollWidth,overflowing}
+  })
+  assert.ok(metrics.scroll <= metrics.width + 1, JSON.stringify(metrics))
   await confirm.click()
   await until(async () => !(await api(staff(target))).received.length,'重置收回派生共享')
   await host.stop()

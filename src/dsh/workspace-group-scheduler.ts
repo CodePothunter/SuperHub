@@ -219,6 +219,7 @@ export interface GroupSchedulerOptions {
   /** 管理员派出的工单批次落地时先不叫它，由宿主验收（见 `wake` 效果的 `held`）。 */
   holdOrderWakes?: boolean
   engage?: (workOrderId: string | undefined, memberId?: string) => { generation?: number } | undefined
+  canPublish?: (call: GroupCall) => boolean
 }
 
 export class GroupScheduler {
@@ -228,6 +229,7 @@ export class GroupScheduler {
   private readonly now: () => number
   private readonly holdOrderWakes: boolean
   private readonly engage: GroupSchedulerOptions['engage']
+  private readonly canPublish: GroupSchedulerOptions['canPublish']
   readonly limits: GroupLimits
 
   constructor(options: GroupSchedulerOptions) {
@@ -235,6 +237,7 @@ export class GroupScheduler {
     this.now = options.now ?? Date.now
     this.holdOrderWakes = options.holdOrderWakes === true
     this.engage = options.engage
+    this.canPublish = options.canPublish
     this.limits = { ...GROUP_LIMITS, ...options.limits }
     this.state = options.state ? clone(options.state) : emptyGroupSchedulerState()
     if (options.inputScoped) this.state.inputScoped = true
@@ -377,7 +380,8 @@ export class GroupScheduler {
    * 宿主以成员身份写一行（接口人的交办、补充、验收追问）：其中的 `@` 照常叫人，派活者是这位成员，落地后收回批次；
    * 管理员说全员词叫全员。`onBehalfOfOwner`：这是主人的交办，像主人发言一样解除空转暂停。同一 `ref` 只写一次。
    */
-  memberSaid(memberId: string, input: { text: string; workOrderId?: string; quote?: GroupLine['quote']; inputAttachments?: GroupLine['inputAttachments']; ref?: string; onBehalfOfOwner?: boolean }): { line: GroupLine; effects: GroupEffect[] } {
+  memberSaid(memberId: string, input: { text: string; workOrderId?: string; quote?: GroupLine['quote']; inputAttachments?: GroupLine['inputAttachments'];
+    ref?: string; onBehalfOfOwner?: boolean; experienceRefs?: GroupLine['experienceRefs'] }): { line: GroupLine; effects: GroupEffect[] } {
     if (input.inputAttachments?.length) this.state.inputScoped = true
     const member = this.member(memberId)
     if (!member) throw new Error(`群里没有这位成员：${memberId}`)
@@ -390,6 +394,7 @@ export class GroupScheduler {
       ...input.quote !== undefined && { quote: input.quote },
       ...input.inputAttachments?.length && { inputAttachments: input.inputAttachments },
       ...input.ref !== undefined && { ref: input.ref },
+      ...input.experienceRefs && { experienceRefs:input.experienceRefs },
     })
     if (input.onBehalfOfOwner) {
       this.state.idle = { streak: 0, bodies: {} }
@@ -565,15 +570,17 @@ export class GroupScheduler {
   }
 
   /** 以成员身份写一行并处理其中的 `@`。 */
-  private post(call: GroupCall, kind: 'message' | 'progress', text: string, effects: GroupEffect[], terminal = false) {
+  private post(call: GroupCall, kind: 'message' | 'progress', text: string, effects: GroupEffect[], terminal?: { substantiveReply: boolean }) {
+    if (this.canPublish && !this.canPublish(call)) return
     const member = this.member(call.memberId)!
     const { ids, all } = parseMentions(text, this.members, { except: member.id })
     const line = this.say.say({
-      kind, speakerId: member.id, author: member.name, text, mentions: ids,
+      kind, speakerId: member.id, author: member.name, text, mentions: ids, memberCallId: call.id,
       ...all && { all: true as const },
       replyTo: call.triggerSeq,
       ...call.workOrderId !== undefined && { workOrderId: call.workOrderId },
       ...call.batchId !== undefined && { batchId: call.batchId },
+      ...terminal?.substantiveReply && { memberCompleted: true as const },
       ...terminal && call.engagement && { engagement: { callId: call.id, triggerSeq: call.triggerSeq, memberId: call.memberId, by: call.by, ...call.engagement } },
     })
     call.posted.push(line.seq)
@@ -694,8 +701,10 @@ export class GroupScheduler {
     const held = call.held.splice(0).join('\n\n')
     const repeated = reply !== '' && (reply === call.lastLine || (held === '' && reply === call.lastPosted))
     const final = held === '' ? (repeated || isPass(reply) ? '' : reply) : (isPass(reply) || repeated ? held : `${held}\n\n${reply}`)
-    if (final !== '') this.post(call, 'message', final, effects, true)
-    else if (call.engagement && !isPass(reply)) this.post(call, 'message', reply, effects, true)
+    const substantiveReply = !isPass(reply) && !promisesWork(reply) && !isIdleRelayText(reply, this.members, [])
+    const terminal = { substantiveReply }
+    if (final !== '') this.post(call, 'message', final, effects, terminal)
+    else if (call.engagement && !isPass(reply)) this.post(call, 'message', reply, effects, terminal)
     else if (call.engagement?.generation !== undefined) this.event('failed', member.name + ' 本轮没有交回可核实的结果。', effects, call)
     const posted = call.posted.length > 0
     const admin = this.admin

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { V2CodingPermission, V2Session, V2TurnInput } from '../src/core/workspace-v2.ts'
+import type { ExperienceEntry, WorkspaceExperiencePort } from '../src/core/workspace-experience.ts'
 import { REDACTED } from '../src/core/redact.ts'
 import { commandApprovals } from '../src/dsh/approvals.ts'
 import { CodingGate, GATE_DEADLINE_ENV, GATE_SOCKET_ENV, GATE_TOKEN_ENV } from '../src/dsh/coding-gate.ts'
@@ -71,6 +72,18 @@ describe('run-as-owner launch arguments', () => {
 })
 
 describe('coding tool stream: commands, native session and process', () => {
+  it('仅收到 Claude Code 初始化和拒绝时不登记输入送达', async () => {
+    const h = host((_spec, _prompt, {say}) => {
+      say({type:'system',subtype:'init',session_id:'unconfirmed'})
+      say({type:'result',subtype:'error_during_execution',is_error:true,num_turns:0,session_id:'unconfirmed'})
+      return 1
+    }, {replay:false})
+    const onInputAccepted = vi.fn()
+    await expect(codingTurn(h.subprocess, 'claude-code', 'claude', tmpdir(), '需要认领的摘要', signal(),
+      {publish:()=>{},onInputAccepted})).rejects.toThrow()
+    expect(onInputAccepted).not.toHaveBeenCalled()
+  })
+
   it('reports Codex command executions with exit code and a redacted output tail, and the thread id', async () => {
     const events: CodingCommandEvent[] = [], sessions: string[] = []
     const h = host((_spec, _prompt, {say}) => {
@@ -158,6 +171,44 @@ describe('coding tool stream: commands, native session and process', () => {
 })
 
 describe('coding session journal: commands, native continuation and process', () => {
+  it.each([session, claudeSession])('$executor 普通会话刷新授权并登记实际输入与命令回执', async target => {
+    const root = temp()
+    const h = host((_spec, prompt, {say}) => {
+      const result = prompt.includes('陈旧方法') ? '旧执行者的转述' : '现在的结果'
+      if (target.executor === 'codex') {
+        say({type:'item.completed',item:{id:'verify',type:'command_execution',command:'pnpm test',exit_code:0,aggregated_output:'ok'}})
+        say({type:'item.completed',item:{id:'reply',type:'agent_message',text:result}})
+        say({type:'turn.completed'})
+      } else {
+        say({type:'system',subtype:'init',session_id:'claude-1'})
+        say({type:'assistant',message:{content:[{type:'tool_use',id:'verify',name:'Bash',input:{command:'pnpm test'}}]}})
+        say({type:'user',message:{content:[{type:'tool_result',tool_use_id:'verify',content:'ok'}]}})
+        say({type:'result',subtype:'success',session_id:'claude-1',num_turns:1,result})
+      }
+      return 0
+    })
+    const recordExperienceDelivery = vi.fn()
+    const onCodingResult = vi.fn()
+    let available: ExperienceEntry[] = [{id:'steps',version:1,text:'陈旧方法'}]
+    const experience: WorkspaceExperiencePort = {
+      selectExperience: query => ({query,scope:'brain',authority:'v1',entries:available,authorized:available}),
+      assertExperienceCurrent: () => {},
+      recordExperienceDelivery,
+    }
+    const source = createV2DialogueSource({...options(h.ctx,root),experience,onCodingResult})
+    await source.send(target,turn('first','主人先前指示'),signal())
+    available = [{id:'steps',version:2,text:'改后的新方法'}]
+    await source.send(target,turn('second','主人的本轮指示'),signal())
+    expect(h.calls[1]!.resume).toBeUndefined()
+    expect(h.calls[1]!.prompt).toContain('改后的新方法')
+    expect(h.calls[1]!.prompt).toContain('主人先前指示')
+    expect(h.calls[1]!.prompt).not.toContain('旧执行者的转述')
+    expect(recordExperienceDelivery.mock.calls.map(([picked, receipt]) => [picked.entries[0].version, receipt.sessionId, receipt.turnId]))
+      .toEqual([[1,target.id,'first'],[2,target.id,'second']])
+    expect(onCodingResult.mock.calls[1]?.[0]).toMatchObject({sessionId:target.id, turnId:'second',
+      commands:[{command:'pnpm test',exitCode:0,outputTail:'ok'}]})
+    source.dispose()
+  })
   it('records commands per work order, continues the native session with only this turn, and keeps the process exit', async () => {
     const root = temp()
     const h = host((_spec, _prompt, {say}) => {

@@ -2,7 +2,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSy
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { GROUP_LEDGER_FILE, GROUP_SEEN_FILE, GroupLedger, readGroupLedger } from '../src/dsh/workspace-group-ledger.ts'
+import { GROUP_LEDGER_FILE, GROUP_SEEN_FILE, GroupLedger, memberCompletionEvidenceId, readGroupLedger } from '../src/dsh/workspace-group-ledger.ts'
 
 const roots: string[] = []
 function temp() { const p = mkdtempSync(join(tmpdir(), 'chief-group-ledger-')); roots.push(p); return p }
@@ -37,6 +37,24 @@ describe('group ledger', () => {
     expect(() => ledger.say({ ...owner('x'), kind: 'working' as never })).toThrow(/不认识的行类型/)
     expect(() => ledger.say({ ...owner('x'), speakerId: '' })).toThrow(/发言人/)
     expect(ledger.lastSeq).toBe(0)
+  })
+
+  it('reopens member-call attribution and distinguishes historical completions, formal deliveries, and host notes', () => {
+    const dir = temp()
+    const ledger = new GroupLedger(dir)
+    const member = {speakerId: 'eng', author: '工程师', text: '通过端点日志复核了区域配置。'}
+    ledger.say({kind: 'message', ...member, memberCallId: 'call-current', memberCompleted: true})
+    ledger.say({kind: 'message', ...member, engagement: {callId: 'call-legacy', triggerSeq: 1, memberId: 'eng'}})
+    ledger.say({kind: 'progress', ...member, memberCallId: 'call-stage'})
+    ledger.say({kind: 'message', ...member, engagement: {callId: 'call-mismatch', triggerSeq: 1, memberId: 'other'}})
+    ledger.say({kind: 'message', ...member, ref: 'host-note'})
+    const [current, historical, progress, wrongMember, host] = new GroupLedger(dir).all()
+    expect(memberCompletionEvidenceId('group', current!)).toBe('group-member:group:1:eng')
+    expect(memberCompletionEvidenceId('group', historical!)).toBe('group-member:group:2:eng')
+    expect(memberCompletionEvidenceId('group', progress!)).toBeUndefined()
+    expect(memberCompletionEvidenceId('group', progress!, true)).toBe('group-member:group:3:eng')
+    expect(memberCompletionEvidenceId('group', wrongMember!)).toBeUndefined()
+    expect(memberCompletionEvidenceId('group', host!, true)).toBeUndefined()
   })
 
   it('skips a torn last line from a crash and closes it before the next append', () => {

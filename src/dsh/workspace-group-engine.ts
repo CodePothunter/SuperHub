@@ -16,12 +16,13 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSyn
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { redactSecrets } from '../core/redact.ts'
 import type { ChatInputAttachment } from '../core/chat-attachments.ts'
+import type { ExperienceRef, ExperienceSelection } from '../core/workspace-experience.ts'
 import { WORKSPACE_ARCHIVED, type V2PendingApproval } from '../core/workspace-v2.ts'
 import type { Logger } from './ports.ts'
 import { GroupLedger, LEDGER_FIRST_LOOK, type GroupAttachment, type GroupLine, type GroupLineInput, type GroupSay } from './workspace-group-ledger.ts'
-import { GroupMemberSessions, MemberInputError, type GroupContext, type GroupMemberKind, type GroupRosterMember, type MemberCall, type MemberCallSink, type MemberInputs, type MemberRunner, type MemberSteer } from './workspace-group-members.ts'
+import { experienceHistory, GroupMemberSessions, LIAISON_MEMBER_ID, MemberInputError, type ExperienceAccess, type GroupContext, type GroupMemberKind, type GroupRosterMember, type MemberCall, type MemberCallSink, type MemberInputs, type MemberRunner, type MemberSteer } from './workspace-group-members.ts'
 import {
-  GroupScheduler, HOST_ID, HOST_NAME, OWNER_ID, OWNER_NAME, type GroupCallReason, type GroupCallStatus, type GroupEffect, type GroupLimits, type GroupMember, type GroupSchedulerOptions, type GroupSchedulerState, type MemberActivity,
+  GroupScheduler, HOST_ID, HOST_NAME, OWNER_ID, OWNER_NAME, type GroupCall, type GroupCallReason, type GroupCallStatus, type GroupEffect, type GroupLimits, type GroupMember, type GroupSchedulerOptions, type GroupSchedulerState, type MemberActivity,
 } from './workspace-group-scheduler.ts'
 
 export const GROUP_SCHEDULER_FILE = 'scheduler.json'
@@ -54,6 +55,8 @@ export interface GroupEngineOptions {
   /** 现在的名册（接口人 + 本区幕僚，`groupRoster`）；每次被叫时现读，身份与模型跟着变。 */
   roster: () => GroupRosterMember[]
   runners: Partial<Record<GroupMemberKind, MemberRunner>>
+  experience?: ExperienceAccess
+  orderTask?: (orderId: string) => {task: string; original?: string}
   /** 本群待主人批准的命令（`CodingGate.pending`）。 */
   approvals?: { pending(filter: { workspaceId?: string; sessionId?: string }): V2PendingApproval[] }
   /** 调度器给出的效果（执行之后），给验收、提醒与界面刷新用。 */
@@ -266,6 +269,7 @@ export class GroupEngine {
   private readonly steering = new Map<string, Promise<GroupDelivery>>()
   /** 在跑的回合最近调的工具与中途发言（只在内存里；重启后从账本补中途发言）。 */
   private readonly doing = new Map<string, { tool?: GroupMemberTool; progress?: { text: string; at: number } }>()
+  private readonly callExperience = new Map<string, ExperienceSelection>()
   private readonly deliveriesPath: string
   private delivered: Record<string, GroupDelivery[]> | undefined
   private readonly sink: MemberCallSink
@@ -298,7 +302,7 @@ export class GroupEngine {
       stepped: (callId, text) => {
         const said = activityText(text, 200)
         if (said) note(callId, { progress: { text: said, at: this.now() } })
-        report(s => s.stepped(callId, text))
+        report(s => this.experienceCurrent(s, callId) ? s.stepped(callId, text) : [])
       },
       tool: (callId, { name, team, detail }) => {
         const shown = detail === undefined ? '' : activityText(detail)
@@ -310,6 +314,11 @@ export class GroupEngine {
       finished: (callId, result) => {
         this.doing.delete(callId)
         report(s => {
+          if (!this.experienceCurrent(s, callId)) {
+            const detail = '本轮经验授权已变化，请重新叫这位成员。'
+            this.failedDelivery(s, callId, detail)
+            return s.finished(callId, {status:'failed', detail})
+          }
           if (result.status === 'failed') this.failedDelivery(s, callId, result.detail ?? '成员没有接下材料')
           return s.finished(callId, result)
         })
@@ -330,7 +339,8 @@ export class GroupEngine {
     // Members' lines link their files (`[名字](相对路径)`): those inside the group's working directory become attachments.
     const say: GroupSay = { say: input => this.ledger.say(this.withFiles(input)) }
     const scheduler = new GroupScheduler({ members: this.roster.map(asMember), say, now: this.now, inputScoped: this.ledger.hasInputs, engage: this.options.engage, ...state && { state }, ...this.options.limits && { limits: this.options.limits },
-      ...this.options.holdOrderWakes && { holdOrderWakes: true } })
+      ...this.options.holdOrderWakes && { holdOrderWakes: true },
+      ...this.options.experience && {canPublish:call=>this.canPublishExperience(call)} })
     this.scheduler = scheduler
     const alive: string[] = []
     const settled = new Set(this.ledger.all().flatMap(line => line.engagement ? [line.engagement.callId] : []))
@@ -341,7 +351,10 @@ export class GroupEngine {
       const runner = member && this.options.runners[member.kind]
       if (!member || !runner) continue
       try {
-        if (await runner.reattach({ callId: call.id, group, member, identity: memberIdentity(member, this.options.info(), group.workDir), ...call.workOrderId && { workOrderId: call.workOrderId } }, this.sink)) alive.push(call.id)
+        const experience = this.selectExperience(member, call.triggerSeq, call.workOrderId)
+        if (experience) this.callExperience.set(call.id, experience)
+        const identity = memberIdentity(experience ? {...member, memories: undefined} : member, this.options.info(), group.workDir)
+        if (await runner.reattach({ callId: call.id, group, member, identity, experience, ...call.workOrderId && { workOrderId: call.workOrderId } }, this.sink)) alive.push(call.id)
       } catch (error) { this.options.logger?.warn('群成员 %s 的回合没能续上：%s', member.name, String(error)) }
     }
     for (const callId of Object.keys(this.sessions.lives())) if (!alive.includes(callId)) this.sessions.clearLive(callId)
@@ -498,7 +511,8 @@ export class GroupEngine {
    * 以管理员（接口人）身份在群里说一句（交办、补充、验收结论）：其中的 `@` 照常叫人，落地后收回批次。
    * 同一 `ref` 只写一次（重启后补发不会重复）。`callAdmin`：这一行没叫到谁时，替主人叫接口人自己来回应它（附这句说明）。
    */
-  liaisonSay(text: string, options: { workOrderId?: string; quote?: GroupLine['quote']; inputAttachments?: ChatInputAttachment[]; ref?: string; onBehalfOfOwner?: boolean; callAdmin?: string } = {}): GroupLine {
+  liaisonSay(text: string, options: { workOrderId?: string; quote?: GroupLine['quote']; inputAttachments?: ChatInputAttachment[]; ref?: string;
+    onBehalfOfOwner?: boolean; callAdmin?: string; experienceRefs?: GroupLine['experienceRefs'] } = {}): GroupLine {
     const past = options.ref ? this.ledger.byRef(options.ref) : undefined
     if (past) return past
     const admin = this.roster.find(row => row.admin)
@@ -508,7 +522,8 @@ export class GroupEngine {
     this.handle(s => {
       const said = s.memberSaid(admin.id, { text, ...options.workOrderId !== undefined && { workOrderId: options.workOrderId },
         ...options.inputAttachments?.length && { inputAttachments: options.inputAttachments }, ...options.quote && { quote: options.quote },
-        ...options.ref !== undefined && { ref: options.ref }, ...options.onBehalfOfOwner && { onBehalfOfOwner: true } })
+        ...options.ref !== undefined && { ref: options.ref }, ...options.onBehalfOfOwner && { onBehalfOfOwner: true },
+        experienceRefs:options.experienceRefs })
       line = said.line
       effects = said.effects
       if (options.callAdmin !== undefined && !said.line.mentions.length && !said.line.all) {
@@ -524,7 +539,8 @@ export class GroupEngine {
    * 只记一行、不叫任何人：接口人留下没交出去的主人原话（`speaker: 'owner'`，带请求号），或接口人不需要谁回应的说明。
    * 同一 `ref` / 请求号只写一次。
    */
-  note(input: { speaker: 'owner' | 'liaison'; text: string; workOrderId?: string; inputAttachments?: ChatInputAttachment[]; ref?: string; requestId?: string; quote?: GroupLine['quote']; engagement?: GroupLine['engagement'] }): GroupLine {
+  note(input: { speaker: 'owner' | 'liaison'; text: string; workOrderId?: string; inputAttachments?: ChatInputAttachment[]; ref?: string; requestId?: string;
+    quote?: GroupLine['quote']; engagement?: GroupLine['engagement']; experienceRefs?: GroupLine['experienceRefs'] }): GroupLine {
     const past = (input.ref ? this.ledger.byRef(input.ref) : undefined) ?? (input.requestId ? this.ledger.byRequest(input.requestId) : undefined)
     if (past) return past
     if (this.viewOnly) throw new Error(WORKSPACE_ARCHIVED)
@@ -532,7 +548,8 @@ export class GroupEngine {
     const speaker = input.speaker === 'owner' ? { speakerId: OWNER_ID, author: OWNER_NAME } : admin ? { speakerId: admin.id, author: admin.name } : { speakerId: HOST_ID, author: HOST_NAME }
     const line = this.ledger.say({ kind: 'message', ...speaker, text: input.text, mentions: [],
       ...input.workOrderId !== undefined && { workOrderId: input.workOrderId }, ...input.ref !== undefined && { ref: input.ref },
-      ...input.requestId !== undefined && { requestId: input.requestId }, ...input.quote && { quote: input.quote }, inputAttachments: input.inputAttachments, engagement: input.engagement })
+      ...input.requestId !== undefined && { requestId: input.requestId }, ...input.quote && { quote: input.quote }, inputAttachments: input.inputAttachments,
+      engagement: input.engagement, experienceRefs: input.experienceRefs })
     try { this.options.onChange?.() } catch (error) { this.options.logger?.warn('群聊变动的后续处理出错：%s', String(error)) }
     return line
   }
@@ -551,9 +568,9 @@ export class GroupEngine {
   }
 
   dispatchEngagement(request: string, members: string[], text: string, workOrderId?: string,
-    handoff?: {original?: string; inputAttachments?: ChatInputAttachment[]}) {
+    handoff?: {original?: string; inputAttachments?: ChatInputAttachment[]; experienceRefs?: GroupLine['experienceRefs']}) {
     if (this.viewOnly) throw new Error(WORKSPACE_ARCHIVED)
-    const line = this.note({speaker: 'liaison', text, workOrderId, ref: request, inputAttachments: handoff?.inputAttachments,
+    const line = this.note({speaker: 'liaison', text, workOrderId, ref: request, inputAttachments: handoff?.inputAttachments, experienceRefs:handoff?.experienceRefs,
       ...(handoff?.original && {quote: {label: '主人原话', text: handoff.original}})})
     this.handle(s => s.dispatchEngagement(request, members, {triggerSeq: line.seq, note: '接口人请你继续处理这一项', workOrderId}), true, true)
     return line
@@ -626,6 +643,11 @@ export class GroupEngine {
 
   /** A member's message or progress line: the files it links inside the working directory, as its attachments. */
   private withFiles(input: GroupLineInput): GroupLineInput {
+    if (this.options.experience && input.memberCallId) {
+      const selected = this.callExperience.get(input.memberCallId)?.entries
+      const captured = this.sessions.native(input.speakerId, input.workOrderId)?.experience
+      input = {...input, experienceRefs: experienceHistory(selected, captured)}
+    }
     // Host-written lines (hand-overs, verdicts: they carry a `ref`) never publish files as the member's own.
     if (input.kind === 'event' || input.ref !== undefined || input.attachments?.length || !this.kinds.has(input.speakerId)) return input
     let workDir: string
@@ -642,7 +664,68 @@ export class GroupEngine {
   private context(): GroupContext {
     const info = this.options.info()
     return { scope: this.options.scope, workspaceId: this.options.workspaceId, groupId: this.options.groupId, workspaceName: info.workspaceName,
-      title: info.title, workDir: this.options.workDir(), sessions: this.sessions, commandsPath: join(this.options.dir, GROUP_COMMANDS_FILE) }
+      title: info.title, workDir: this.options.workDir(), sessions: this.sessions, commandsPath: join(this.options.dir, GROUP_COMMANDS_FILE),
+      experience: this.options.experience }
+  }
+
+  private selectExperience(member: GroupRosterMember, triggerSeq: number, workOrderId?: string) {
+    const access = this.options.experience
+    if (!access) return
+    const trigger = this.ledger.get(triggerSeq)
+    const source = this.ledger.all().findLast(line => line.seq <= triggerSeq && line.workOrderId === workOrderId
+      && (line.speakerId === OWNER_ID || line.speakerId === LIAISON_MEMBER_ID && !!line.ref && !!line.quote))
+    const order = workOrderId ? this.options.orderTask?.(workOrderId) : undefined
+    const owningSource = source?.speakerId === OWNER_ID ? source.text : source?.quote?.text
+    const browserAssignment = this.ledger.all().some(line => line.seq <= triggerSeq && line.workOrderId === workOrderId &&
+      line.speakerId === LIAISON_MEMBER_ID && line.ref?.startsWith('staff-'))
+    const purposeTask = owningSource ?? order?.original ?? (browserAssignment ? order?.task : '') ?? ''
+    const task = [order?.task, purposeTask, trigger?.speakerId === OWNER_ID ? trigger.text : undefined].filter(Boolean).join('\n')
+    return access.selectExperience({ workspaceId: this.options.workspaceId,
+      staffId: member.id === LIAISON_MEMBER_ID ? undefined : member.id, task, purposeTask,
+      ...member.kind !== 'dsh' && {domains: ['软件工程']} })
+  }
+
+  private experienceCurrent(scheduler: GroupScheduler, callId: string) {
+    const call = scheduler.calls.find(row => row.id === callId)
+    return !call || this.canPublishExperience(call)
+  }
+
+  private canPublishExperience(call: GroupCall) {
+    const access = this.options.experience
+    if (!access) return true
+    try {
+      const binding = this.sessions.native(call.memberId, call.workOrderId)
+      if (binding?.memories?.length) return false
+      const selection = this.callExperience.get(call.id)
+      if (selection) access.assertExperienceCurrent(selection)
+      if (!binding?.experience?.length) return true
+      const member = this.roster.find(row => row.id === call.memberId)
+      const current = selection ? access.selectExperience(selection.query) : member && this.selectExperience(member,call.triggerSeq,call.workOrderId)
+      return binding.experience.every(ref => current?.authorized.some(entry => ref.id === entry.id && ref.version === entry.version))
+    } catch { return false }
+  }
+
+  /** The receiving member must also receive the versions used by any replayed member line. */
+  private replayAllowed(line: GroupLine, experience: ExperienceSelection | undefined, omitUntracked = false) {
+    if (!experience || line.speakerId === OWNER_ID) return true
+    if (line.experienceRefs) return line.experienceRefs.every(ref =>
+      experience.entries.some(entry => ref.id === entry.id && ref.version === entry.version))
+    if (line.speakerId === HOST_ID || line.quote && line.ref) return true
+    return !omitUntracked && !this.sessions.hasLegacyExperience()
+  }
+
+  projectLiaisonHistory(lines: readonly GroupLine[], triggerSeq: number, workOrderId?: string) {
+    const liaison = this.roster.find(member => member.id === LIAISON_MEMBER_ID)
+    if (!liaison && this.options.experience) return lines.filter(line => !line.experienceRefs?.length)
+    const experience = liaison && this.selectExperience(liaison,triggerSeq,workOrderId)
+    return lines.filter(line => this.replayAllowed(line,experience))
+  }
+
+  canUseLiaisonExperience(refs: readonly ExperienceRef[], triggerSeq: number, workOrderId?: string) {
+    if (!refs.length) return true
+    const liaison = this.roster.find(member => member.id === LIAISON_MEMBER_ID)
+    const experience = liaison && this.selectExperience(liaison,triggerSeq,workOrderId)
+    return refs.every(ref => experience?.entries.some(entry => ref.id === entry.id && ref.version === entry.version))
   }
 
   /** 改调度器、执行效果、存盘、重定计时器。 */
@@ -654,6 +737,8 @@ export class GroupEngine {
     let effects: GroupEffect[]
     try {
       effects = fn(scheduler)
+      const remaining = new Set(scheduler.calls.map(call => call.id))
+      for (const callId of this.callExperience.keys()) if (!remaining.has(callId)) this.callExperience.delete(callId)
       this.persist(save || effects.length > 0, strict)
     } catch (error) {
       if (before) scheduler.restore(before)
@@ -773,6 +858,21 @@ export class GroupEngine {
     }
     if (!runner?.steer) { this.steering.set(key, Promise.resolve(fallback())); return }
     const lines = this.ledger.unseen(effect.memberId).filter(line => line.seq <= effect.seq && (!line.workOrderId || this.schedule.sameOrder(line.workOrderId, effect.workOrderId)))
+    const experience = this.callExperience.get(effect.callId)
+    const participant = this.roster.find(row => row.id === effect.memberId)
+    if (experience && participant) {
+      let current: ExperienceSelection | undefined
+      try { current = this.selectExperience(participant,effect.seq,effect.workOrderId) }
+      catch { this.steering.set(key, Promise.resolve(fallback())); return }
+      const entries = experience.entries.filter(entry => current?.authorized.some(ref => ref.id === entry.id && ref.version === entry.version))
+      const exposed = this.sessions.native(effect.memberId,effect.workOrderId)?.experience ?? []
+      if (experience.entries.some(entry => entry.purpose && !entries.includes(entry))
+        || exposed.some(ref => !current?.authorized.some(entry => ref.id === entry.id && ref.version === entry.version))) {
+        this.steering.set(key, Promise.resolve(fallback()))
+        return
+      }
+      for (let index = lines.length - 1; index >= 0; index--) if (!this.replayAllowed(lines[index]!, {...experience, entries})) lines.splice(index, 1)
+    }
     if (!lines.some(line => line.seq === effect.seq)) { const own = this.ledger.get(effect.seq); if (own) lines.push(own) }
     let sent: Promise<MemberSteer>
     const refs = this.inputsFor(effect.memberId, effect.workOrderId, effect.seq, lines)
@@ -806,9 +906,10 @@ export class GroupEngine {
     try { refused = this.options.admit?.({ callId: effect.callId, member, by: effect.by, reason: effect.reason, ...effect.workOrderId !== undefined && { workOrderId: effect.workOrderId } }) }
     catch (error) { refused = error instanceof Error ? error.message : String(error) }
     if (refused) { this.fail(effect.callId, refused); return }
-    let group: GroupContext
-    try { group = this.context() }
+    let group: GroupContext, experience: MemberCall['experience']
+    try { group = this.context(); experience = this.selectExperience(member, effect.triggerSeq, effect.workOrderId) }
     catch (error) { this.fail(effect.callId, error instanceof Error ? error.message : String(error)); return }
+    if (experience) this.callExperience.set(effect.callId,experience)
     const info = this.options.info()
     const binding = this.sessions.member(member.id)
     const isFresh = !binding || binding.kind !== member.kind || binding.cwd !== group.workDir || binding.inputScoped && binding.workOrderId !== effect.workOrderId || this.ledger.seen(member.id) === undefined
@@ -819,24 +920,29 @@ export class GroupEngine {
       const other = this.roster.find(item => item.id === row.memberId)
       return other ? [{ name: other.name, status: row.status as GroupCallStatus, ...minutesSince(now, row.since) !== undefined && { minutes: minutesSince(now, row.since) } }] : []
     })
-    const promptFor = (asFresh: boolean) => {
-      const lines = (asFresh ? this.ledger.all() : this.ledger.unseen(member.id)).filter(line => !line.workOrderId || scheduler.sameOrder(line.workOrderId, effect.workOrderId))
+    const promptFor = (asFresh: boolean, authorizedOnly = false) => {
+      const lines = (asFresh ? this.ledger.all() : this.ledger.unseen(member.id)).filter(line =>
+        (!line.workOrderId || scheduler.sameOrder(line.workOrderId, effect.workOrderId)) && this.replayAllowed(line,experience,authorizedOnly))
       if (asFresh && lines.length > LEDGER_FIRST_LOOK) lines.splice(0, lines.length - LEDGER_FIRST_LOOK)
       // The line that called it is always shown, also when it carries its own name (a hand-over the host wrote for it).
       const trigger = this.ledger.get(effect.triggerSeq)
-      if (trigger && !lines.some(line => line.seq === trigger.seq) && (asFresh || trigger.inputAttachments?.length || (this.ledger.seen(member.id) ?? 0) < trigger.seq)) {
+      if (trigger && this.replayAllowed(trigger,experience,authorizedOnly) && !lines.some(line => line.seq === trigger.seq) &&
+          (asFresh || trigger.inputAttachments?.length || (this.ledger.seen(member.id) ?? 0) < trigger.seq)) {
         lines.push(trigger)
         lines.sort((a, b) => a.seq - b.seq)
       }
       const shown = new Set(lines.map(line => line.seq))
-      const results = (effect.results ?? []).filter(seq => !shown.has(seq)).flatMap(seq => this.ledger.get(seq) ?? []).filter(line => line.workOrderId === effect.workOrderId)
+      const results = (effect.results ?? []).filter(seq => !shown.has(seq)).flatMap(seq => this.ledger.get(seq) ?? [])
+        .filter(line => line.workOrderId === effect.workOrderId && this.replayAllowed(line,experience,authorizedOnly))
       const {materials, note} = this.inputsFor(member.id, effect.workOrderId, effect.triggerSeq, [...lines, ...results])
       return {text: memberPrompt({ member, members: this.roster, info, start: effect, lines, results, busy, fresh: asFresh }) + note, inputs: materials}
     }
     const initial = promptFor(isFresh)
     const recap = isFresh ? initial : promptFor(true)
-    const call: MemberCall = { callId: effect.callId, group, member, identity: memberIdentity(member, info, group.workDir), prompt: initial.text, recap: () => recap.text,
-      ...initial.inputs, recapInputs: recap.inputs,
+    const ownerRecap = experience && promptFor(true, true)
+    const identity = memberIdentity(experience ? {...member, memories: undefined} : member, info, group.workDir)
+    const call: MemberCall = { callId: effect.callId, group, member, identity, prompt: initial.text, recap: authorizedOnly => authorizedOnly && ownerRecap ? ownerRecap.text : recap.text,
+      ...initial.inputs, recapInputs: recap.inputs, ownerRecapInputs: ownerRecap?.inputs, experience,
       ...effect.workOrderId !== undefined && { workOrderId: effect.workOrderId } }
     let delivered: Promise<void>
     try { delivered = runner.run(call, this.sink) }

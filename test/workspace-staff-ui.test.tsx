@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { afterEach, expect, it, vi } from 'vitest'
 import { StaffPortraitPicker } from '../src/client/workspace-staff-portrait.tsx'
 import { StaffBoard } from '../src/client/workspace-staff.tsx'
-import { isStaffImpact, isStaffView, staffPath } from '../src/client/workspace-staff-response.ts'
+import { isSharedExperienceVersion, isStaffImpact, isStaffView, staffPath } from '../src/client/workspace-staff-response.ts'
 import * as api from '../src/client/workspace-v2-api.ts'
 import type { StaffView } from '../src/core/workspace-staff.ts'
 import type { V2WorkspaceView } from '../src/core/workspace-v2.ts'
@@ -35,10 +35,48 @@ it('gives the global role card its membership list and whole-role reset',()=>{
   expect(html).toContain('重置全部记忆')
   expect(html).not.toContain('重置本区记忆')
 })
+it('shows the evidence reference on global growth records from legacy orders',()=>{
+  const memory = {...local.memories[0]!,workspaceId:undefined,
+    evidence:[{kind:'order' as const,id:'T-0001',version:'2026-11-20T08:00:00.000Z'}]}
+  const html = card({...global,memories:[memory]})
+  expect(html).toContain('来源工单')
+  expect(html).toContain('来源编号 · T-0001 · 来源版本 2026-11-20T08:00:00.000Z')
+})
 it('shows the local duty, granted excerpt, and limited reset on the same card',()=>{
-  const html=card(local,view)
-  for(const text of ['研究员','整理访谈','确认下一步','两种按钮容易混淆','交给这位幕僚','共享经验','重置本区记忆']) expect(html).toContain(text)
+  const inherited = {...local.memories[0]!,id:'global-staff',workspaceId:undefined,text:'全局幕僚专属经验'}
+  const html=card({...local,memories:[...local.memories,inherited]},view)
+  for(const text of ['研究员','整理访谈','成长记录','确认下一步','两种按钮容易混淆','交给这位幕僚','共享经验','重置本区记忆']) expect(html).toContain(text)
+  expect(html).not.toContain(inherited.text)
   expect(html).not.toContain('重置全部记忆')
+  expect(card({...global,memories:[inherited]})).toContain(inherited.text)
+})
+
+it('reads and manages shared experience from a dedicated workspace projection',()=>{
+  const common = {id:'common',audience:'shared',workspaceId:space.id,text:'复述访谈决定',status:'active',version:2,at:'2026-11-24',
+    situation:'访谈收尾',taskTypes:['访谈'],evidence:[{kind:'owner',id:'message-id',quote:'以后要复述访谈决定'}]} as const
+  const current = {...common,evidence:[...common.evidence],taskTypes:[...common.taskTypes]}
+  const staff: StaffView = {...local,members:[],memories:[],received:[],
+    sharedExperiences:[current,{...current,id:'candidate',status:'proposed',text:'访谈前复述提纲'},
+      {...current,id:'retired',status:'retired',text:'旧的访谈安排',reason:'交接已统一',previousVersions:[1]},
+      {...current,id:'inherited',workspaceId:undefined,text:'统一全局命名'}],
+    sharedReceived:[{id:'borrowed',text:'获准参考实例',purpose:'编写访谈提纲'}]}
+  const path = staffPath(space.id,true)
+  expect(isStaffView(staff,path)).toBe(true)
+  const read = vi.spyOn(api,'useV2Read').mockImplementation((resource,valid)=>({data:resource && valid(staff,resource) ? staff : undefined,refresh:async()=>{},error:undefined}))
+  const html = renderToStaticMarkup(<StaffBoard workspace={view} experience spaces={[space]} select={()=>{}}
+    openOrder={()=>{}} openMembership={()=>{}} openGlobal={()=>{}}/>)
+  expect(read).toHaveBeenCalledWith(path,isStaffView,10000)
+  for (const text of ['本区共同经验','复述访谈决定','以后要复述访谈决定','任务类型 · 访谈','现在整理','添加共同经验','待采纳','已停用','交接已统一','历史版本',
+    '全局共同经验','统一全局命名','到「我的幕僚」管理','获准参考实例','获准借入 · 只读','编写访谈提纲']) expect(html).toContain(text)
+  expect(html.match(/>更正<\/button>/g)).toHaveLength(2)
+  expect(html).not.toContain(member.name)
+  expect(html).not.toContain(local.memories[0]!.text)
+  expect(html).not.toContain(local.received[0]!.text)
+  expect(isStaffView({...staff,memories:local.memories},path)).toBe(false)
+  expect(isStaffView({...staff,received:local.received},path)).toBe(false)
+  expect(isStaffView({...staff,retiredMemories:[{...local.memories[0]!,audience:'staff',status:'retired'}]},path)).toBe(false)
+  expect(isSharedExperienceVersion({scope:'b',memory:current})).toBe(true)
+  expect(isSharedExperienceVersion({scope:'b',memory:{...local.memories[0]!,audience:'staff'}})).toBe(false)
 })
 
 it('offers the approved ten objects and seven colors with a static saved portrait in the owner view',()=>{

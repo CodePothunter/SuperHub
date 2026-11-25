@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WORKSPACE_ARCHIVED, workspaceArchived, type V2Delegation, type V2DialogueSource, type V2PendingApproval, type V2Session, type V2Workspace, type WorkOrderOutput, type WorkspaceOutput } from '../src/core/workspace-v2.ts'
 import { workspaceFingerprint } from '../src/dsh/superhub-goals.ts'
 import type { ChatInputAttachment } from '../src/core/chat-attachments.ts'
+import type { StaffView } from '../src/core/workspace-staff.ts'
 import type { ChatAttachments } from '../src/dsh/chat-attachments.ts'
 import { serveApi } from '../src/dsh/http.ts'
 import type { AcceptanceVerdict } from '../src/dsh/workspace-acceptance.ts'
@@ -24,6 +25,9 @@ import { appendCommandLog } from '../src/dsh/workspace-command-log.ts'
 import { WorkspaceV2Store } from '../src/dsh/workspace-v2-store.ts'
 import type { OrderResultNotice, ResultNoticeList } from '../src/core/workspace-notices.ts'
 import type { EngagementCoordinator, EngagementDecision, OwnerAction } from '../src/core/workspace-engagement.ts'
+import type { ExperienceEvidence } from '../src/core/workspace-experience.ts'
+import { createExperienceLearning, type ExperienceLearning } from '../src/dsh/workspace-experience-learning.ts'
+import type { Llm } from '../src/dsh/ports.ts'
 
 const scope = 'brain-g'
 const cleanup: (() => void)[] = []
@@ -76,7 +80,7 @@ const NATIVE = [
   { id: 'researcher', name: '研究员', brief: '查资料', executor: 'dsh' as const },
 ]
 
-function fixture(options: { turnLimit?: number; review?: AcceptanceVerdict[] | 'fail'; judge?: CommandIntent; root?: string; inputAttachments?: Pick<ChatAttachments, 'resolve' | 'grant'>; coordinate?: EngagementCoordinator } = {}) {
+function fixture(options: { turnLimit?: number; review?: AcceptanceVerdict[] | 'fail'; judge?: CommandIntent; root?: string; inputAttachments?: Pick<ChatAttachments, 'resolve' | 'grant'>; coordinate?: EngagementCoordinator; llm?: Pick<Llm, 'stream'> } = {}) {
   const root = options.root ?? mkdtempSync(join(tmpdir(), 'chief-group-routes-'))
   if (!options.root) cleanup.push(() => rmSync(root, { recursive: true, force: true }))
   const dsh = new FakeRunner(), codex = new FakeRunner()
@@ -98,6 +102,7 @@ function fixture(options: { turnLimit?: number; review?: AcceptanceVerdict[] | '
   const source: V2DialogueSource = { read: vi.fn(async () => ({ messages: [] })), send: vi.fn(async () => {}), attachment: vi.fn(async () => undefined) }
   let store!: WorkspaceV2Store, staff!: WorkspaceStaffStore, host!: WorkspaceGroupHost
   let route!: ReturnType<typeof workspaceV2Routes>
+  let learning: ExperienceLearning | undefined
   const mount = () => {
     store = new WorkspaceV2Store(root, scope, options.turnLimit ?? 10, { rosterGroups: true })
     staff = new WorkspaceStaffStore(root, scope, () => NATIVE, id => store.workspace(id))
@@ -105,13 +110,16 @@ function fixture(options: { turnLimit?: number; review?: AcceptanceVerdict[] | '
       roster: workspaceId => groupRoster({ workspaceId, staff: staff.view(workspaceId).members, native: NATIVE, defaults: { liaisonPinned: false },
         context: id => staff.context(workspaceId, id), liaisonName: '接口人' }),
       runners: { dsh, codex } })
-    route = workspaceV2Routes({ staff, store, source, approvals, groups: host, inputAttachments: options.inputAttachments, coordinate: options.coordinate, ...options.review && { review }, ...options.judge && { judge: async () => options.judge! },
+    learning = options.llm && createExperienceLearning({root, scope, staff, writable: id => store.writable(id),
+      llm: () => options.llm, model: () => ({provider: 'fixture', model: 'fixture'})})
+    route = workspaceV2Routes({ staff, store, source, approvals, groups: host, learning, inputAttachments: options.inputAttachments, coordinate: options.coordinate, ...options.review && { review }, ...options.judge && { judge: async () => options.judge! },
       remind: (key, text, _order, extra) => reminders.push({ key, text, ...extra?.localOnly && { localOnly: true } }) })
     route.recover()
   }
   mount()
-  cleanup.push(() => { route.dispose(); host.dispose() })
-  const restart = () => { route.dispose(); host.dispose(); mount() }
+  const dispose = () => { route.dispose(); host.dispose(); learning?.dispose() }
+  cleanup.push(dispose)
+  const restart = () => { dispose(); mount() }
   async function call<T = { error: string }>(path: string, body?: Record<string, unknown>, outsideWorkspace = false) {
     const url = new URL('/chief/api/v2' + (outsideWorkspace ? '' : '/workspaces') + path, 'http://local')
     url.searchParams.set('scope', scope)
@@ -140,6 +148,83 @@ function fixture(options: { turnLimit?: number; review?: AcceptanceVerdict[] | '
   return { root, call, id, workspace, group, say, view, order, dsh, codex, reminders, pending, answered, review, source, restart,
     store: () => store, staff: () => staff, host: () => host, route: () => route }
 }
+
+describe('群成员的成长记录', () => {
+  const model = (lesson: string, texts: string[], groupLesson?: string) => ({async *stream(request) {
+    const input = JSON.parse(request.messages[0]!.content[0]!.text) as {summary?: string; evidence?: ExperienceEvidence[]}
+    const proof = input.evidence?.[0]
+    const text = proof?.kind === 'group' ? lesson : proof?.kind === 'delivery' ? groupLesson : undefined
+    const answer = input.evidence ? {changes: text && proof ? [{action: 'learn', text, basis: [proof.id]}] : []} : {action: 'none'}
+    if (input.summary) texts.push(input.summary)
+    yield {type: 'text-delta', text: JSON.stringify(answer)}
+  }} satisfies Pick<Llm, 'stream'>)
+
+  it.each([false, true])('从宿主持久化的成员成果生成本区个人候选（协调器 %s）', async coordinate => {
+    const lesson = '排查端点超时时先用只读命令核对区域配置，再检查重试日志。'
+    const texts: string[] = []
+    const f = fixture({
+      coordinate: coordinate ? async () => ({kind: 'none'}) : undefined,
+      llm: model(lesson, texts),
+    })
+    const ws = await f.workspace(), other = await f.workspace(), session = await f.group(ws)
+    await f.say(session, '@工程师 排查端点超时')
+    await vi.waitFor(() => expect(f.codex.count('engineer')).toBe(1))
+    const {call, sink} = f.codex.last('engineer')
+    sink.stepped(call.callId, '正在查看日志。')
+    expect(texts).toEqual([])
+    const result = '核实超时端点用了另一个区域。根据只读配置输出与重试日志定位了错误。'
+    f.codex.answer('engineer', result)
+    const source = (await f.view(session)).data.messages.find(message => message.text === result)!
+    const local = () => f.call<StaffView>('/' + ws.id + '/staff')
+    const memory = expect.objectContaining({audience: 'staff', staffId: 'engineer', discoveredBy: 'engineer',
+      workspaceId: ws.id, status: 'proposed', text: lesson, evidence: [expect.objectContaining({kind: 'group',
+        workspaceId: ws.id, sessionId: session.id, messageId: source.id, quote: result})]})
+    await vi.waitFor(async () => expect((await local()).data.memories).toEqual([memory]))
+    expect((await local()).data.sharedExperiences).toBeUndefined()
+    expect((await f.call<StaffView>('/staff', undefined, true)).data.memories).toEqual([memory])
+    expect((await f.call<StaffView>('/' + other.id + '/staff')).data.memories).toEqual([])
+
+    await f.say(session, '@研究员 看一下结论')
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(1))
+    f.dsh.answer('researcher', '收到，谢谢。', false)
+    await f.say(session, '@研究员 再核对一次')
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(2))
+    const retry = f.dsh.last('researcher')
+    retry.sink.stepped(retry.call.callId, '还在核对配置。')
+    retry.sink.finished(retry.call.callId, {status: 'failed', text: '', toolCalls: 0, detail: '没有取到日志'})
+    f.restart()
+    const organized = await f.call<StaffView>('/' + ws.id + '/staff', {action: 'organize', requestId: f.id()})
+    expect(organized.data.memories).toEqual([memory])
+    expect(texts).toEqual([result])
+  })
+
+  it('正式阶段回报可作为候选依据，普通过程发言和空结束没有新条目', async () => {
+    const texts: string[] = []
+    const lesson = '核对现行端点价格时将活动折扣和标准单价分列。'
+    const groupLesson = '价格表的标准单价与活动折扣各附原始价目表。'
+    const f = fixture({llm: model(lesson, texts, groupLesson)})
+    const ws = await f.workspace()
+    const job = f.route().assign('owner-growth', '让研究员核实端点价格', undefined, ws.id, undefined,
+      {title: '端点价格', promise: '可核对的端点价格表'}, 'researcher')
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(1))
+    const {call, sink} = f.dsh.last('researcher')
+    const report = '阶段回报\n已核对标准单价和活动折扣。两类价格分别采自不同的价目表。'
+    sink.stepped(call.callId, report)
+    const read = (await f.view(job.session)).data
+    const source = read.messages.find(message => message.text === report)!
+    const local = () => f.call<StaffView>('/' + ws.id + '/staff')
+    const memory = expect.objectContaining({audience: 'staff', staffId: 'researcher', status: 'proposed', text: lesson,
+      orderId: job.delegation.id, evidence: [expect.objectContaining({messageId: source.id, orderId: job.delegation.id, quote: report})]})
+    await vi.waitFor(async () => expect((await local()).data.memories).toEqual([memory]))
+    f.dsh.answer('researcher', '[PASS]', false)
+    f.restart()
+    const organized = await f.call<StaffView>('/' + ws.id + '/staff', {action: 'organize', requestId: f.id()})
+    expect(organized.data.memories).toEqual([memory])
+    expect(organized.data.sharedExperiences).toEqual([expect.objectContaining({audience: 'shared', text: groupLesson,
+      workspaceId: ws.id, status: 'proposed', evidence: [expect.objectContaining({kind: 'delivery', messageId: source.id})]})])
+    expect(texts.filter(text => text === report)).toHaveLength(1)
+  })
+})
 
 describe('工作交接', () => {
   const waitFor = (check: () => void | Promise<void>) => vi.waitFor(check, {timeout: 3000, interval: 15})
@@ -986,6 +1071,33 @@ describe('续上的成员回合也占着目录', () => {
     await expect(gone.reattach({ callId: 'c2', group: g, member: { id: 'm', name: 'm', kind: 'dsh' }, identity: '' }, sink)).resolves.toBe(false)
     expect(locks.busy('dir:/repo')).toBe(false)
     placed.dispose()
+  })
+})
+
+describe('工作区共同经验入口', () => {
+  it('列表、写入回执和历史只返回共同经验，幕僚专属仍可在幕僚入口查看', async () => {
+    const f = fixture()
+    const ws = await f.workspace()
+    const path = '/' + ws.id + '/staff'
+    const shared = path + '?experience=shared'
+    const privateText = '只交给工程师的核对方法'
+    const commonText = '工作区共同核对方法'
+    const personal = await f.call<StaffView>(path, {requestId:f.id(), action:'learn', staffId:'engineer', text:privateText})
+    const privateId = personal.data.memories[0]!.id
+    await f.call(path, {requestId:f.id(), action:'revise', staffId:'engineer', memoryId:privateId, text:'他的新版'})
+    const common = await f.call<StaffView>(shared, {requestId:f.id(), action:'learn', audience:'shared', text:commonText})
+    expect(common).toMatchObject({status:200, data:{members:[], available:[], memories:[], received:[],
+      sharedExperiences:[{text:commonText, audience:'shared'}]}})
+    const commonId = common.data.sharedExperiences![0]!.id
+    const listed = await f.call<StaffView>(shared)
+    expect(listed.data).toEqual(common.data)
+    expect(JSON.stringify(listed.data)).not.toContain(privateId)
+    const history = (id: string) => `&memory=${id}&version=1`
+    expect(await f.call(shared + history(privateId))).toMatchObject({status:404})
+    expect(await f.call(path + '?' + history(privateId).slice(1))).toMatchObject({status:200, data:{memory:{text:privateText}}})
+    expect(await f.call(shared + history(commonId))).toMatchObject({status:200, data:{memory:{text:commonText}}})
+    expect(await f.call(shared, {requestId:f.id(), action:'retire', staffId:'engineer', memoryId:privateId})).toMatchObject({status:400})
+    expect(await f.call<StaffView>(path)).toMatchObject({status:200, data:{memories:[{id:privateId, text:'他的新版', status:'active'}]}})
   })
 })
 

@@ -121,6 +121,12 @@ describe('工作区产物：地址与响应', () => {
     expect(readPlace('brain')).toMatchObject({panel: 'staff'})
   })
 
+  it('「经验」有独立的工作区地址，忽略混入的个人条目或工单参数', () => {
+    vi.stubGlobal('location', {hash: '#v2?scope=brain&view=workspace&workspace=w&panel=experience&item=private&order=stale'})
+    expect(readPlace('brain')).toEqual({view:'workspace',workspace:'w',panel:'experience'})
+    expect(readPlace('other')).toEqual({view:'today'})
+  })
+
   it('只接受本工作区的产物，每个须有工单标签', () => {
     const value = answer(seven)
     expect(isWorkspaceOutputs(value, path)).toBe(true)

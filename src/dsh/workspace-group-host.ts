@@ -31,6 +31,7 @@ export interface GroupHostOptions {
   /** The group's roster: the liaison as admin and the workspace's staff (`groupRoster`), read fresh each time. */
   roster: (workspaceId: string) => GroupRosterMember[]
   runners: Partial<Record<GroupMemberKind, MemberRunner>>
+  experience?: GroupEngineOptions['experience']
   approvals?: GroupEngineOptions['approvals']
   locks?: DirectoryLocks
   logger?: Logger
@@ -115,6 +116,12 @@ export class WorkspaceGroupHost {
       },
       roster: () => this.options.roster(workspaceId),
       runners: this.runners,
+      experience: this.options.experience,
+      orderTask: orderId => {
+        const order = this.options.store.delegation(workspaceId,orderId)
+        return {task:[order.title,order.promise].join('\n'),
+          original:order.hasOriginal ? this.options.store.orderOriginal(workspaceId,orderId).text : undefined}
+      },
       ...this.options.approvals && { approvals: this.options.approvals },
       onEffects: effects => this.handlers.onEffects?.(current(), effects, engine),
       onChange: () => this.handlers.onChange?.(current(), engine),

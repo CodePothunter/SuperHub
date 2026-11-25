@@ -72,12 +72,22 @@ function response({ messages, sessionId, tools, system }) {
     if (!done('staff-remember-local')) return call('staff-remember-local','chief_workspace',{action:'remember_staff',staff_name:'轮值访谈研究员',quote:'乙的独立经验'})
     return text('已记录本区访谈做法。')
   }
+  if (sessionId?.startsWith('chief-liaison-') && words === '以后本区访谈结束都先核对原始录音。') {
+    if (!done('remember-shared-interview')) return call('remember-shared-interview','chief_workspace',{
+      action:'remember_experience',quote:words,
+    })
+    return text('已记录本区共同做法。')
+  }
+  if (sessionId?.startsWith('chief-liaison-') && words?.startsWith('请你自己核对访谈流程')) {
+    const prompted = messages.some(message => (message.role === 'system' || message.source?.kind === 'runtime-context') && said(message).includes('〔SuperHub 经验版本〕')
+      && said(message).includes('先核对原始录音'))
+    return text(prompted ? '已收到本区共同经验。' : '本轮没有这条共同经验。')
+  }
   if (history.includes('核对本轮获准的访谈方法')) {
-    // The experience the member is given: its system prompts (a group member's identity lists its experience there; a long-
-    // lived DSH session keeps every earlier turn's system prompt in its history). The group's lines may quote an earlier
-    // answer naming a revoked method; that is the group's public record, not experience given to the member.
-    const given = systemText(system) + '\n' + messages.filter(m => m.role === 'system').map(said).join('\n')
-    const visible = ['访谈结束复述约定', '甲的虚构访谈对象', '乙的独立经验'].filter(method => given.includes(method))
+    const actual = messages.filter(message => message.role === 'user').map(said).findLast(text => text.startsWith('〔本轮参考经验〕'))
+    const given = actual ? (actual.split('\n本轮可参考的经验。')[1] ?? '').split('\n\n')[0]
+      : systemText(system) + '\n' + messages.filter(m => m.role === 'system').map(said).join('\n')
+    const visible = ['访谈结束复述约定', '甲的虚构访谈对象', '乙的独立经验','先核对原始录音'].filter(method => given.includes(method))
     return text('本轮可用记录为 ' + (visible.join('、') || '空') + '。')
   }
   if (sessionId?.startsWith('chief-v2-member-')) {

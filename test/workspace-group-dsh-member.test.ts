@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { V2CodingPermission } from '../src/core/workspace-v2.ts'
 import type { ChatInputAttachment } from '../src/core/chat-attachments.ts'
+import type { ExperienceEntry } from '../src/core/workspace-experience.ts'
 import type { ChatAttachments } from '../src/dsh/chat-attachments.ts'
 import { commandApprovals, type PendingCommand } from '../src/dsh/approvals.ts'
 import { CodingGate, type Reviewer } from '../src/dsh/coding-gate.ts'
@@ -280,6 +281,42 @@ describe('DSH 成员会话的建立', () => {
 })
 
 describe('经验撤回后换新会话', () => {
+  it('队列认领不能代替实际 DSH 请求，收到模型响应后登记，撤权后的回报与旧回放不再提供', async () => {
+    const t = setup()
+    const {sink,finished} = sinkLog()
+    const old = {id:'style',version:1,text:'这一版经验已撤回。'}
+    let active: ExperienceEntry[] = [old]
+    const recordExperienceDelivery = vi.fn()
+    const query = {task:'研究',workspaceId:'w1',staffId:'res'}
+    t.group.experience = {
+      selectExperience: query => ({query,scope:'brain',authority:'v1',entries:active,authorized:active}),
+      assertExperienceCurrent: selection => {
+        if (selection.entries.some(ref => !active.some(entry => entry.id === ref.id && entry.version === ref.version))) throw new Error('revoked')
+      },
+      recordExperienceDelivery,
+    }
+    const extra = () => ({experience:t.group.experience!.selectExperience(query), recap:(clean?:boolean)=>clean ? '主人原话' : '旧助手回放'})
+    await t.runner.run(t.call('c1', extra()), sink)
+    const first = t.host.prompts[0]!
+    expect(first.text).toContain(old.text)
+    expect(recordExperienceDelivery).not.toHaveBeenCalled()
+    t.host.turn(first.sessionId, first.requestId, emit => {
+      expect(recordExperienceDelivery).not.toHaveBeenCalled()
+      emit('assistant/message', {message:{content:[{type:'text',text:'先核查材料'}]}})
+      expect(recordExperienceDelivery).toHaveBeenCalledWith(expect.anything(),
+        {turnId:'c1.1',executorId:'res',sessionId:'g1',nativeSessionId:first.sessionId,orderId:'d1'})
+      active = [{...old,version:2,text:'这一版经验可以使用。'}]
+      emit('assistant/message', {message:{content:[{type:'text',text:'不该回报的内容'}]}})
+    })
+    expect(finished).toContainEqual(expect.objectContaining({text:'',status:'failed'}))
+    await t.runner.run(t.call('c2', extra()), sink)
+    const next = t.host.prompts[1]!
+    expect(next.sessionId).not.toBe(first.sessionId)
+    expect(next.text).toContain(active[0]!.text)
+    expect(next.text).toContain('主人原话')
+    expect(next.text).not.toContain('旧助手回放')
+  })
+
   it('同一会话续用到有经验被撤回：之后开一场新会话，并给它最近几行；新增经验不换会话', async () => {
     const t = setup()
     const { sink } = sinkLog()

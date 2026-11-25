@@ -32,7 +32,7 @@ import { WorkspaceSettings } from './workspace-settings.tsx'
 import { WORKSPACE_V2_STYLE } from './workspace-v2-style.ts'
 
 interface Props { scope: string; native?: () => void; configure: boolean; reloadBrain: () => Promise<void> }
-type Place = { view: SuperhubSurface | 'profile'; workspace?: string; panel?: 'execution' | 'outputs' | 'staff'; delegation?: string; session?: string; message?: string; item?: string; date?: string }
+type Place = { view: SuperhubSurface | 'profile'; workspace?: string; panel?: 'execution' | 'outputs' | 'staff' | 'experience'; delegation?: string; session?: string; message?: string; item?: string; date?: string }
 type Popup = 'new-space' | 'switch-space' | 'delegate' | 'new-session' | 'narrow' | 'cancel' | 'liaison' | 'import' | 'export'
 
 export function readPlace(scope: string): Place {
@@ -45,7 +45,9 @@ export function readPlace(scope: string): Place {
   if (view === 'settings') return {view,panel:staffPanel,item:staffPanel && id('item')}
   if (view === 'calendar') return {view,date:id('date')}
   if (view === 'people' || view === 'history' || view === 'profile') return {view,item:id('item')}
-  const workPanel = params.get('panel') === 'execution' ? 'execution' : params.get('panel') === 'outputs' ? 'outputs' : staffPanel
+  const panel = params.get('panel')
+  const workPanel = panel === 'execution' || panel === 'outputs' || panel === 'experience' ? panel : staffPanel
+  if (view === 'workspace' && workPanel === 'experience') return {view,workspace:id('workspace'),panel:workPanel}
   if (view === 'workspace') return {view,workspace:id('workspace'),panel:workPanel,item:staffPanel && id('item'),
     delegation:id('order') ?? id('delegation'),session:id('session'),message:id('message')}
   return {view:'today',workspace:id('workspace')}
@@ -173,6 +175,7 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
   }
   function newOrder(sessionId?: string, staff?: StaffMember) { setOrderStaff(staff); setOrderSession(sessionId); setPopup('delegate') }
   const staffPanel = place.panel === 'staff'
+  const experiencePanel = place.panel === 'experience'
   const outputsPanel = place.panel === 'outputs'
   const openOutputs = () => go({view:'workspace',workspace:chosenId,panel:'outputs'})
   // Outputs are re-read while an order can still deliver, and whenever the orders change (a turn spent, a new order).
@@ -254,6 +257,7 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
         <button aria-current={panel ? 'page' : undefined} onClick={() => go({ view: 'workspace', workspace: chosenId, panel: 'execution' })}><V2Icon name="chat"/>执行</button>
         <button aria-current={outputsPanel ? 'page' : undefined} onClick={openOutputs}><V2Icon name="box"/>产物</button>
         <button aria-current={staffPanel ? 'page' : undefined} onClick={() => go({view:'workspace',workspace:chosenId,panel:'staff'})}><V2Icon name="group"/>幕僚</button>
+        <button aria-current={experiencePanel ? 'page' : undefined} onClick={() => go({view:'workspace',workspace:chosenId,panel:'experience'})}><V2Icon name="book"/>经验</button>
       </nav>}
       {selecting && archived && shown && <ArchivedBanner workspace={shown} restored={async () => { await reread(); setNotice('已恢复「' + shown.name + '」。') }}/>}
       {place.view === 'history' && <HistoryPanel itemId={place.item} openItem={openHistory} back={() => openHistory()}/>}
@@ -262,6 +266,8 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
         openStaff={() => go({view:'settings',panel:'staff'})}/>}
       {place.view === 'settings' && staffPanel && <StaffBoard key={place.item ?? 'list'} spaces={spaces} selected={place.item}
         select={item => go({view:'settings',panel:'staff',item})} openOrder={(workspace,delegation) => go({view:'workspace',workspace,delegation})}
+        openEvidence={source => source.workspaceId && go({view:'workspace',workspace:source.workspaceId,delegation:source.orderId,
+          ...source.sessionId && source.messageId && source.kind !== 'owner' ? {panel:'execution',session:source.sessionId,message:source.messageId} : {}})}
         openMembership={(workspace,item) => go({view:'workspace',workspace,panel:'staff',item})}/>}
       {place.view === 'people' && <WorkspacePeople selected={place.item} open={item => go({view:'people',item})}
         back={() => go({view:'people'},place.item)}/>}
@@ -297,9 +303,13 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
             back={() => go({ view: 'workspace', workspace: chosenId, panel: 'execution' }, 'session-' + place.session)}
             openDelegation={openDelegation} create={() => setPopup('new-session')} changed={current.refresh}/>
             : outputsPanel ? <OutputsBoard key={view.workspace.id} base={base} feed={outputsFeed}/>
-            : staffPanel ? <StaffBoard key={view.workspace.id+'/'+(place.item ?? 'list')} workspace={view} spaces={spaces} selected={place.item}
+            : staffPanel || experiencePanel ? <StaffBoard key={view.workspace.id+'/'+place.panel+'/'+(place.item ?? 'list')}
+              workspace={view} spaces={spaces} selected={place.item} experience={experiencePanel}
               select={item => go({view:'workspace',workspace:chosenId,panel:'staff',item})}
               openOrder={(workspace,delegation) => go({view:'workspace',workspace,delegation})}
+              openEvidence={source => source.workspaceId && go({view:'workspace',workspace:source.workspaceId,delegation:source.orderId,
+                ...source.sessionId && source.messageId && (source.kind !== 'owner' || view.sessions.some(session=>session.id === source.sessionId))
+                  ? {panel:'execution',session:source.sessionId,message:source.messageId} : {}})}
               openMembership={(workspace,item) => go({view:'workspace',workspace,panel:'staff',item})}
               openGlobal={item=>go({view:'settings',panel:'staff',item})}
               assign={staff => newOrder(undefined,staff)}/>

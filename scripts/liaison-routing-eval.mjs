@@ -174,6 +174,15 @@ const allCases = [
     judge: turn => {
       if (!turn.currentSurface || turn.newWorkspaces || !turn.reply.includes('字节 Landing')) return '本轮未注入有效工作区上下文或答案不符'
     } },
+  { id:'workspace-experience-remember', needs:['workspace-create'], selected:true,
+    said:'请把这个长期要求记下来：以后本区访谈收尾都要核对蓝杉编号。',
+    expect:'按主人原话登记本区共同经验，无额外交办',
+    judge: turn => {
+      const stored = turn.experiences?.find(memory => memory.status === 'active' && memory.evidence?.some(source =>
+        source.kind === 'owner' && typeof source.quote === 'string' && turn.said.includes(source.quote) && source.quote.includes('蓝杉编号')))
+      if (!stored || !calls(turn,'chief_workspace',row=>args(row).action === 'remember_experience' && succeeded(row)).length) return '本区缺少有原话来源的共同经验'
+      if (createdTicket(turn) || turn.newRooms || turn.workOrders.length) return '登记经验时额外交办'
+    }},
   // Staff for one workspace only (chief_staff create with `workspace`); without a workspace name it stays a global role card.
   { id: 'workspace-staff-global', said: '加一个盯行业政策变化的幕僚', expect: 'chief_staff create 不带 workspace，建全局幕僚',
     judge: turn => {
@@ -488,6 +497,9 @@ async function conversation(host) {
     if (item.id.startsWith('followup-') && followupJob) turn.followup = await host.api(`/v2/workspaces/${followupJob.workspaceId}/orders/${followupJob.id}/followup?scope=${scope}`)
     if (item.id.startsWith('portrait-') || item.id.startsWith('workspace-staff-')) turn.staff = (await host.api(`/v2/staff?scope=${encodeURIComponent(scope)}`)).members
     if (item.id.startsWith('workspace-staff-')) turn.roster = (await host.api('/state')).staff
+    if (item.id === 'workspace-experience-remember' && selectedId) {
+      turn.experiences = (await host.api(`/v2/workspaces/${selectedId}/staff?scope=${encodeURIComponent(scope)}`)).sharedExperiences
+    }
     if (item.id === 'profile-submit') {
       const imports = replies.flatMap(message => message.profileImports ?? [])
       turn.profileRecords = await Promise.all(imports.map(async ({importId}) =>
