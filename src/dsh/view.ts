@@ -116,15 +116,12 @@ export interface WarroomState {
   events: EventRow[]
   staff: StaffRow[]
   sources: SourceRow[]
-  /** 接口人和幕僚自己定的跟进，按触发时间排。 */
-  timers: { id: string; at: string; text: string; by: string }[]
   /** 是否配置了推送渠道。 */
   push: boolean
   /** 服务端插件的构建编号；和页面自己的编号不同，说明有新版本。 */
   build: string
   goals: string
   remote: { waiting: number; taken: number }
-  rules: { id: string; when: string }[]
   poc: PocState
 }
 
@@ -155,12 +152,12 @@ const DISPOSITION: Record<string, string> = { pending: '等待研判', observed:
 
 export interface StateDeps {
   engine: Engine; brain: BrainRepo; brainScope?: string; remote: FileRemoteQueue; roster: Roster; rooms?: NativeRooms; available: (executor: string) => boolean
-  clock: () => { today: string; now: string }; sources: () => SourceRow[]; timers: () => WarroomState['timers']; push: () => boolean
+  clock: () => { today: string; now: string }; sources: () => SourceRow[]; push: () => boolean
   /** 待审批的执行器命令。只在主人的作战台视图里提供。 */
   commands?: () => readonly PendingCommand[]
 }
 
-export function warroomState({ engine, brain, brainScope, remote, roster, rooms, available, clock, sources, timers, push, commands: pending }: StateDeps): WarroomState {
+export function warroomState({ engine, brain, brainScope, remote, roster, rooms, available, clock, sources, push, commands: pending }: StateDeps): WarroomState {
   const views = engine.views().filter(({ ticket }) => !ticket.superhub || ticket.superhub.brainScope === brainScope)
   const visibleTickets = new Set(views.map(({ ticket }) => ticket.id))
   const by = (column: string) => views.filter(v => v.column === column)
@@ -194,12 +191,10 @@ export function warroomState({ engine, brain, brainScope, remote, roster, rooms,
       done: views.filter(v => v.ticket.ended && v.ticket.staff === s.id).length,
     })),
     sources: sources(),
-    timers: timers(),
     push: push(),
     build: typeof __BUILD__ === 'string' ? __BUILD__ : 'dev',
     goals: brain.goals().slice(0, 4000),
     remote: remote.counts(),
-    rules: brain.rules().map(r => ({ id: r.id, when: r.when })),
     poc: pocState(roster, engine, clock(), by('you').length + engine.stuckEvents().length + roomActions.length + (commands?.length ?? 0)),
   }
 }

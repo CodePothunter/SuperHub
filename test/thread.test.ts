@@ -24,7 +24,7 @@ function fixture(script?: (request: RunRequest) => RunResult | Promise<RunResult
     { id: 'reviewer', name: '审查官', executor: 'dsh', verifier: 'none', brief: '独立核验' },
   ]
   const commits: string[] = []
-  const brain: Brain = { root, staff: () => staff, constitution: () => 'PRIVATE_LIAISON_CONTEXT', workspaces: () => [], rules: () => [], workdir: id => join(root, 'work', id), appendNote: p => p, commit: message => { commits.push(message) } }
+  const brain: Brain = { root, staff: () => staff, constitution: () => 'PRIVATE_LIAISON_CONTEXT', workspaces: () => [], workdir: id => join(root, 'work', id), appendNote: p => p, commit: message => { commits.push(message) } }
   const store = new FileStore(root), calls: RunRequest[] = [], tasks: RemoteTask[] = []
   const executors: Executors = { available: () => true, supportsSchema: () => true, run: async request => {
     calls.push(request)

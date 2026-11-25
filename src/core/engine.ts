@@ -7,7 +7,6 @@
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
-import { latestSlot, parseClock, slotKey } from './clock.ts'
 import { threadBoundaryOf, threadIdOf, type AcceptanceCriterionInput, type Assignment, type ChiefEvent, type CommandApprovalDetail, type CommandApprovalStatus, type Decision, type DeliveryVersion, type ExecutionAttempt, type ExecutionGroup, type ExecutionRef, type Level, type NativeEvidence, type Report, type Staff, type StaleResult, type SuperhubCommission, type SuperhubCommissionIntent, type Ticket, type TicketOutcome, type Verification } from './model.ts'
 import { assignmentPrompt, CONTRACT_VERDICT_SCHEMA, DECISION_SCHEMA, triagePrompt, VERDICT_SCHEMA, verifyContractPrompt, verifyPrompt } from './prompts.ts'
 import { REPORT_SCHEMA, reportFromRemote, reportFromStructured, reportFromText } from './report.ts'
@@ -108,21 +107,12 @@ export interface RemoteQueue {
   cancel(assignmentId: string): void
 }
 
-export interface ClockRule {
-  readonly id: string
-  readonly when: string
-  readonly text: string
-  /** 错过多久之内仍补发，默认 6 小时。 */
-  readonly graceMinutes?: number
-}
-
 export interface Brain {
   readonly root: string
   /** AGENTS.md 与 goals.md 的节选，供研判使用。 */
   constitution(): string
   staff(): Staff[]
   workspaces(): string[]
-  rules(): ClockRule[]
   /** 工单的工作目录（brain/work/T-xxxx），不存在则创建。 */
   workdir(ticketId: string): string
   /** 向 journal/ 下的文件追加内容，返回相对路径；路径不在 journal/ 下则抛错。 */
@@ -299,24 +289,6 @@ export class Engine {
       this.kick()
       return true
     })
-  }
-
-  /** 检查时钟规则：每条规则只发最近一个到期时刻，去重键保证不重复。 */
-  async tickClock(onDue?: (rule: ClockRule, slot: string) => void): Promise<void> {
-    const now = this.now()
-    for (const rule of this.brain.rules()) {
-      let slot: Date | undefined
-      try { slot = latestSlot(parseClock(rule.when), now, this.options.timeZone) } catch (error) {
-        this.problem(`时钟规则 ${rule.id} 无效：${(error as Error).message}`)
-        continue
-      }
-      if (!slot) continue
-      const grace = (rule.graceMinutes ?? 360) * 60_000
-      if (now.getTime() - slot.getTime() > grace) continue
-      const key = slotKey(slot, this.options.timeZone)
-      await this.receive({ source: 'clock', dedupe: `clock:${rule.id}:${key}`, text: rule.text, meta: { rule: rule.id, slot: key } })
-      onDue?.(rule, key)
-    }
   }
 
   /** 远程执行者回传汇报。 */

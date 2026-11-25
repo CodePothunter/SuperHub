@@ -5,6 +5,7 @@ import { SettingsDiagnostics } from './settings-diagnostics.tsx'
 import type { Scoped } from './superhub-api.ts'
 import { clearV2PrivateCache, scopedResource, useV2Read, V2Client } from './workspace-v2-api.ts'
 import { Issue } from './workspace-v2-elements.tsx'
+import { SCHEDULE_STYLE, ScheduleSettings } from './workspace-schedules.tsx'
 
 type StaffEntry = {id:string; name:string; executor:string; brief:string}
 interface SettingsPage extends Scoped {
@@ -36,7 +37,7 @@ function Section({ title, children }: { title:string; children:ReactNode }) {
 function submit(event:FormEvent<HTMLFormElement>) { event.preventDefault(); return new FormData(event.currentTarget) }
 const value = (form: FormData, name: string) => String(form.get(name) ?? '').trim()
 
-export function WorkspaceSettings({ configure, reloadBrain, openStaff }: {configure:boolean; reloadBrain:() => Promise<void>; openStaff:()=>void}) {
+export function WorkspaceSettings({ configure, reloadBrain, openStaff, focusSchedules }: {configure:boolean; reloadBrain:() => Promise<void>; openStaff:()=>void; focusSchedules?:boolean}) {
   const {scope, revoke} = useContext(V2Client)
   const query = useV2Read('/v2/settings', isWorkspaceSettings)
   const [saving,setSaving] = useState(false)
@@ -68,7 +69,7 @@ export function WorkspaceSettings({ configure, reloadBrain, openStaff }: {config
   }
   const page = query.data
   const admin = configure ? page?.admin : undefined
-  return <div className="v2-settings">
+  return <div className="v2-settings"><style>{SCHEDULE_STYLE}</style>
     <Issue text={query.error} retry={query.refresh}/>
     {!page && !query.error && <p className="v2-quiet" role="status">正在读取设置…</p>}
     {page && <><Section title="接口人与团队">
@@ -82,6 +83,7 @@ export function WorkspaceSettings({ configure, reloadBrain, openStaff }: {config
     </Section>
     <Section title="时间与提醒">{admin ? <TimeForm key={JSON.stringify([page.timeZone,admin.settings.notifyUrl])}
       settings={admin.settings} save={save} busy={saving}/> : <dl className="v2-ledger"><div><dt>时区</dt><dd>{page.timeZone}</dd></div></dl>}</Section>
+    <ScheduleSettings focus={focusSchedules}/>
     <Section title="手机访问">{admin ? <MobileForm key={admin.settings.mobile.port + '/' + admin.settings.mobile.enabled}
       mobile={admin.settings.mobile} save={save} busy={saving}/> : <><p>已通过手机密码入口登录。</p>
         <a className="v2-button" href="/logout" onClick={() => clearV2PrivateCache(scope)}>退出本机登录</a></>}</Section>

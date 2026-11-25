@@ -36,9 +36,8 @@ describe('第二大脑', () => {
   writeFileSync(join(root, 'staff', 'eng.md'), '---\nname: 工程师\nexecutor: claude-code\nmodel: zhipu/glm-5.3\n---\n写代码。')
   writeFileSync(join(root, 'rules.yaml'), 'workspaces: [../code]\nrules:\n  - {id: a, when: daily 08:30, text: 早报}\n  - {id: b, when: daily 09:00, text: 关掉的, enabled: false}\n')
   const brain = new BrainRepo(root)
-  it('读角色卡与规则', () => {
+  it('读角色卡与工作区', () => {
     expect(brain.staff()).toEqual([{ id: 'eng', name: '工程师', executor: 'claude-code', model: 'zhipu/glm-5.3', verifier: 'reviewer', brief: '写代码。' }])
-    expect(brain.rules().map(r => r.id)).toEqual(['a'])
     expect(brain.workspaces()).toEqual([join(root, '..', 'code')])
   })
   it('笔记只能写进 journal/ 下的 .md', () => {

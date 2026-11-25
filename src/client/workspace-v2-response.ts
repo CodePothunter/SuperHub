@@ -3,6 +3,7 @@ import type { MentionSegment } from '../core/mentions.ts'
 import { isChatInputAttachment } from '../core/chat-attachments.ts'
 import type { GroupDeliveryState, GroupMemberState, GroupMessage, GroupPauseState } from '../dsh/workspace-v2.ts'
 import type { Scoped } from './superhub-api.ts'
+import type { ScheduleRow } from '../dsh/schedules.ts'
 import type { FollowupView } from '../core/workspace-followup.ts'
 import type { V2OrderOriginal } from '../core/workspace-v2.ts'
 import { isSpeakerId, isSpeakerPortraits } from '../core/workspace-avatars.ts'
@@ -265,3 +266,20 @@ export function hasMutationObject(value: Scoped, resource: string) {
     : collection === 'sessions' && session(value.session) ? value.session : undefined
   return !!object && encodeURIComponent(object.workspaceId) === workspaceId && (!objectId || encodeURIComponent(object.id) === objectId)
 }
+
+/** `GET /v2/schedules`：「设置 → 定时安排」与「经验」里的每周整理说明共用。 */
+export type ScheduleListView = Scoped & { timeZone: string; push: boolean; schedules: ScheduleRow[] }
+const SCHEDULE_CONTENT = ['open-orders', 'reminder', 'brief', 'review', 'dream']
+function scheduleRun(value: unknown) {
+  return value === undefined || record(value) && strings(value, 'slot', 'at') && ['delivered', 'failed', 'missed'].includes(String(value.status)) && optionalText(value.detail)
+    && (value.attempts === undefined || Number.isInteger(value.attempts)) && optionalText(value.retryAt)
+}
+export function isScheduleList(value: unknown): value is ScheduleListView {
+  return record(value) && typeof value.scope === 'string' && typeof value.timeZone === 'string' && typeof value.push === 'boolean'
+    && Array.isArray(value.schedules) && value.schedules.every(row => record(row) && strings(row, 'id', 'title', 'whenLabel', 'createdAt')
+      && SCHEDULE_CONTENT.includes(String(row.content)) && typeof row.enabled === 'boolean' && typeof row.removable === 'boolean'
+      && ['owner', 'liaison', 'system'].includes(String(row.by)) && optionalText(row.next) && optionalText(row.nextLabel) && optionalText(row.retryLabel)
+      && optionalText(row.text) && scheduleRun(row.lastRun))
+}
+/** 定时安排开关、删除的回执。 */
+export const isScheduleReceipt = (value: Scoped) => record(value) && value.ok === true

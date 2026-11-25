@@ -1,7 +1,7 @@
 /**
  * 第二大脑：brain git 仓库的读写。
  *
- * 读：AGENTS.md / goals.md（宪法）、staff/*.md（角色卡）、rules.yaml（时钟规则与工作区）。
+ * 读：AGENTS.md / goals.md（宪法）、staff/*.md（角色卡）、rules.yaml（工作区与来源档位；定时安排在 SuperHub 运行数据里，见 schedules.ts）。
  * 写：只有两处——journal/ 下的笔记追加、work/<工单>/ 工作目录；长期记忆只经提案（见 DESIGN.md 第 5 节）。
  * 提交：几秒内的多次改动合并成一次 commit，避免刷屏的历史。
  */
@@ -9,13 +9,13 @@ import { execFile } from 'node:child_process'
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, normalize, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
-import { parse as parseYaml, parseDocument } from 'yaml'
+import { isMap, parse as parseYaml, parseDocument } from 'yaml'
 import { currentOutputEvidence, snapshotOutputs } from './deliveries.ts'
 import { PRIVATE_OPS } from './brain-private.ts'
-import { parseClock } from '../core/clock.ts'
 import { SUPERHUB_GOALS_FILE, readGoalsDocument } from '../core/export.ts'
 import { defaultStaffPortrait, isSpeakerPortrait, isStaffAvatarShape, recommendStaffPortrait, type StaffAvatarShape } from '../core/workspace-avatars.ts'
-import type { Brain, ClockRule } from '../core/engine.ts'
+import type { Brain } from '../core/engine.ts'
+import type { LegacyRule } from './schedules.ts'
 import type { DeliveryVersion, Staff } from '../core/model.ts'
 
 const exec = promisify(execFile)
@@ -52,7 +52,6 @@ class Cached<T> {
 
 interface RulesFile {
   workspaces?: unknown
-  rules?: unknown
   sources?: unknown
 }
 
@@ -62,7 +61,7 @@ export const SOURCE_MODES: readonly SourceMode[] = ['auto', 'observe', 'off']
 
 export class BrainRepo implements Brain {
   private readonly staffCache: Cached<Staff[]>
-  private readonly rulesCache: Cached<{ rules: ClockRule[]; workspaces: string[]; sources: Record<string, SourceMode> }>
+  private readonly rulesCache: Cached<{ workspaces: string[]; sources: Record<string, SourceMode> }>
   private commitTimer: NodeJS.Timeout | undefined
   private readonly pendingMessages: string[] = []
   private pendingAll = false
@@ -101,7 +100,6 @@ export class BrainRepo implements Brain {
 
   staff(): Staff[] { return this.staffCache.get() }
   goals(): string { return readGoalsDocument(this.root) }
-  rules(): ClockRule[] { return this.rulesCache.get().rules }
   /** 系统自带的工作区（开发模式下的插件源码目录），不写进 rules.yaml。 */
   extraWorkspaces: readonly string[] = []
   workspaces(): string[] { return [...new Set([...this.rulesCache.get().workspaces, ...this.extraWorkspaces])] }
@@ -118,53 +116,31 @@ export class BrainRepo implements Brain {
     this.commit(`来源 ${id} 改为 ${mode}`, { paths: ['rules.yaml'] })
   }
 
-  /** 新建或修改一条时钟规则（主人的操作）。when 先用 parseClock 校验；只改给出的字段，保留文件里的注释。 */
-  setRule(rule: { id: string; when?: string; text?: string; enabled?: boolean }): void {
-    if (!/^[a-z][a-z0-9-]{1,30}$/.test(rule.id)) throw new Error('规则的代号只能用小写字母、数字和短横线，例如 morning-brief')
-    if (rule.when !== undefined) parseClock(rule.when) // 不合法会抛错
+  /**
+   * 旧版定时规则迁到 SuperHub 定时安排（只在定时安排初始化时调用一次）：读出 rules.yaml 的 rules 交给 save，
+   * save 成功后才删掉 rules 键（保留 workspaces、sources 与注释）并提交。没有 rules 键时以空列表调用 save，不改文件。
+   */
+  takeLegacyRules(save: (rules: LegacyRule[]) => void): void {
     const file = join(this.root, 'rules.yaml')
-    const doc = parseDocument(existsSync(file) ? readFileSync(file, 'utf8') : '')
-    const list = doc.get('rules') as { items?: { get(key: string): unknown; set(key: string, value: unknown): void }[] } | undefined
-    const items = list?.items ?? []
-    const existing = items.find(item => item.get('id') === rule.id)
-    if (existing) {
-      if (rule.when !== undefined) existing.set('when', rule.when)
-      if (rule.text !== undefined) existing.set('text', rule.text)
-      if (rule.enabled !== undefined) existing.set('enabled', rule.enabled)
-    } else {
-      if (!rule.when || !rule.text) throw new Error('新规则要写 when 和 text')
-      const node = doc.createNode({ id: rule.id, when: rule.when, text: rule.text, ...rule.enabled === false ? { enabled: false } : {} })
-      if (list?.items) doc.addIn(['rules'], node)
-      else doc.set('rules', doc.createNode([{ id: rule.id, when: rule.when, text: rule.text }]))
-    }
+    if (!existsSync(file)) return save([])
+    let doc: ReturnType<typeof parseDocument>
+    try { doc = parseDocument(readFileSync(file, 'utf8')) } catch { return save([]) }
+    if (doc.errors.length || !isMap(doc.contents) || !doc.has('rules')) return save([])
+    const raw = doc.toJS() as { rules?: unknown }
+    save((Array.isArray(raw.rules) ? raw.rules : []).flatMap(item => {
+      const r = (item ?? {}) as Record<string, unknown>
+      return typeof r.id === 'string' && typeof r.when === 'string' && typeof r.text === 'string' ? [{ id: r.id, when: r.when, text: r.text, enabled: r.enabled !== false }] : []
+    }))
+    doc.delete('rules')
     writeFileSync(file, doc.toString())
-    this.commit(`时钟规则：${existing ? '修改' : '新增'} ${rule.id}`, { paths: ['rules.yaml'] })
+    this.commit('定时规则迁到 SuperHub 定时安排：到点投递到接口人对话，在「设置 → 定时安排」查看和开关；rules.yaml 不再有 rules', { paths: ['rules.yaml'] })
   }
 
-  /** 删掉一条时钟规则。 */
-  removeRule(id: string): void {
+  /** rules.yaml 里是否（又）出现了 rules 键：迁移之后不再读取，只提示。 */
+  hasLegacyRules(): boolean {
     const file = join(this.root, 'rules.yaml')
-    if (!existsSync(file)) throw new Error(`没有这条规则：${id}`)
-    const doc = parseDocument(readFileSync(file, 'utf8'))
-    const list = doc.get('rules') as { items?: { get(key: string): unknown }[] } | undefined
-    const index = list?.items?.findIndex(item => item.get('id') === id) ?? -1
-    if (index < 0) throw new Error(`没有这条规则：${id}`)
-    doc.deleteIn(['rules', index])
-    writeFileSync(file, doc.toString())
-    this.commit(`时钟规则：删除 ${id}`, { paths: ['rules.yaml'] })
-  }
-
-  /** 所有规则（含停用的），给设置页和接口人看。 */
-  allRules(): { id: string; when: string; text: string; enabled: boolean }[] {
-    const file = join(this.root, 'rules.yaml')
-    if (!existsSync(file)) return []
-    try {
-      const doc = (parseYaml(readFileSync(file, 'utf8')) ?? {}) as RulesFile
-      return (Array.isArray(doc.rules) ? doc.rules : []).flatMap(raw => {
-        const r = (raw ?? {}) as Record<string, unknown>
-        return typeof r.id === 'string' && typeof r.when === 'string' && typeof r.text === 'string' ? [{ id: r.id, when: r.when, text: r.text, enabled: r.enabled !== false }] : []
-      })
-    } catch { return [] }
+    if (!existsSync(file)) return false
+    try { const doc = parseDocument(readFileSync(file, 'utf8')); return isMap(doc.contents) && doc.has('rules') } catch { return false }
   }
 
   /** 让一位幕僚退休：角色卡移到 staff/.retired/，需要时可以搬回来。 */
@@ -209,28 +185,18 @@ export class BrainRepo implements Brain {
     return out
   }
 
-  private loadRules(file: string): { rules: ClockRule[]; workspaces: string[]; sources: Record<string, SourceMode> } {
-    if (!existsSync(file)) return { rules: [], workspaces: [], sources: {} }
+  private loadRules(file: string): { workspaces: string[]; sources: Record<string, SourceMode> } {
+    if (!existsSync(file)) return { workspaces: [], sources: {} }
     let doc: RulesFile
     try { doc = (parseYaml(readFileSync(file, 'utf8')) ?? {}) as RulesFile } catch (error) {
       this.log(`rules.yaml 解析失败：${(error as Error).message}`)
-      return { rules: [], workspaces: [], sources: {} }
+      return { workspaces: [], sources: {} }
     }
     const workspaces = Array.isArray(doc.workspaces)
       ? doc.workspaces.filter((x): x is string => typeof x === 'string').map(p => resolve(this.root, p)) : []
-    const rules: ClockRule[] = []
-    if (Array.isArray(doc.rules)) {
-      for (const raw of doc.rules) {
-        if (!raw || typeof raw !== 'object') continue
-        const r = raw as Record<string, unknown>
-        if (r.enabled === false) continue
-        if (typeof r.id === 'string' && typeof r.when === 'string' && typeof r.text === 'string')
-          rules.push({ id: r.id, when: r.when, text: r.text, ...typeof r.graceMinutes === 'number' ? { graceMinutes: r.graceMinutes } : {} })
-      }
-    }
     const sources: Record<string, SourceMode> = {}
     if (doc.sources && typeof doc.sources === 'object') for (const [id, mode] of Object.entries(doc.sources as object)) if (SOURCE_MODES.includes(mode as SourceMode)) sources[id] = mode as SourceMode
-    return { rules, workspaces, sources }
+    return { workspaces, sources }
   }
 
   workdir(ticketId: string): string {

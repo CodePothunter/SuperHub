@@ -47,7 +47,7 @@ export function SettingsDrawer({ close, refresh, modal = false }: { close: () =>
         {saved && <div className="wr-ok">{saved}</div>}
 
         <h3>幕僚团</h3>
-        <Field label="时区" hint="定时规则、到期提醒、安静时段都按这个时区。">
+        <Field label="时区" hint="定时安排、到期提醒、安静时段都按这个时区。">
           <input value={zone} onChange={e => setZone(e.target.value)} spellCheck={false} placeholder="Asia/Shanghai" />
         </Field>
         <Field label="同时干活的幕僚" hint="1 到 6。多了更快，也更费模型额度。">

@@ -5,10 +5,10 @@
  *   chief_ticket  查看工单，或代主人回答 / 批准 / 验收 / 停止
  *   chief_lookup  查人物、横向线、承诺、会议
  *   chief_record  记录事实：互动、人物的角色与团队、承诺、横向线进展、会议
- *   chief_followup 给自己定一个跟进：到时候回头检查某件事
+ *   chief_schedule 定时安排：到点在接口人对话里提醒主人（可推送），主人要求的周期提醒或接口人自己的一次性跟进
  *   chief_staff   加幕僚、改幕僚、让幕僚退休（主人说了才用）
  *   chief_ui      改作战台的样子：主题、版式、自定义面板（立即生效）；开发模式下还能交给界面师改源码
- *   chief_settings 看和改设置：时区、并发、推送地址、手机访问、定时规则、来源档位
+ *   chief_settings 看和改设置：时区、并发、推送地址、手机访问、来源档位
  *   chief_import  把其他助手对主人的了解送入个人资料核对页
  *   chief_export  反过来：把第二大脑里主人确认过的内容整理成 ChatGPT / Claude / Claude Code / Codex 能用的形式
  *
@@ -55,6 +55,8 @@ import { DIRECTORY_SOURCE_LABEL, workspaceArchived } from '../core/workspace-v2.
 import { homedir } from 'node:os'
 import { join as joinPath } from 'node:path'
 import type { ProfileImportReceipt } from '../core/profile-import.ts'
+import type { ScheduleContent } from '../core/schedules.ts'
+import { scheduleReceipt, scheduleRow, type ScheduleStore } from './schedules.ts'
 import { IMPORT_SOURCES } from '../core/onboarding.ts'
 
 export interface AgentLookup {
@@ -124,12 +126,11 @@ export interface ChiefControl {
   update(patch: { timeZone?: string; concurrency?: number; notifyUrl?: string; mobileEnabled?: boolean; mobilePort?: number; liaisonModel?: string; liaisonReasoningEffort?: string }): Promise<string>
 }
 
-export interface FollowUps {
-  set(when: string, text: string, by: string): { id: string; at: string }
-  cancel(id: string): boolean
-}
+const clipTitle = (text: string) => text.length > 40 ? text.slice(0, 39) + '…' : text
+/** 定时安排（src/dsh/schedules.ts）：接口人的 chief_schedule 用。 */
+export interface ScheduleAccess { store: ScheduleStore; timeZone: string; now?: () => Date }
 
-export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomExecution?: RequestRoomExecution; connectors?: Connectors; isLiaison: (id: string) => boolean; lookup: AgentLookup; worklines?: Worklines; readOnlyExecution?: (id: string) => boolean; executionBinding?: (id: string) => { ticketId: string; assignmentId: string } | undefined; followUps: FollowUps; ui: UiControl; control: ChiefControl; importer: Importer; exporter: Exporter; superhub?: SuperhubIntake; inputAttachments?: ChatAttachments; groups?: Pick<WorkspaceGroupHost, 'refresh'>; modelDefaults?: () => ModelDefaults; workspaceStore: WorkspaceV2Store; staffStore?:WorkspaceStaffStore; learning?: ExperienceLearning; assign?: ReturnType<typeof workspaceV2Routes>['assign']; follow?: ReturnType<typeof workspaceV2Routes>['follow']; orderFollowup:OrderFollowupAccess; calendarWeek: (day?: string) => Promise<CalendarWeek>; personDetail: (id:string) => Promise<HistoryDetail> }): (() => void)[] {
+export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomExecution?: RequestRoomExecution; connectors?: Connectors; isLiaison: (id: string) => boolean; lookup: AgentLookup; worklines?: Worklines; readOnlyExecution?: (id: string) => boolean; executionBinding?: (id: string) => { ticketId: string; assignmentId: string } | undefined; schedules: ScheduleAccess; ui: UiControl; control: ChiefControl; importer: Importer; exporter: Exporter; superhub?: SuperhubIntake; inputAttachments?: ChatAttachments; groups?: Pick<WorkspaceGroupHost, 'refresh'>; modelDefaults?: () => ModelDefaults; workspaceStore: WorkspaceV2Store; staffStore?:WorkspaceStaffStore; learning?: ExperienceLearning; assign?: ReturnType<typeof workspaceV2Routes>['assign']; follow?: ReturnType<typeof workspaceV2Routes>['follow']; orderFollowup:OrderFollowupAccess; calendarWeek: (day?: string) => Promise<CalendarWeek>; personDetail: (id:string) => Promise<HistoryDetail> }): (() => void)[] {
   const { engine, brain, roster, inputAttachments } = deps
   const attachmentWriteGuard = (agent: Agent | undefined) => {
     if (agent && deps.isLiaison(agent.id) && nativeAttachmentOnlyTurn(agent.session?.snapshotEvents() ?? [])) {
@@ -167,7 +168,7 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
     if (!text || text.length > HANDOFF_LIMIT) throw new Error(`handoff 是你写给执行者的交办说明，需要 1 到 ${HANDOFF_LIMIT} 字；用你自己的话写，主人原话会自动附上。`)
     return text
   }
-  const ownerSource = (execution: ToolExecution, unavailable = '交办需要本轮接口人会话中经宿主确认的主人原话。这次调用不在主人本轮消息之内（例如定时任务、幕僚或上一轮已结束），未建单、未开讨论。请等主人亲自提出后再交办。') => {
+  const ownerSource = (execution: ToolExecution, unavailable = '交办需要本轮接口人会话中经宿主确认的主人原话。这次调用不在主人本轮消息之内（例如定时安排、幕僚或上一轮已结束），未建单、未开讨论。请等主人亲自提出后再交办。') => {
     const agent = (execution as ToolExecution & { agent?: import('./ports.ts').Agent }).agent
     const events = agent?.session?.snapshotEvents() ?? []
     const source = agent && deps.isLiaison(agent.id) && nativeIntakeSource(events)
@@ -957,23 +958,79 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
       },
     }),
     register({
-      name: 'chief_followup',
-      description: '给自己定一个跟进：到某个时间回头检查一件事（例如"周四早上看周岚给没给评审意见"）。到点会作为一条事件回来。action=set 需要 when（YYYY-MM-DD，当天 9 点；或 YYYY-MM-DDTHH:MM）和 text（到时候要检查什么、怎么判断）；list 查看；cancel 加 id 取消。带日期的承诺逾期系统会自动提醒，不要为它重复定跟进。',
+      name: 'chief_schedule',
+      description: [
+        '定时安排：到点在接口人对话里提醒主人（配置了推送地址时同时推送到手机），主人在「设置 → 定时安排」查看、停用或删除。这是唯一的定时机制：主人要定期或到某个时间提醒、汇总、写早报晚报（「工作日 9 点提醒我未关闭的工单」「每周五下午提醒我写周报」「早报改到 9 点」）时用它。',
+        'action=list：全部安排，含时间规则、下一次触发、上一次结果。主人问有哪些定时提醒时用它回答。',
+        'action=set：新建或修改。title 是给主人看的名字（不超过 40 字）。时间二选一：when 周期写法 daily HH:MM（每天）/ weekdays HH:MM（周一到周五）/ weekly mon,thu HH:MM（每周某几天，mon tue wed thu fri sat sun）；at 一次性本地时间 YYYY-MM-DDTHH:MM。content：open-orders 汇总各工作区尚未关闭的工单（系统按实际工单生成，不经模型）；reminder 到点原样提醒 text；brief 早报、review 晚报（由你基于工作区、工单和日程撰写，text 可写主人的补充要求）。修改已有安排带 id（list 里的 id），只给要改的字段；早报、晚报、每周经验整理是系统内置的（id morning-brief、evening-review、weekly-dream），改时间用 set 带 id。',
+        'for=owner（默认）：只在主人本轮明确要求时建立或修改，宿主核对本轮主人原话。for=self：你给自己定的一次性跟进（「周四早上看周岚给没给评审意见」），只能用 at + reminder，到点同样出现在接口人对话里，也会列在主人的清单中。带日期的承诺逾期系统会自动提醒，不要为它重复定。',
+        'action=enable / disable / remove 带 id：主人要求恢复、停用或删除时用，主人的和系统内置的安排需要主人本轮原话；你自己 for=self 定的跟进可以直接停用或删除。系统内置的安排只能停用，不能删除。',
+        '回执的 message 就是对主人的承诺：照它告诉主人下一次触发时间、投递位置（接口人对话，以及是否推送到手机）和查看位置（「设置 → 定时安排」）。不要说回执以外的渠道（短信、邮件、日历、微信等），也不要承诺回执里没有的时间。',
+      ].join('\n'),
       parameters: {
         type: 'object', additionalProperties: false, required: ['action'],
-        properties: { action: { type: 'string', enum: ['set', 'list', 'cancel'] }, when: { type: 'string' }, text: { type: 'string' }, id: { type: 'string' } },
+        properties: {
+          action: { type: 'string', enum: ['list', 'set', 'enable', 'disable', 'remove'] },
+          id: { type: 'string', description: '修改、开关、删除时用 list 里的 id；新建时不填。' },
+          title: { type: 'string', description: '给主人看的名字，例如「未关闭工单提醒」。' },
+          when: { type: 'string', description: '周期：daily HH:MM / weekdays HH:MM / weekly mon,thu HH:MM。与 at 二选一。' },
+          at: { type: 'string', description: '一次性：本地时间 YYYY-MM-DDTHH:MM。与 when 二选一。' },
+          content: { type: 'string', enum: ['open-orders', 'reminder', 'brief', 'review'] },
+          text: { type: 'string', description: 'reminder 到点要说的话（必填）；brief、review 的补充要求（选填）。' },
+          for: { type: 'string', enum: ['owner', 'self'], description: 'owner：主人本轮要求的（默认）；self：你自己的一次性跟进。' },
+        },
       },
       output: { schema: OBJECT, render: (_a, v) => textOut(v) },
       execute: async (args, execution) => {
-        if (args.action === 'list') return { followUps: deps.timers() }
-        attachmentWriteGuard((execution as ToolExecution & {agent?: Agent}).agent)
-        if (args.action === 'cancel') return { cancelled: deps.followUps.cancel(String(args.id ?? '')) }
-        const agentId = (execution as ToolExecution & { agent?: { id: string } }).agent?.id
-        const by = agentId && deps.isLiaison(agentId) ? '接口人' : '幕僚'
-        const timer = deps.followUps.set(String(args.when ?? ''), String(args.text ?? ''), by)
-        return { message: `已定好跟进，${timer.at} 会提醒。`, id: timer.id }
+        const { store, timeZone } = deps.schedules
+        const now = () => deps.schedules.now?.() ?? new Date()
+        const push = deps.push()
+        if (args.action === 'list') {
+          const at = now()
+          return { timeZone, push, schedules: store.list().map(row => scheduleRow(row, at, timeZone)),
+            message: '到点在接口人对话里提醒' + (push ? '，同时推送到手机' : '；还没配置推送地址，不会推送到手机') + '。主人可在「设置 → 定时安排」查看、停用或删除。' }
+        }
+        if (args.action === 'enable' || args.action === 'disable' || args.action === 'remove') {
+          guard(execution)
+          const id = str(args.id)
+          if (!id) throw new Error('id 必填：先用 action=list 找到要操作的安排。')
+          const target = store.get(id)
+          if (!target) throw Object.assign(new Error(`没有这条定时安排：${id}`), { status: 404 })
+          // 主人的安排和系统内置的安排只听主人本轮的话；接口人自己定的跟进（for=self）可以自己停、删。
+          if (target.by !== 'liaison') ownerSource(execution, `停用、恢复或删除主人的定时安排「${target.title}」需要本轮接口人会话中经宿主确认的主人原话。这次调用不在主人本轮消息之内，未改动。请等主人亲自提出。`)
+          if (args.action === 'remove') {
+            const removed = store.remove(id)
+            return { removed: { id: removed.id, title: removed.title }, message: `已删除定时安排「${removed.title}」，之后不会再提醒。` }
+          }
+          const row = scheduleRow(store.setEnabled(id, args.action === 'enable'), now(), timeZone)
+          return { schedule: row, message: args.action === 'enable'
+            ? `已恢复「${row.title}」：${row.whenLabel}。${row.nextLabel ? `下一次 ${row.nextLabel}（${timeZone}）。` : ''}到点会在接口人对话里提醒你${push ? '，同时推送到手机' : ''}。`
+            : `已停用「${row.title}」，在「设置 → 定时安排」里可以重新打开。` }
+        }
+        if (args.action !== 'set') throw new Error('action 取 list、set、enable、disable 或 remove。')
+        const self = args.for === 'self'
+        let by: 'owner' | 'liaison' = 'liaison'
+        if (self) {
+          attachmentWriteGuard((execution as ToolExecution & { agent?: Agent }).agent)
+          if (str(args.when) || !str(args.at)) throw new Error('for=self 只能定一次性的跟进：用 at（YYYY-MM-DDTHH:MM），不要用 when。主人要的周期提醒用 for=owner。')
+          if (args.content !== undefined && args.content !== 'reminder') throw new Error('for=self 只能是 reminder：写清到时候要检查什么。')
+          const existing = str(args.id) ? store.get(str(args.id)!) : undefined
+          if (existing && existing.by !== 'liaison') throw new Error(`「${existing.title}」是主人的定时安排，修改需要主人本轮要求（for=owner）。`)
+        } else {
+          ownerSource(execution, '建立或修改定时安排需要本轮接口人会话中经宿主确认的主人原话。这次调用不在主人本轮消息之内，未保存。你自己的一次性跟进用 for=self。')
+          guard(execution)
+          by = 'owner'
+        }
+        const content = self ? 'reminder' : args.content
+        const { schedule, created } = store.upsert({
+          ...str(args.id) && { id: str(args.id)! }, ...str(args.title) ? { title: str(args.title)! } : self && !str(args.id) && str(args.text) ? { title: clipTitle('跟进：' + str(args.text)!) } : {},
+          ...str(args.when) && { when: str(args.when)! }, ...str(args.at) && { at: str(args.at)! },
+          ...typeof content === 'string' && { content: content as ScheduleContent }, ...str(args.text) && { text: str(args.text)! },
+        }, by)
+        const row = scheduleRow(schedule, now(), timeZone)
+        return { schedule: row, created, ...row.next && { next: row.next }, message: scheduleReceipt(row, created, push, timeZone, self) }
       },
-    }),
+    }, privateLiaison),
     register({
       name: 'chief_staff',
       description: [
@@ -1151,27 +1208,25 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
     register({
       name: 'chief_settings',
       description: [
-        '看和改幕僚团的设置。主人说"时区改成……""推送发到……""打开手机访问""早报改到 9 点""该联系了这个提醒关掉"时用。',
-        'action=show：当前设置、全部定时规则和来源档位。',
+        '看和改幕僚团的设置。主人说"时区改成……""推送发到……""打开手机访问""该联系了这个提醒关掉"时用。定时提醒、早报晚报的时间不在这里，用 chief_schedule。',
+        'action=show：当前设置和来源档位。',
         'action=set：time_zone（IANA 时区，例如 Asia/Shanghai）、concurrency（同时干活的幕僚数，1~6）、notify_url（推送地址，空串表示不推送）、mobile_enabled（手机访问开关）、mobile_port（手机访问端口）、liaison_model（你自己——接口人——用的模型，写 模型名 或 厂商/模型，空串表示跟随 DSH 默认；下一句话起生效）、liaison_reasoning_effort（接口人的思考深度，取所选模型支持的档位，空串表示模型默认；只换模型不给档位时回到模型默认）。',
         '  主人说"接口人换成某某模型""你用某某模型"指的是 liaison_model；幕僚（含研判官）的模型用 chief_staff 改。',
         '  手机访问的密码不能在对话里设：对话内容会发给模型。没设密码时请主人到作战台的"设置"里填。',
-        'action=rule：新增或修改一条定时规则，rule_id 必填，when 的写法：daily HH:MM / weekdays HH:MM / weekly sun HH:MM（可写 mon,thu）/ every 30m；text 写到点要做什么；enabled=false 停用。action=rule_remove：删掉 rule_id。',
         'action=source：调整事件来源的档位，source_id 取 meeting-prep / commitment-due / stale-contact，mode 取 auto（自动处理）/ observe（只记录，等主人放行）/ off（关闭）。',
       ].join('\n'),
       parameters: {
         type: 'object', additionalProperties: false, required: ['action'],
         properties: {
-          action: { type: 'string', enum: ['show', 'set', 'rule', 'rule_remove', 'source'] },
+          action: { type: 'string', enum: ['show', 'set', 'source'] },
           time_zone: { type: 'string' }, concurrency: { type: 'integer' }, notify_url: { type: 'string' },
           mobile_enabled: { type: 'boolean' }, mobile_port: { type: 'integer' }, liaison_model: { type: 'string' }, liaison_reasoning_effort: { type: 'string' },
-          rule_id: { type: 'string' }, when: { type: 'string' }, text: { type: 'string' }, enabled: { type: 'boolean' },
           source_id: { type: 'string' }, mode: { type: 'string', enum: ['auto', 'observe', 'off'] },
         },
       },
       output: { schema: OBJECT, render: (_a, v) => textOut(v) },
       execute: async (args, execution) => {
-        if (args.action === 'show') return { ...deps.control.show(), rules: brain.allRules(), sources: deps.sources().filter(x => !x.fixed).map(x => ({ id: x.id, name: x.name, mode: x.mode })) }
+        if (args.action === 'show') return { ...deps.control.show(), schedules: '定时安排（提醒、早报、晚报、每周经验整理）用 chief_schedule list 查看。', sources: deps.sources().filter(x => !x.fixed).map(x => ({ id: x.id, name: x.name, mode: x.mode })) }
         guard(execution)
         if (args.action === 'set') {
           const patch = {
@@ -1185,18 +1240,6 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
           }
           if (!Object.keys(patch).length) throw new Error('没有要改的设置')
           return { message: await deps.control.update(patch) }
-        }
-        if (args.action === 'rule') {
-          const id = str(args.rule_id)
-          if (!id) throw new Error('rule_id 必填')
-          brain.setRule({ id, ...str(args.when) ? { when: str(args.when)! } : {}, ...str(args.text) ? { text: str(args.text)! } : {}, ...typeof args.enabled === 'boolean' ? { enabled: args.enabled } : {} })
-          return { message: `规则 ${id} 已保存，下一次检查（半分钟内）开始按新规则走。`, rules: brain.allRules() }
-        }
-        if (args.action === 'rule_remove') {
-          const id = str(args.rule_id)
-          if (!id) throw new Error('rule_id 必填')
-          brain.removeRule(id)
-          return { message: `规则 ${id} 已删除。` }
         }
         const id = str(args.source_id), mode = str(args.mode)
         if (!id || !mode) throw new Error('source_id 和 mode 必填')

@@ -20,12 +20,15 @@ export interface Notice {
   delivery?: { path: string; version: string; title: string }
   /** SuperHub 2.0 工单：提醒里的「打开工单」直接定位到这张单。 */
   order?: NoticeOrder
+  /** 定时安排到点的提醒：来自哪条安排（「停用」「在设置中查看」按它操作）。 */
+  schedule?: NoticeSchedule
   /** 推送状态：pending 等待推送；pushed 已推；local 没有配置推送，只在作战台显示；failed 多次推送失败。 */
   push: 'pending' | 'pushed' | 'local' | 'failed'
   attempts: number
 }
 
 export interface NoticeOrder { workspaceId: string; orderId: string }
+export interface NoticeSchedule { id: string; title: string; when: string }
 
 const KEEP = 400
 const MAX_ATTEMPTS = 5
@@ -45,12 +48,12 @@ export class Outbox {
 
   has(key: string): boolean { return this.notices.some(n => n.key === key) }
 
-  /** 放进发件箱；同一个 key 说过就不再说。 */
+  /** 放进发件箱；同一个 key 说过就不再说。正文默认最长 600 字，定时安排的汇总可放宽（maxLength）。 */
   enqueue(key: string, text: string, now: Date, ticketId?: string,
-    options: Pick<Notice, 'kind' | 'assignmentId' | 'delivery' | 'order'> & { localOnly?: boolean } = {}): boolean {
+    options: Pick<Notice, 'kind' | 'assignmentId' | 'delivery' | 'order' | 'schedule'> & { localOnly?: boolean; maxLength?: number } = {}): boolean {
     if (this.has(key)) return false
-    const { localOnly, ...details } = options
-    this.notices.push({ key, at: now.toISOString(), text: text.trim().slice(0, 600), push: localOnly ? 'local' : 'pending', attempts: 0, ...ticketId ? { ticketId } : {}, ...details })
+    const { localOnly, maxLength = 600, ...details } = options
+    this.notices.push({ key, at: now.toISOString(), text: text.trim().slice(0, maxLength), push: localOnly ? 'local' : 'pending', attempts: 0, ...ticketId ? { ticketId } : {}, ...details })
     this.save()
     return true
   }

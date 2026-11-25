@@ -87,7 +87,7 @@ export async function serveApi(req: IncomingMessage, res: ServerResponse, via: V
 }
 
 /** 第二大脑就绪之后的全部接口（状态由外层的控制路由给出，见 src/index.ts）。 */
-export function runtimeRoutes(deps: StateDeps & { requestRoomExecution?: RequestRoomExecution; connectors?: Connectors; approvals?: ReturnType<typeof commandApprovals>; chat: LiaisonChat; liaisonSeen?: LiaisonSeen; discussions?: Discussions; worklines?: Worklines; followUps: { cancel(id: string): boolean }; custom: CustomStore; exporter: Exporter; superhub?: SuperhubIntake; inputAttachments?: ChatAttachments; llm?: () => Llm | undefined }): Route {
+export function runtimeRoutes(deps: StateDeps & { requestRoomExecution?: RequestRoomExecution; connectors?: Connectors; approvals?: ReturnType<typeof commandApprovals>; chat: LiaisonChat; liaisonSeen?: LiaisonSeen; discussions?: Discussions; worklines?: Worklines; custom: CustomStore; exporter: Exporter; superhub?: SuperhubIntake; inputAttachments?: ChatAttachments; llm?: () => Llm | undefined }): Route {
   const { engine, brain, roster } = deps
   const inbox = (t: string, meta: Record<string, string>) => engine.receive({ source: 'inbox', dedupe: `inbox:${randomUUID()}`, text: t, meta })
   const ok = (res: ServerResponse, extra: object = {}) => json(res, 200, { ok: true, ...extra })
@@ -371,7 +371,6 @@ export function runtimeRoutes(deps: StateDeps & { requestRoomExecution?: Request
       return done()
     }
     if (seg[0] === 'events' && seg[1] && (seg[2] === 'retriage' || seg[2] === 'evaluate')) { await engine.retriage(seg[1]); return done() }
-    if (seg[0] === 'timers' && seg[1] && seg[2] === 'cancel') return deps.followUps.cancel(seg[1]) ? done() : done(404, { error: '没有这个跟进' })
     if (seg[0] === 'sources' && seg[1] && seg.length === 2) { brain.setSourceMode(seg[1], body.mode as never); return done() }
     if (seg[0] === 'staff' && seg.length === 1) {
       const id = text(body.id, 40)

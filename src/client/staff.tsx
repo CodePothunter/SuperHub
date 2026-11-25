@@ -115,15 +115,7 @@ export function EventsView({ state, run, busy, openTicket }: { state: WarroomSta
       </div>)}</div>
       {error && <div className="wr-err">{error}</div>}
       <div className="wr-empty" style={{ marginTop: 8 }}>"只记录"的来源照常产生事件，但不会动用幕僚团。你可以在下面逐条放行，觉得靠谱了再改成自动。</div>
-    </section>
-    <section className="wr-sec">
-      <h2>定好的跟进<span className="n">{state.timers.length}</span></h2>
-      {state.timers.length ? <div className="wr-rows">{state.timers.map(t => <div key={t.id} className="wr-row">
-        <span className="lead">{t.at.slice(5).replace('-', '/')}</span>
-        <div className="main">{t.text}<div className="note">{t.by}定的</div></div>
-        <span className="tail"><button disabled={busy === `tm${t.id}`} onClick={() => run(`tm${t.id}`, `/timers/${t.id}/cancel`)}>取消</button></span>
-      </div>)}</div> : <div className="wr-empty">接口人和幕僚会给自己定"到时候回头看一眼"，到点自动触发。现在没有。</div>}
-      <div className="wr-empty" style={{ marginTop: 8 }}>{state.push ? '有事等你决定时会推送到你配置的地址，晚上 10 点半到早上 8 点不打扰。' : '还没有配置推送：提醒只会出现在接口人的对话里。在 ~/workspace/dsh/.env 里设置 CHIEF_NOTIFY_URL 后重启即可。'}</div>
+      <div className="wr-empty" style={{ marginTop: 8 }}>定时提醒在 SuperHub「设置 → 定时安排」里查看和开关。{state.push ? '有事等你决定时会推送到你配置的地址，晚上 10 点半到早上 8 点不打扰。' : '还没有配置推送：提醒只会出现在接口人的对话里。'}</div>
     </section>
     <section className="wr-sec">
       <h2>事件<span className="n">{state.events.length}</span></h2>
