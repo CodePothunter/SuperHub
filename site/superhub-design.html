@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SuperHub 设计图解</title>
+<meta name="description" content="用六张图了解 SuperHub 的交办流程、注意力管理、工作区边界和权限。">
+<link rel="icon" href="assets/hub-small.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@700&family=JetBrains+Mono:wght@400&display=swap">
@@ -61,6 +63,8 @@ body {
 }
 
 header { display: grid; gap: 18px; }
+.demo-back { color: var(--accent); font-weight: 500; }
+.demo-back:focus-visible, .scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
 .eyebrow {
   font-size: 12.5px; letter-spacing: .08em; color: var(--dim);
   display: flex; align-items: center; gap: 8px;
@@ -101,6 +105,8 @@ figure {
   min-width: 0;
 }
 .scroll { overflow-x: auto; min-width: 0; }
+.diagram-hint { color: var(--dim); font-size: 13px; margin: 0; }
+@media (min-width: 791px) { .diagram-hint { display: none; } }
 figcaption { font-size: 14.5px; line-height: 1.7; max-width: 46em; }
 .src {
   font-family: var(--mono); font-size: 12px; color: var(--dim);
@@ -157,6 +163,7 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
 <div class="page">
 
 <header>
+  <nav aria-label="返回 SuperHub 演示"><a class="demo-back" href="index.html#after-demo">← 返回在线演示</a></nav>
   <div class="eyebrow"><span class="pip" aria-hidden="true"></span>SuperHub 0.2.0 · DeepSeek Harness 插件</div>
   <h1>SuperHub 设计图解</h1>
   <p class="lead">你只跟接口人说一句话，事情就落到对应项目里推进。你继续手头的事，有空再从红点接回汇报。下面六张图依次画出它的整体结构、注意力节奏、工单流程、项目边界、写入权限和命令护栏。</p>
@@ -165,13 +172,14 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
     <li><b>过程有归属</b><span>一个项目的对话、材料、决定和成果，都留在它自己的工作区。</span></li>
     <li><b>回来有线索</b><span>红点留住未读汇报。汇报先给结论和待确认项，「今天」页看全局。</span></li>
   </ul>
+  <p class="diagram-hint">屏幕较窄时，可横向滑动查看整张图。</p>
 </header>
 
 <!-- 图 1 -->
 <section>
   <h2><span class="no">图 1</span>一个入口，按项目分流</h2>
   <figure>
-    <div class="scroll">
+    <div class="scroll" tabindex="0" role="region" aria-label="整体结构图">
       <svg class="dg" viewBox="0 0 960 480" role="img" aria-label="SuperHub 总体结构：你通过接口人一句话交办，接口人开工单派到三个项目工作区；成果交回接口人验收，汇报以红点回到你；「今天」页汇总全部项目，所有记录写入第二大脑。">
         <defs>
           <marker id="f1n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="mk" d="M0,1 L10,5 L0,9 z"/></marker>
@@ -262,7 +270,7 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
 <section>
   <h2><span class="no">图 2</span>汇报等你，不打断你</h2>
   <figure>
-    <div class="scroll">
+    <div class="scroll" tabindex="0" role="region" aria-label="注意力节奏图">
       <svg class="dg" viewBox="0 0 960 320" role="img" aria-label="时间线：你交办后继续写提纲；团队排查、出方案、验收后汇报，只亮红点不打断；你写完一段再看结论和待确认项，补一句方向后回到提纲，团队按方向继续。">
         <defs>
           <marker id="f2n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="mk" d="M0,1 L10,5 L0,9 z"/></marker>
@@ -334,7 +342,7 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
 <section>
   <h2><span class="no">图 3</span>一张工单怎样走完</h2>
   <figure>
-    <div class="scroll">
+    <div class="scroll" tabindex="0" role="region" aria-label="工单流程图">
       <svg class="dg" viewBox="0 0 960 380" role="img" aria-label="工单流程：你交办，接口人写下约定并留存原话，工作区成员执行，接口人对照约定验收；通过就通知你，有缺口先自动追问一次，仍有缺口或验收没完成就等你决定；你随时可以补充、收窄、暂停、恢复、完成、取消或重开。">
         <defs>
           <marker id="f3n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="mk" d="M0,1 L10,5 L0,9 z"/></marker>
@@ -406,7 +414,7 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
 <section>
   <h2><span class="no">图 4</span>项目之间有边界</h2>
   <figure>
-    <div class="scroll">
+    <div class="scroll" tabindex="0" role="region" aria-label="工作区边界图">
       <svg class="dg" viewBox="0 0 960 400" role="img" aria-label="同一位研究员被邀请进产品研发和客户访谈，两边职责不同，经验各自积累在本区；只有你选定的一段文字能经共享越过边界，其余经验留在原工作区。">
         <defs>
           <marker id="f4n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="mk" d="M0,1 L10,5 L0,9 z"/></marker>
@@ -469,7 +477,7 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
 <section>
   <h2><span class="no">图 5</span>谁能改第二大脑</h2>
   <figure>
-    <div class="scroll">
+    <div class="scroll" tabindex="0" role="region" aria-label="第二大脑写入权限图">
       <svg class="dg" viewBox="0 0 960 350" role="img" aria-label="第二大脑分三层：长期知识与判断只有你能直接写；幕僚想改只能写提案，等你批准后落地并留下 git 记录；事实与工单产出幕僚可以直接记录。">
         <defs>
           <marker id="f5n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="mk" d="M0,1 L10,5 L0,9 z"/></marker>
@@ -526,8 +534,8 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
 <section>
   <h2><span class="no">图 6</span>编码命令要过闸门</h2>
   <figure>
-    <div class="scroll">
-      <svg class="dg" viewBox="0 0 960 330" role="img" aria-label="编码工具每次执行命令前，钩子先问命令闸门：普通命令直接执行；高危命令按工单档位处理，完全访问直接执行，请求批准由你决定，代为批准交给自动审查，审查不可用或超时就转给你；钩子等不到答复时一律拒绝。">
+    <div class="scroll" tabindex="0" role="region" aria-label="编码命令审批图">
+      <svg class="dg" viewBox="0 0 960 330" role="img" aria-label="接入命令护栏的编码工具在执行命令前，由钩子询问闸门：普通命令直接执行；高危命令按工单档位处理，完全访问直接执行，请求批准由你决定，代为批准交给自动审查，审查不可用或超时就转给你；钩子等不到答复时一律拒绝。">
         <defs>
           <marker id="f6n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="mk" d="M0,1 L10,5 L0,9 z"/></marker>
           <marker id="f6r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="mk-r" d="M0,1 L10,5 L0,9 z"/></marker>
@@ -539,7 +547,7 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
 
         <rect class="box" x="200" y="110" width="150" height="64" rx="10"/>
         <text class="tb" x="275" y="137" text-anchor="middle">PreToolUse</text>
-        <text class="ts" x="275" y="158" text-anchor="middle">每次调用先问闸门</text>
+        <text class="ts" x="275" y="158" text-anchor="middle">命令执行前检查</text>
 
         <rect class="box-l" x="390" y="110" width="150" height="64" rx="10"/>
         <text class="tb" x="465" y="137" text-anchor="middle">命令闸门</text>
@@ -604,12 +612,12 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
         <text class="ts" x="275" y="251" text-anchor="middle">一律拒绝执行</text>
       </svg>
     </div>
-    <figcaption>Codex 和 Claude Code 以你的身份、不带沙箱运行，所以它们每调用一次工具，都要先问闸门。只有短短一张高危清单需要把关，其他命令照常执行。新工单默认是「请求批准」档。档位改了，从下一条命令起生效。钩子等不到答复就拒绝，绝不默认放行。</figcaption>
+    <figcaption>由 SuperHub 接入的 Codex / Claude Code 编码命令在运行前通过 PreToolUse 钩子检查。只有短短一张高危清单需要把关，其他命令照常执行。新工单默认是「请求批准」档。档位改了，从下一条命令起生效。钩子等不到答复就拒绝，绝不默认放行。</figcaption>
     <div class="src">src/dsh/coding-gate.ts · src/core/coding-risk.ts · src/client/workspace-execution.tsx（TIER_LABEL）</div>
   </figure>
 </section>
 
-<footer>根据 SuperHub 0.2.0 的源码、README 和 docs/attention.md 绘制。图中的项目、职责和经验都是示例。</footer>
+<footer>根据 SuperHub 0.2.0 的源码、README 和 docs/attention.md 绘制。图中的项目、职责和经验都是示例。<a class="demo-back" href="https://github.com/CodePothunter/SuperHub/pull/1">图解由 @jinbozhan 贡献</a>。</footer>
 
 </div>
 </body>

@@ -689,6 +689,10 @@ to{opacity:1;transform:none}}
 .zoom-out img{width:29px;height:34px}
 .zoom-out h3{font-size:15px;margin-bottom:6px}
 .zoom-out p{font-size:12px;color:var(--muted)}
+.design-guide-link{margin-top:12px}
+.design-guide-link:hover{border-color:var(--blue);background:#f4f6ff}
+.design-guide-link h3,.design-guide-link>span{color:var(--blue-text)}
+.design-guide-link>span{margin-left:auto}
 .design-references{margin-top:25px;border-bottom:1px solid var(--line);padding:18px 0}
 .design-references summary{font-size:12px;font-weight:450;color:var(--muted)}
 .reference-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:30px;padding:9px 0 8px}
