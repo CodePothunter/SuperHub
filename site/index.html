@@ -78,9 +78,13 @@
 <section class="section bound" id="faq"><div class="faqs"><h2>开始之前，你可能想知道。</h2><details open><summary>SuperHub 是什么？</summary><p>SuperHub 是基于 DeepSeek Harness 的个人 AI 工作空间。通过一个接口人交办，按项目配置幕僚与上下文，在工作区协作、从汇报接回决定。当前是 DSH Web 插件，并提供手机浏览器入口。</p></details>
   <details id="comparison-faq">
     <summary>SuperHub 和 DS Bot、Personal Agent 有什么区别？</summary>
-    <p><strong>DS Bot</strong> 围绕长期运行的 Bot 和群聊组织协作。你可以找主 Bot、单聊或在群里点名成员，也能查看后台任务进度。<a href="https://github.com/Fei-Craft/DS-Bot#features">查看 DS Bot 的功能说明 ↗</a></p>
-    <p><strong>Personal Agent</strong> 以「搭档」项目为例，从一个个人助手入口收下交办，把需要跟进的事记成工单，并汇集结果和日报。<a href="https://github.com/yinguobing/dsh-personal-agent">查看「搭档」的项目说明 ↗</a></p>
-    <p><strong>SuperHub</strong> 围绕项目工作区组织目标、幕僚、会话、工单和交付。你可以把研发排查交出去，继续客户访谈。红点留住新汇报，等你有空再打开看结论、补方向，或沿原工单看过程。</p>
+    <p><strong>同一个用例。</strong> 你正在根据受访者原话整理下一轮访谈提纲，产品研发的接入检查突然失败了。你想请 AI 核对接入记录，交一份修复与验证方案，实际改动等你确认。</p>
+    <p><strong>DS Bot</strong> 可以把研发排查交到专门的群聊，由群管理员叫来工程和验证 Bot，也可以直接 @ 对应成员。研发群有自己的记忆和工作目录，Bot 把结果发回群里，你也可以在任务页查看后台进度。 <a href="https://github.com/Fei-Craft/DS-Bot#features">DS Bot 功能说明 ↗</a></p>
+    <p><strong>Personal Agent（以「搭档」为例）</strong> 把排查交给面板或微信里的同一个助手。助手登记工单，在对应的会话和目录里执行。你可以从原交办入口接回结果，也能在面板看在办事项，或从日报集中回看。 <a href="https://github.com/yinguobing/dsh-personal-agent">「搭档」项目说明 ↗</a></p>
+    <p><strong>SuperHub</strong> 从「一句话交办」把排查交给接口人。它把原话、交付要求和改动边界放进「产品研发」的工单，由本区幕僚分工。你回「客户访谈」继续写提纲。</p>
+    <p><strong>工作区 Context 隔离。</strong> 研发保留接入记录、排查对话和验证方案，访谈保留受访者原话和提纲。同一位幕僚可以按两边各自的职责和经验工作。想把「怎么标注待核实项」带到访谈，只共享那条经验，选定接收工作区和成员。</p>
+    <p><strong>注意力管理。</strong> 研发交回方案时，未读红点出现在「一句话交办」，眼前仍是访谈对话。你可以先写完这段，再打开汇报看结论、待确认项和建议下一步。需要补方向或看依据时，沿汇报回到原工单，也可以在「今天」一起看各项目的交付。</p>
+    <p><a href="#story-sequence">在在线演示里走一遍这个用例 ↗</a></p>
   </details>
   <details id="team-faq"><summary>幕僚是固定的几个角色吗？</summary><p>你可以创建全局幕僚、邀请它加入工作区并设定本区职责，也可以创建工作区专属幕僚。名称、职责和头像可调整，经验可以采纳、共享、撤回或重置。</p></details><details><summary>工作区的上下文边界是什么？</summary><p>工作区分别组织对话、项目职责与本区经验。通用做法可以复用，跨区经验可由你选择文字、接收人、用途与有效期。这里描述的是应用中的上下文组织和授权，不是独立账号或文件系统沙箱。</p></details><details><summary>红点会只提醒必须立即处理的事吗？</summary><p>目前红点表示接口人的未读回复、讨论回报和提醒。它提供集中回看的入口，不是紧急度分类，也不表示每项都要立刻处理。</p></details><details><summary>怎样把已有 AI 经验带进来、再带出去？</summary><p>把导入提示词发给常用助手，贴回它对你的了解，在 SuperHub 逐条核对、修改或采纳。导出时可以生成给 ChatGPT、Claude 的文字，或用于 Codex、Claude Code 的指令文件区块与会话背景。本机同步需由你配置；导出采用已确认的本人资料、协作约定与有效目标，标记为机密的内容会被过滤。</p></details><details><summary>可以接入哪些执行工具？</summary><p>DSH 模型成员可以与使用 Codex 或 Claude Code 的成员在工作区协作。具体可用工具、模型和账号取决于你的运行环境与成员配置。</p></details><details><summary>资料存在哪里？</summary><p>工作资料保存在运行 SuperHub 的主机及你选择的资料目录中。调用模型时，相关内容按所用模型服务处理，不能把本地保存理解成全程离线。</p></details><details><summary>能完全不干预地持续工作吗？</summary><p>SuperHub 提供分工、进展、跟进和交付入口。实际推进取决于模型、工具与任务情况；缺少信息或需要决定时，仍要由你接话和确认。</p></details></div></section>
 <section class="closing bound"><img src="assets/hub-small.svg" alt=""><h2>把下一件事，交给 SuperHub。</h2><p>让 AI 分头忙，让你专心做主。</p><div class="cta"><a class="button primary" href="#start">了解如何开始 ↗</a><a class="button" href="https://github.com/CodePothunter/SuperHub">查看项目源码 ↗</a></div></section>
