@@ -38,9 +38,12 @@ export function Issue({ text, retry }: { text?: string; retry?: () => void }) {
   return text ? <div className="v2-issue" role="alert"><span>{text}</span>{retry && <button type="button" className="v2-link" onClick={retry}>重新读取</button>}</div> : null
 }
 
-/** The native dialog handles Tab and Escape. Its body is also focusable for keyboard scrolling. */
-export function V2Dialog({ title, meta, close, fallbackFocus, children }: {
-  title: string; meta?: string; close: () => void; fallbackFocus?: RefObject<HTMLElement | null>; children: ReactNode
+/**
+ * The native dialog handles Tab and Escape. Its body is also focusable for keyboard scrolling.
+ * `size="wide"` is the working window of the liaison only: wide, fixed height, full screen on phones.
+ */
+export function V2Dialog({ title, meta, close, fallbackFocus, size, children }: {
+  title: string; meta?: string; close: () => void; fallbackFocus?: RefObject<HTMLElement | null>; size?: 'wide'; children: ReactNode
 }) {
   const dialog = useRef<HTMLDialogElement>(null)
   const titleRef = useRef<HTMLHeadingElement>(null)
@@ -58,7 +61,7 @@ export function V2Dialog({ title, meta, close, fallbackFocus, children }: {
       if (fallbackFocus?.current?.isConnected) fallbackFocus.current.focus({ preventScroll: true })
     }
   }, [])
-  return <dialog ref={dialog} className="v2-dialog" aria-label={title} onCancel={event => { event.preventDefault(); close() }}>
+  return <dialog ref={dialog} className={size ? 'v2-dialog ' + size : 'v2-dialog'} aria-label={title} onCancel={event => { event.preventDefault(); close() }}>
     <header><div>{meta && <div className="v2-eyebrow">{meta}</div>}<h2 ref={titleRef} tabIndex={-1}>{title}</h2></div>
       <button className="v2-icon-btn" type="button" aria-label="关闭详情" onClick={close}><V2Icon name="close"/></button></header>
     <div className="v2-dialog-body" role="group" aria-label="详情内容" tabIndex={0}>{children}</div>

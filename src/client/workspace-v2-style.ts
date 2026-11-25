@@ -359,6 +359,8 @@ body[data-ds-dark-theme]:not([data-chief-standalone]) .wv2 { ${darkPalette} }
   margin:auto; padding:0; border:1px solid var(--v-line); border-radius:13px; overflow:hidden;
   background:var(--v-surface); color:var(--v-ink); box-shadow:0 18px 75px #10121A38; font:inherit; }
 .wv2 .v2-dialog[open] { display:flex; flex-direction:column; }
+.wv2 .v2-dialog.wide { width:min(960px,calc(100vw - 48px)); height:min(88dvh,940px); max-width:none; max-height:none; }
+.wv2 .v2-dialog.wide .v2-dialog-body { flex:1; display:flex; flex-direction:column; }
 .wv2 .v2-dialog::backdrop { background:#14151966; }
 .wv2 .v2-dialog>header { flex:none; display:flex; align-items:start; justify-content:space-between; gap:12px;
   padding:var(--dialog-block) var(--dialog-inline) 12px; border-bottom:1px solid var(--v-soft); }
@@ -596,6 +598,11 @@ body[data-ds-dark-theme]:not([data-chief-standalone]) .wv2 { ${darkPalette} }
   .wv2 .v2-archived-banner { padding:10px 12px; }
   .wv2 .v2-archived-banner>.v2-button { flex:1 1 100%; min-height:44px; }
   .wv2 .v2-archive-workspace>.v2-link { min-height:44px; }
+}
+@media(max-width:640px) {
+  .wv2 .v2-dialog.wide { inset:0; width:100%; height:100dvh; max-height:none; margin:0; border:0; border-radius:0; box-shadow:none; }
+  .wv2 .v2-dialog.wide>header { padding-top:calc(var(--dialog-block) + env(safe-area-inset-top)); }
+  .wv2 .v2-dialog.wide .v2-dialog-body { margin-bottom:0; padding-bottom:calc(12px + env(safe-area-inset-bottom)); }
 }
 ${CHAT_ATTACHMENT_STYLE}
 `
