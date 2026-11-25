@@ -471,7 +471,8 @@ async function conversation(host) {
         && (message.text.trim() || message.profileImports?.length))
     }, `「${item.said}」的回复`, 240_000).catch(e => { error = e.message })
     await delay(1500)
-    const rows = (await probe({ action: 'records' })).filter(row => row.session === liaison && row.owner === item.said)
+    // 接口人对话按上下文用量换段（<base>-p2、-p3…），换段之后的调用记在新段的会话里。
+    const rows = (await probe({ action: 'records' })).filter(row => (row.session === liaison || row.session?.startsWith(liaison + '-p')) && row.owner === item.said)
     const tickets = (await ticketList()).filter(row => !beforeTickets.has(row.id))
     const details = await Promise.all(tickets.map(row => host.api(`/tickets/${row.id}`)))
     const fromRoom = new Set((await host.api(`/superhub/items?scope=${scope}`)).receipts.filter(row => row.authorization?.roomId).flatMap(row => row.items.map(item => item.ticketId)))
@@ -496,7 +497,11 @@ async function conversation(host) {
           ...(opening && {firstMessage:{author:opening.author,text:opening.text,quote:opening.quote}})})
       }
     }
-    const route = (await probe({ action: 'routes' }))[liaison]?.at(-1)
+    // 换段后本轮的路由记在最新一段（<base>-pN）的会话里；只看起始会话会读到旧段早先那一轮的路由。
+    const routes = await probe({ action: 'routes' })
+    const part = id => id === liaison ? 1 : Number(id.slice(liaison.length + 2))
+    const latest = Object.keys(routes).filter(id => id === liaison || /^-p\d+$/.test(id.slice(liaison.length)) && id.startsWith(liaison)).sort((a, b) => part(a) - part(b)).at(-1)
+    const route = latest ? routes[latest]?.at(-1) : undefined
     const turn = { id: item.id, said: item.said, seconds: Math.round((Date.now() - started) / 1000), rows, newTickets: tickets.map(row => row.id),
       tickets: details.map(row => ({ id: row.ticket.id, staff: row.ticket.staff, stage: row.stage, ...fromRoom.has(row.ticket.id) ? { room: true } : {} })),
       denied: details.flatMap(row => row.ticket.superhub?.contracts?.at(-1)?.denied ?? []), newRooms: (await host.api('/rooms')).length - beforeRooms, reply: reply.slice(0, 400),
