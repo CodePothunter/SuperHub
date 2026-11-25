@@ -149,7 +149,7 @@ npm pack
 
 [打开 SuperHub 演示](https://codepothunter.github.io/SuperHub/)。用滚轮或左右方向键推进场景，也可以切换「产品研发」「客户访谈」「研究周报」，查看各自的工单、材料、共同经验与幕僚成长记录。演示使用内置样例。
 
-[查看 SuperHub 机制图解](https://codepothunter.github.io/SuperHub/superhub-design.html)。六张图说明交办、注意力管理、工单、工作区边界和权限。
+[查看 SuperHub 机制图解](https://codepothunter.github.io/SuperHub/superhub-design.html)。七张图说明交办、注意力管理、工单、工作区边界、经验记忆和权限。
 
 从源码预览时，在仓库根目录运行 `python3 -m http.server 8080 --bind 127.0.0.1 --directory site`，再打开 [本地演示](http://127.0.0.1:8080/)。
 

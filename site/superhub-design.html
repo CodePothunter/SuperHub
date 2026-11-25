@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SuperHub 设计图解</title>
-<meta name="description" content="用六张图了解 SuperHub 的交办流程、注意力管理、工作区边界和权限。">
+<meta name="description" content="用七张图了解 SuperHub 的交办流程、注意力管理、工作区边界、经验记忆和权限。">
 <link rel="icon" href="assets/hub-small.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -164,9 +164,9 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
 
 <header>
   <nav aria-label="返回 SuperHub 演示"><a class="demo-back" href="index.html#after-demo">← 返回在线演示</a></nav>
-  <div class="eyebrow"><span class="pip" aria-hidden="true"></span>SuperHub 0.2.0 · DeepSeek Harness 插件</div>
+  <div class="eyebrow"><span class="pip" aria-hidden="true"></span>SuperHub 当前 main · DeepSeek Harness 插件</div>
   <h1>SuperHub 设计图解</h1>
-  <p class="lead">你只跟接口人说一句话，事情就落到对应项目里推进。你继续手头的事，有空再从红点接回汇报。下面六张图依次画出它的整体结构、注意力节奏、工单流程、项目边界、写入权限和命令护栏。</p>
+  <p class="lead">你只跟接口人说一句话，事情就落到对应项目里推进。你继续手头的事，有空再从红点接回汇报。下面七张图依次画出整体结构、注意力节奏、工单流程、项目边界、写入权限、经验记忆和命令护栏。</p>
   <ul class="principles">
     <li><b>交办有落点</b><span>接口人把目标和边界交到对应工作区，回执带你找到原工单。</span></li>
     <li><b>过程有归属</b><span>一个项目的对话、材料、决定和成果，都留在它自己的工作区。</span></li>
@@ -229,7 +229,7 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
         <rect class="chip" x="610" y="139" width="44" height="24" rx="6"/><text class="ts" x="632" y="156" text-anchor="middle">会话</text>
         <rect class="chip" x="662" y="139" width="44" height="24" rx="6"/><text class="ts" x="684" y="156" text-anchor="middle">工单</text>
         <rect class="chip" x="714" y="139" width="44" height="24" rx="6"/><text class="ts" x="736" y="156" text-anchor="middle">幕僚</text>
-        <rect class="chip" x="766" y="139" width="68" height="24" rx="6"/><text class="ts" x="800" y="156" text-anchor="middle">本区经验</text>
+        <rect class="chip" x="766" y="139" width="68" height="24" rx="6"/><text class="ts" x="800" y="156" text-anchor="middle">共同经验</text>
         <rect class="chip" x="842" y="139" width="44" height="24" rx="6"/><text class="ts" x="864" y="156" text-anchor="middle">交付</text>
 
         <!-- 工作区 2 -->
@@ -239,7 +239,7 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
         <rect class="chip" x="610" y="234" width="44" height="24" rx="6"/><text class="ts" x="632" y="251" text-anchor="middle">会话</text>
         <rect class="chip" x="662" y="234" width="44" height="24" rx="6"/><text class="ts" x="684" y="251" text-anchor="middle">工单</text>
         <rect class="chip" x="714" y="234" width="44" height="24" rx="6"/><text class="ts" x="736" y="251" text-anchor="middle">幕僚</text>
-        <rect class="chip" x="766" y="234" width="68" height="24" rx="6"/><text class="ts" x="800" y="251" text-anchor="middle">本区经验</text>
+        <rect class="chip" x="766" y="234" width="68" height="24" rx="6"/><text class="ts" x="800" y="251" text-anchor="middle">共同经验</text>
         <rect class="chip" x="842" y="234" width="44" height="24" rx="6"/><text class="ts" x="864" y="251" text-anchor="middle">交付</text>
 
         <!-- 工作区 3 -->
@@ -249,7 +249,7 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
         <rect class="chip" x="610" y="329" width="44" height="24" rx="6"/><text class="ts" x="632" y="346" text-anchor="middle">会话</text>
         <rect class="chip" x="662" y="329" width="44" height="24" rx="6"/><text class="ts" x="684" y="346" text-anchor="middle">工单</text>
         <rect class="chip" x="714" y="329" width="44" height="24" rx="6"/><text class="ts" x="736" y="346" text-anchor="middle">幕僚</text>
-        <rect class="chip" x="766" y="329" width="68" height="24" rx="6"/><text class="ts" x="800" y="346" text-anchor="middle">本区经验</text>
+        <rect class="chip" x="766" y="329" width="68" height="24" rx="6"/><text class="ts" x="800" y="346" text-anchor="middle">共同经验</text>
         <rect class="chip" x="842" y="329" width="44" height="24" rx="6"/><text class="ts" x="864" y="346" text-anchor="middle">交付</text>
 
         <!-- 第二大脑 -->
@@ -261,7 +261,7 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
         <text x="40" y="443"><tspan class="tb">第二大脑</tspan><tspan class="ts" dx="12">你选的目录，纯文本 + git：工单记录、会话产出、本人资料、目标、经验</tspan></text>
       </svg>
     </div>
-    <figcaption>一个入口进，项目里做，汇报回到同一个入口。接口人手里没有 shell，也不能直接改文件，所有活都要落成工单，才能被追踪和验收。执行者按成员选，示例里研发用 Codex 和 Claude Code，访谈和周报用 DSH 模型。所有记录都落在你自己的目录里。</figcaption>
+    <figcaption>一个入口进，项目里做，汇报回到同一个入口。接口人手里没有 shell，也不能直接改文件，所有活都要落成工单，才能被追踪和验收。执行者按成员选，示例里研发用 Codex 和 Claude Code，访谈和周报用 DSH 模型。共同经验在工作区「经验」页，幕僚成长记录在各自的成员卡；记录落在你自己的目录里。</figcaption>
     <div class="src">src/dsh/liaison.ts（LIAISON_DENY） · src/core/workspace-v2.ts · README.md「数据存放」</div>
   </figure>
 </section>
@@ -415,7 +415,7 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
   <h2><span class="no">图 4</span>项目之间有边界</h2>
   <figure>
     <div class="scroll" tabindex="0" role="region" aria-label="工作区边界图">
-      <svg class="dg" viewBox="0 0 960 400" role="img" aria-label="同一位研究员被邀请进产品研发和客户访谈，两边职责不同，经验各自积累在本区；只有你选定的一段文字能经共享越过边界，其余经验留在原工作区。">
+      <svg class="dg" viewBox="0 0 960 400" role="img" aria-label="同一位研究员被邀请进产品研发和客户访谈，两边职责不同。工作区共同经验在经验页，研究员成长记录在幕僚卡；只有你授权的摘录能经共享越过边界。">
         <defs>
           <marker id="f4n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="mk" d="M0,1 L10,5 L0,9 z"/></marker>
           <marker id="f4a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="mk-a" d="M0,1 L10,5 L0,9 z"/></marker>
@@ -438,22 +438,24 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
         <text class="tb" x="40" y="128">产品研发</text>
         <rect class="box" x="40" y="142" width="390" height="44" rx="8"/>
         <text x="56" y="169"><tspan class="tb">研究员</tspan><tspan class="ts" dx="12">本区职责：核对配置与验证依据</tspan></text>
-        <text class="ts" x="40" y="210">本区经验</text>
+        <text class="ts" x="40" y="210">共同经验 · 工作区「经验」页</text>
         <rect class="box" x="40" y="220" width="390" height="34" rx="6"/>
         <text x="56" y="242">接入排查先比对配置版本</text>
-        <rect class="box" x="40" y="262" width="390" height="34" rx="6"/>
-        <text x="56" y="284">验证方案附上复现步骤</text>
+        <text class="ts" x="40" y="278">个人成长 ·「幕僚」成员卡</text>
+        <rect class="box" x="40" y="286" width="390" height="34" rx="6"/>
+        <text x="56" y="308">结论附上来源，待核实项另列</text>
         <text class="ts" x="40" y="356">还有本区的会话、工单、交付</text>
 
         <!-- 客户访谈 -->
         <text class="tb" x="530" y="128">客户访谈</text>
         <rect class="box" x="530" y="142" width="390" height="44" rx="8"/>
         <text x="546" y="169"><tspan class="tb">研究员</tspan><tspan class="ts" dx="12">本区职责：核对受访者原话</tspan></text>
-        <text class="ts" x="530" y="210">本区经验</text>
+        <text class="ts" x="530" y="210">共同经验 · 工作区「经验」页</text>
         <rect class="box" x="530" y="220" width="390" height="34" rx="6"/>
         <text x="546" y="242">引用原话注明受访者与日期</text>
+        <text class="ts" x="530" y="278">获准共享 · 限定用途</text>
         <rect class="box-l" x="530" y="290" width="390" height="34" rx="6"/>
-        <text x="546" y="312">共享自产品研发：验证方案附上复现步骤</text>
+        <text x="546" y="312">获准摘录：结论附上来源，待核实项另列</text>
         <text class="ts" x="530" y="356">还有本区的会话、工单、交付</text>
 
         <!-- 不外流 -->
@@ -462,13 +464,13 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
         <line class="ln-r" x1="486" y1="231" x2="474" y2="243"/>
 
         <!-- 共享 -->
-        <path class="ln-a" d="M430,279 L446,279 L446,300 L461,300"/>
-        <rect class="box-l" x="462" y="288" width="36" height="24" rx="5"/>
-        <text class="tl" x="480" y="305" text-anchor="middle">共享</text>
-        <path class="ln-a" d="M498,300 L514,300 L514,307 L527,307" marker-end="url(#f4a)"/>
+        <path class="ln-a" d="M430,303 L461,303"/>
+        <rect class="box-l" x="462" y="291" width="36" height="24" rx="5"/>
+        <text class="tl" x="480" y="308" text-anchor="middle">共享</text>
+        <path class="ln-a" d="M498,303 L514,303 L514,307 L527,307" marker-end="url(#f4a)"/>
       </svg>
     </div>
-    <figcaption>幕僚来自全局名册，可以被邀请进多个项目，每个项目给他定一份职责。他在某个项目里积累的经验只留在那个项目。要把一条经验带到别的项目，你得选定那段文字、接收的成员和用途，才能共享过去；其余经验不会跨过边界。</figcaption>
+    <figcaption>幕僚可以加入多个项目，每个项目各定职责。共同经验在来源工作区的「经验」页，具名幕僚的成长记录在「幕僚」页的成员卡。跨区复用已生效经验时，由你选择摘录、接收范围、用途和有效期；接收方只看到获准内容，来源条目仍由原工作区管理。</figcaption>
     <div class="src">src/core/workspace-staff.ts（StaffMember.memberships · StaffMemory.workspaceId · StaffShare）</div>
   </figure>
 </section>
@@ -525,14 +527,80 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
         <text class="tl" x="775" y="182" text-anchor="middle">等你批准</text>
       </svg>
     </div>
-    <figcaption>事实可以直接记，判断留给你。幕僚可以随手记下互动、承诺和工单产出；涉及长期知识、目标，或对人的判断，就只能写提案，你在作战台批准后才落地，每一步都有 git 记录。对外发送消息、邮件、评论也要先经你批准。标了 [机密] 的内容不会导出给别的助手。</figcaption>
+    <figcaption>事实可以直接记，判断留给你。幕僚可以随手记下互动、承诺和工单产出；涉及通用长期知识、目标，或对人的判断，就只能写提案，你在作战台批准后才落地，每一步都有 git 记录。经验清单另按下一张图的依据与状态规则管理。对外发送消息、邮件、评论也要先经你批准。标了 [机密] 的内容不会导出给别的助手。</figcaption>
     <div class="src">templates/brain/README.md · templates/brain/AGENTS.md · src/dsh/connectors.ts（草稿待批准）</div>
   </figure>
 </section>
 
 <!-- 图 6 -->
 <section>
-  <h2><span class="no">图 6</span>编码命令要过闸门</h2>
+  <h2><span class="no">图 6</span>经验怎样成为可用记忆</h2>
+  <figure>
+    <div class="scroll" tabindex="0" role="region" aria-label="经验与记忆机制图">
+      <svg class="dg" viewBox="0 0 960 470" role="img" aria-label="主人明确的长期约定可直接成为已采纳经验。交付、阶段回报和失败恢复经整理、核对来源后通常成为待采纳候选；你可以采纳，完全匹配的直接工具或测试证据也可能使其自动采纳。工作区共同经验在经验页，具名幕僚经验在成员成长记录；只有已生效且相关的条目才按权限提供给后续任务。">
+        <defs>
+          <marker id="f6a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="mk-a" d="M0,1 L10,5 L0,9 z"/></marker>
+        </defs>
+
+        <!-- 明确的主人约定可直达已采纳状态 -->
+        <path class="ln-a dash" d="M115,78 L115,18 L825,18 L825,78" marker-end="url(#f6a)"/>
+        <text class="tl" x="470" y="43" text-anchor="middle">主人明确的长期约定可直接生效</text>
+
+        <!-- 来源 → 整理 → 候选 → 生效 -->
+        <rect class="box" x="20" y="80" width="190" height="130" rx="10"/>
+        <text class="tb" x="35" y="110">可核对的来源</text>
+        <text class="ts" x="35" y="137">主人明确约定</text>
+        <text class="ts" x="35" y="158">工单交付、阶段回报</text>
+        <text class="ts" x="35" y="179">失败后的恢复</text>
+
+        <rect class="box" x="250" y="80" width="190" height="130" rx="10"/>
+        <text class="tb" x="265" y="110">经验整理</text>
+        <text class="ts" x="265" y="137">核对原话与实际结果</text>
+        <text class="ts" x="265" y="158">「现在整理」</text>
+        <text class="ts" x="265" y="179">已启用的每周 Dream</text>
+
+        <rect class="box-l" x="480" y="80" width="190" height="130" rx="10"/>
+        <text class="tb" x="495" y="110">待采纳</text>
+        <text class="ts" x="495" y="137">保留来源、情境与边界</text>
+        <text class="ts" x="495" y="158">供你审阅与更正</text>
+        <text class="tl" x="495" y="179">搁置不会自动生效</text>
+
+        <rect class="box-ok" x="710" y="80" width="230" height="130" rx="10"/>
+        <text class="tb" x="725" y="110">已采纳</text>
+        <text class="ts" x="725" y="137">你采纳，或严格证据匹配</text>
+        <text class="ts" x="725" y="158">更正、停用均留版本</text>
+        <text class="ts" x="725" y="179">可恢复历史版本</text>
+
+        <line class="ln-a" x1="210" y1="145" x2="247" y2="145" marker-end="url(#f6a)"/>
+        <line class="ln-a" x1="440" y1="145" x2="477" y2="145" marker-end="url(#f6a)"/>
+        <line class="ln-a" x1="670" y1="145" x2="707" y2="145" marker-end="url(#f6a)"/>
+
+        <!-- 同一状态规则，按归属展示在不同页面 -->
+        <text class="tl" x="20" y="250">按归属审查</text>
+        <rect class="box" x="20" y="265" width="440" height="88" rx="10"/>
+        <text class="tb" x="38" y="292">工作区共同经验</text>
+        <text class="ts" x="38" y="315">工作区「经验」页查看状态、依据与旧版本</text>
+        <text class="ts" x="38" y="337">跨区复用只共享你授权的摘录</text>
+
+        <rect class="box" x="500" y="265" width="440" height="88" rx="10"/>
+        <text class="tb" x="518" y="292">幕僚专属经验</text>
+        <text class="ts" x="518" y="315">「幕僚」→ 成员卡 →「成长记录」</text>
+        <text class="ts" x="518" y="337">按具名成员核对来源与适用范围</text>
+
+        <!-- 共享行为层按任务选择生效经验 -->
+        <rect class="box-l" x="20" y="380" width="920" height="76" rx="10"/>
+        <text x="35" y="408"><tspan class="tb">共享智能体行为层</tspan><tspan class="ts" dx="12">只把已生效且与当前任务相关的条目按权限提供给主智能体和执行成员</tspan></text>
+        <text class="ts" x="35" y="434">跨区使用还须核对接收对象、用途与授权有效期；有效期控制接收方使用，不会自动停用来源条目。</text>
+      </svg>
+    </div>
+    <figcaption>工作结果通常先整理成带来源的待采纳候选；候选搁置时不会被后续任务使用。主人明确的长期约定可以直接生效，候选也可能在出现完全匹配的直接工具或测试证据后自动采纳。已提供给工单的经验若遇到可核对的直接反证，整理流程可更正或停用，并保留旧版本。经验条目目前没有通用的自动过期规则；跨区共享的使用授权可以设置有效期。</figcaption>
+    <div class="src">src/dsh/workspace-experience-learning.ts · src/dsh/workspace-staff-store.ts · src/dsh/runtime.ts · src/client/workspace-staff.tsx</div>
+  </figure>
+</section>
+
+<!-- 图 7 -->
+<section>
+  <h2><span class="no">图 7</span>编码命令要过闸门</h2>
   <figure>
     <div class="scroll" tabindex="0" role="region" aria-label="编码命令审批图">
       <svg class="dg" viewBox="0 0 960 330" role="img" aria-label="接入命令护栏的编码工具在执行命令前，由钩子询问闸门：普通命令直接执行；高危命令按工单档位处理，完全访问直接执行，请求批准由你决定，代为批准交给自动审查，审查不可用或超时就转给你；钩子等不到答复时一律拒绝。">
@@ -617,7 +685,7 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
   </figure>
 </section>
 
-<footer>根据 SuperHub 0.2.0 的源码、README 和 docs/attention.md 绘制。图中的项目、职责和经验都是示例。<a class="demo-back" href="https://github.com/CodePothunter/SuperHub/pull/1">图解由 @jinbozhan 贡献</a>。</footer>
+<footer>根据 SuperHub 源码、README 和 docs/attention.md 绘制；经验机制依据当前 main 补充。v0.2.0 发布包早于此功能。图中的项目、职责和经验都是示例。<a class="demo-back" href="https://github.com/CodePothunter/SuperHub/pull/1">原六张图解由 @jinbozhan 贡献</a>。</footer>
 
 </div>
 </body>
