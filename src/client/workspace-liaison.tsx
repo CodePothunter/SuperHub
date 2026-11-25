@@ -25,9 +25,11 @@ interface Props extends Links {
 }
 
 const style = `
-.wv2 .v2-liaison-history { max-height:46dvh; overflow:auto; overscroll-behavior:contain; padding:2px; scrollbar-gutter:stable; }
+.wv2 .v2-liaison { flex:1; display:flex; flex-direction:column; min-height:0; }
+.wv2 .v2-liaison-actions { flex:none; }
+.wv2 .v2-liaison-history { flex:1; min-height:120px; overflow:auto; overscroll-behavior:contain; padding:2px; scrollbar-gutter:stable; }
 .wv2 .v2-liaison .v2-turns { margin:3px 0 10px; }
-.wv2 .v2-liaison .v2-compose { margin:13px 0 0; }
+.wv2 .v2-liaison .v2-compose { flex:none; margin:13px 0 0; }
 .wv2 .v2-liaison .wr-room-receipts { display:flex; flex-wrap:wrap; gap:3px 10px; }
 .wv2 .v2-liaison .wr-room-receipts button { color:var(--v-green); font-weight:650; text-align:left; min-height:34px; }
 .wv2 .v2-liaison .wr-room-receipts button { display:flex; align-items:center; gap:5px; }
@@ -145,7 +147,7 @@ export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, op
     }
   }
 
-  return <V2Dialog title="接口人" meta={workspace?.name} close={close}>
+  return <V2Dialog title="接口人" meta={workspace?.name} close={close} size="wide">
     <style>{style + chatAvatarStyle}</style><div className="v2-liaison">
       {pending && <div className="v2-liaison-actions">{pending}</div>}
       <div className="v2-liaison-history" ref={history} onScroll={event => {
