@@ -100,7 +100,7 @@ try {
   const checklistHash = new URL(desktop.url()).hash
   await openOrderSession(desktop)
   await say(desktop,'@' + CODEX_STAFF.name + ' 请把交接要点写成一份 Markdown 清单。')
-  await desktop.getByRole('list',{name:'会话发言'}).getByRole('button',{name:'交接清单'}).waitFor({timeout:60_000})
+  await desktop.getByRole('list',{name:'会话发言'}).getByRole('button',{name:'交接清单',exact:true}).waitFor({timeout:60_000})
   await backToOrder(desktop)
   const files = desktop.getByRole('region',{name:'交付成果'})
   await button(files,'交接清单').click()
@@ -187,9 +187,12 @@ try {
   await button(mobile,'关闭会话').click()
   await button(mobile.getByRole('dialog'),'确认关闭').click()
   await mobile.getByText(/群聊 · 你和 \d+ 位成员 · 已关闭/).first().waitFor()
+  // The fix rewrites the same index.html: one delivered file, opened from its latest link.
   const fixed = await get(jobPath + '/outputs')
-  assert.equal(fixed.outputs.length,2)
-  passed('真实密码手机入口读到同一份已读交付并回到原单，打开工单的交付，在群里让 Codex 成员修正后关闭会话，工单仍列出两次交付')
+  const pageLines = (await get(base + '/sessions/' + sessionId)).messages.filter(m => m.attachments?.some(file => file.label === '查看报名页源码'))
+  assert.equal(pageLines.length,2)
+  assert.deepEqual(fixed.outputs.map(row => [row.messageId,row.attachment.label]),[[pageLines.at(-1).id,'查看报名页源码']])
+  passed('真实密码手机入口读到同一份已读交付并回到原单，打开工单的交付，在群里让 Codex 成员修正后关闭会话，同一份报名页在工单交付里只列一次、指向最新那次')
 
   const second = (await set('/v2/workspaces',{name:'独立试点'})).workspace
   await assert.rejects(get('/v2/workspaces/' + second.id + '/sessions/' + sessionId),{status:404})
