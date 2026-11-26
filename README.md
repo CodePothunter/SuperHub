@@ -8,7 +8,7 @@
 <p align="center">
   <a href="#快速开始">快速开始</a> ·
   <a href="https://codepothunter.github.io/SuperHub/">在线演示</a> ·
-  <a href="https://github.com/CodePothunter/SuperHub/releases/tag/v0.2.0">下载 0.2.0</a> ·
+  <a href="https://github.com/CodePothunter/SuperHub/releases/latest">下载最新版</a> ·
   <a href="#使用工作区">工作区</a> ·
   <a href="#经验怎样积累和使用">经验</a> ·
   <a href="#导入与导出">导入与导出</a>
@@ -26,16 +26,14 @@ SuperHub 是 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 
 ### 1. 安装 SuperHub
 
-从 [SuperHub 0.2.0](https://github.com/CodePothunter/SuperHub/releases/tag/v0.2.0) 下载 `SuperHub-0.2.0.tgz`。在运行 DSH 的机器上，用实际文件路径安装：
+下载 `SuperHub-0.3.0.tgz`。在运行 DSH 的机器上，将命令里的路径换成安装包的实际位置。[SuperHub 0.3.0](https://github.com/CodePothunter/SuperHub/releases/tag/v0.3.0)
 
 ```sh
-dsh plugin --profile web add /absolute/path/to/SuperHub-0.2.0.tgz
+dsh plugin --profile web add /absolute/path/to/SuperHub-0.3.0.tgz
 dsh web
 ```
 
-请通过本仓库的 GitHub Release 获取 SuperHub 安装包。
-
-「经验」页和幕僚成长记录已合入当前 `main`。要使用下文介绍的经验机制，可按下方「从源码打包」安装当前源码。v0.2.0 发布包对应发布时的代码。
+GitHub Release 的安装包已包含桌面与手机端构建产物，可直接安装。
 
 <details>
 <summary>安装 DSH Web</summary>

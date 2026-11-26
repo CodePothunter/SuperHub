@@ -1,6 +1,6 @@
 {
   "name": "dsh-chief",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "SuperHub 是 DeepSeek Harness 的个人 AI 工作空间。通过一个接口人交办，按项目组织 AI 协作，按自己的节奏接回汇报。",
   "type": "module",
   "main": "lib/index.js",
