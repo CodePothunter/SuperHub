@@ -100,6 +100,8 @@ export interface Subprocess {
 /** dsh-api-session-controller */
 export interface SessionController {
   resolveAgent(sessionId: string): Promise<{ agent: Agent } | { error: { code: string; message?: string } }>
+  /** DSH creates a new native session from a source prefix that includes atSeq. */
+  fork?(request: { sessionId: string; atSeq: number }): Promise<{ sessionId: string }>
   /** `workspaceId` or `cwd`, not both (a group member's session is created on its group's directory). */
   create(request: { sessionId?: string; agentPreset?: string; title?: string } & ({ workspaceId: string; cwd?: never } | { cwd: string; workspaceId?: never })): Promise<unknown>
   rename(request: { sessionId: string; title: string }): Promise<unknown>

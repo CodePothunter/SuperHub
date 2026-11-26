@@ -18,15 +18,15 @@ function optionalTimeZone(v:unknown) {
 }
 const evidence = (v:unknown) => row(v) && fields(v,'id','kind')
   && ['owner','group','delivery','tool','test','model-review','owner-acceptance','order','artifact'].includes(String(v.kind))
-  && [v.workspaceId,v.sessionId,v.orderId,v.messageId,v.version,v.quote,v.fileId,v.resultId,v.turnId,v.staffId].every(optional)
+  && [v.workspaceId,v.sessionId,v.orderId,v.messageId,v.version,v.quote,v.fileId,v.resultId,v.turnId,v.staffId,v.traceId,v.sessionDeletedAt,v.orderDeletedAt].every(optional)
 const maintenance = (v:unknown) => row(v) && timestamp(v.at) && optional(v.reason)
   && ['learn','accept','revise','retire','expire','pause','restore'].includes(String(v.action))
   && ['manual','owner','system'].includes(String(v.actor))
 const experienceFields = (v:Record<string,unknown>) => fields(v,'id','text','at')
-  && [v.staffId,v.workspaceId,v.orderId,v.situation,v.boundary,v.reason,v.adoptedAt,v.recordedAt].every(optional)
+  && [v.staffId,v.workspaceId,v.orderId,v.situation,v.boundary,v.reason,v.adoptedAt,v.recordedAt,v.orderDeletedAt].every(optional)
   && (v.source === undefined || ['owner','suggestion','observation'].includes(String(v.source)))
   && Number.isSafeInteger(v.version) && Number(v.version) > 0
-  && (v.lastUsed === undefined || fields(v.lastUsed,'workspaceId','orderId','at'))
+  && (v.lastUsed === undefined || row(v.lastUsed) && fields(v.lastUsed,'workspaceId','orderId','at') && optional(v.lastUsed.orderDeletedAt))
   && (v.expiresAt === undefined || timestamp(v.expiresAt))
   && (v.maintenance === undefined || maintenance(v.maintenance))
   && (v.supportCount === undefined || Number.isSafeInteger(v.supportCount) && Number(v.supportCount) >= 0)

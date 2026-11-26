@@ -154,6 +154,7 @@ interface SourceContext {
   sessionId?: string
   chatMode?: 'auto' | 'queue' | 'steer'
   inputAttachments?: ChatInputAttachment[]
+  readOnly?: true
 }
 
 interface Dispatch {
@@ -605,7 +606,8 @@ export class SuperhubIntake {
       const feature = featureRef(input.feature)
       const context = contextOf(input.context)
       const goalIds = this.goalIds(input.goalIds)
-      const choices = origin.channel === 'owner' ? this.ownerChoices(input, feature) : undefined
+      const choices: OwnerChoices | undefined = origin.channel === 'owner' ? this.ownerChoices(input, feature)
+        : origin.readOnly ? { operation:'read' } : undefined
       const key = this.originKey(origin.channel, request)
       const fingerprint = hash([text, feature, context, goalIds, origin.sessionId, undefined, origin.chatMode,
         ...choices?.operation || choices?.staff ? [choices.operation ?? null, choices.staff ?? null] : [],

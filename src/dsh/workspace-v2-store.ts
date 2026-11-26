@@ -3,8 +3,8 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { ChatInputAttachment } from '../core/chat-attachments.ts'
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import type { V2Acceptance, V2CodingPermission, V2Decision, V2Delegation, V2DialogueSource, V2DirectorySuggestions, V2DirectoryWait, V2Executor, V2Held, V2MessageAction, V2OrderOriginal, V2PermissionChange, V2Session, V2WorkDirectory, V2Workspace, V2WorkspaceView } from '../core/workspace-v2.ts'
-import { CODING_PERMISSIONS, WORKSPACE_ARCHIVED, codingPermission, defaultWorkspaceIcon, orderEnded, workspaceArchived } from '../core/workspace-v2.ts'
+import type { V2Acceptance, V2CodingPermission, V2Decision, V2Delegation, V2DialogueSource, V2DirectorySuggestions, V2DirectoryWait, V2Executor, V2Held, V2Message, V2MessageAction, V2OrderOriginal, V2PermissionChange, V2Session, V2WorkDirectory, V2Workspace, V2WorkspaceView } from '../core/workspace-v2.ts'
+import { CODING_PERMISSIONS, WORKSPACE_ARCHIVED, codingPermission, defaultWorkspaceIcon, messageWorkOrder, orderEnded, workspaceArchived } from '../core/workspace-v2.ts'
 import { nextSlot } from '../core/clock.ts'
 import type { IntakeContext } from '../core/superhub-intake.ts'
 import { workspaceError, workspaceFingerprint } from './superhub-goals.ts'
@@ -15,14 +15,18 @@ import type { OrderFollowupState } from './workspace-followup.ts'
 import { checkedOrderBrief, interimOrderBrief, type OrderBrief } from './workspace-order-brief.ts'
 import { weeklyResult, type StoredResult } from './workspace-notices.ts'
 import { checkProjectDirectory, suggestDirectories, type DirectoryRules } from './project-directory.ts'
+import { INITIAL_WORKSPACE_TRACE, initialTraceState, type WorkspaceDialogueEdit, type WorkspaceTraceState } from './workspace-dialogue-trace.ts'
 
-type MutationResult = { workspace: V2Workspace; outcome?: 'created' | 'existing' } | { delegation: V2Delegation } | { session: V2Session; stopped?: string }
+export type WorkspaceTarget = 'session' | 'order'
+interface Deletion { id: string; deletedAt: string }
+type MutationResult = { workspace: V2Workspace; outcome?: 'created' | 'existing' } | { delegation: V2Delegation } | { session: V2Session; stopped?: string } | Deletion
 interface SavedMutation { kind: 'mutation'; hash: string; result: MutationResult }
 interface Turn {
   staffToken?:string
   kind: 'turn'
   hash: string
   sessionId: string
+  traceId?: string
   state: 'pending' | 'sent' | 'unknown' | 'unsent'
   reserved: { id: string; generation: number }[]
   at: string
@@ -46,8 +50,9 @@ interface Interjected {
 }
 interface FollowupReceipt { kind: 'followup'; hash: string; reportId?: string }
 /** Owner words said in a roster group (one ledger line, found again by its request id), or held words handed to it. */
-interface GroupSaid { kind: 'group-say'; hash: string; sessionId: string; at: string }
+interface GroupSaid { kind: 'group-say'; hash: string; sessionId: string; at: string; traceId?: string }
 type Receipt = SavedMutation | Turn | QueuedFollow | Interjected | FollowupReceipt | GroupSaid | {kind: 'notice-read'; hash: string}
+  | {kind: 'trace-edit'; hash: string; traceId: string; sessionId: string}
 /**
  * Work the liaison hands to a roster group (an assignment, a supplement, a staff order from the order form), saved in
  * the same write as the order; the group line is posted once (by `requestId`) and the row is removed after it.
@@ -104,6 +109,7 @@ export interface AcceptanceRecord {
  */
 export interface OwnerCommand {
   inputAttachments?: ChatInputAttachment[]
+  traceId?: string
   workspaceId: string; sessionId: string; orderId: string; generation: number; text: string; hash: string; at: string
   /** The liaison's reading (`failed`: no reading, treated as ambiguous; `reason` says why). */
   judged: 'complete' | 'ambiguous' | 'failed'
@@ -279,6 +285,7 @@ export interface EngagementJob {
   id: string
   workspaceId: string
   sessionId: string
+  traceId?: string
   seq: number
   orderId?: string
   generation?: number
@@ -294,6 +301,7 @@ export interface EngagementJob {
   done?: true
 }
 interface StoredOwnerAction extends Omit<OwnerAction, 'workspaceName' | 'sessionTitle'> {
+  traceId?: string
   generation?: number
   answerMessageId?: string
   resolved?: true
@@ -301,6 +309,7 @@ interface StoredOwnerAction extends Omit<OwnerAction, 'workspaceName' | 'session
 
 interface Board {
   schema: 1 | 2
+  dialogueTraces?: Record<string, WorkspaceTraceState>
   portraits?: Record<string, SpeakerPortraits>
   personalWorkspaceId?: string
   /** Committed with the assignment, removed in the same write as the first turn reservation. */
@@ -375,11 +384,27 @@ export const ARCHIVE_RUNNING = '有回合正在运行，请等它结束或叫停
 function writable(board: Board, workspaceId: string | undefined) {
   if (board.workspaces.some(row => row.id === workspaceId && workspaceArchived(row))) workspaceError(409, WORKSPACE_ARCHIVED)
 }
+const ORDER_DELETED = '这张工单已删除'
+const SESSION_DELETED = '这场会话已删除'
+function orderRecord(board: Board, workspaceId: string, id: string) {
+  return board.delegations.find(row => row.workspaceId === workspaceId && row.id === id)
+}
+function sessionRecord(board: Board, workspaceId: string, id: string) {
+  return board.sessions.find(row => row.workspaceId === workspaceId && row.id === id)
+}
+function deletedReason(board: Board, workspaceId: string, sessionId: string, orderId?: string) {
+  if (sessionRecord(board, workspaceId, sessionId)?.deletedAt) return SESSION_DELETED
+  if (orderId && orderRecord(board, workspaceId, orderId)?.deletedAt) return ORDER_DELETED
+}
 function findDelegation(board: Board, workspaceId: string, id: string): V2Delegation {
-  return board.delegations.find(d => d.workspaceId === workspaceId && d.id === id) ?? workspaceError(404, '这个工作区没有这张工单')
+  const order = orderRecord(board, workspaceId, id) ?? workspaceError(404, '这个工作区没有这张工单')
+  if (order.deletedAt) return workspaceError(410, ORDER_DELETED)
+  return order
 }
 function findSession(board: Board, workspaceId: string, id: string): V2Session {
-  return board.sessions.find(s => s.workspaceId === workspaceId && s.id === id) ?? workspaceError(404, '这个工作区没有这场会话')
+  const session = sessionRecord(board, workspaceId, id) ?? workspaceError(404, '这个工作区没有这场会话')
+  if (session.deletedAt) return workspaceError(410, SESSION_DELETED)
+  return session
 }
 function newBoard(): Board {
   return { schema: 2, workspaces: [], delegations: [], sessions: [], decisions: [], receipts: {} }
@@ -657,10 +682,120 @@ export class WorkspaceV2Store {
     return receipt
   }
 
+  /** A trace belongs to this business session. Its initial version is implicit on older boards. */
+  traceState(session: Pick<V2Session, 'workspaceId' | 'id'>): WorkspaceTraceState {
+    this.current()
+    if (!this.board.sessions.some(row => row.workspaceId === session.workspaceId && row.id === session.id)) {
+      return workspaceError(404, '找不到这场会话')
+    }
+    return structuredClone(this.board.dialogueTraces?.[session.id] ?? initialTraceState())
+  }
+
+  traceBinding(session: V2Session, traceId?: string): V2Session {
+    const state = this.traceState(session)
+    const id = traceId ?? state.active
+    if (!state.traces.some(trace => trace.id === id)) return workspaceError(404, '这场会话没有这个历史版本')
+    return {...session, traceId: id}
+  }
+
+  assertActiveTrace(session: Pick<V2Session, 'workspaceId' | 'id'>, expected?: string) {
+    this.session(session.workspaceId, session.id)
+    const active = this.board.dialogueTraces?.[session.id]?.active ?? INITIAL_WORKSPACE_TRACE
+    if (expected !== undefined && expected !== active) return workspaceError(409, '对话版本已更新，请刷新后在当前对话继续')
+    return active
+  }
+
+  turnTrace(session: V2Session, requestId: string): V2Session {
+    const receipt = this.board.receipts['req-' + requestId]
+    const traceId = receipt?.kind === 'turn' && receipt.sessionId === session.id ? receipt.traceId : undefined
+    return this.traceBinding(session, traceId ?? INITIAL_WORKSPACE_TRACE)
+  }
+
+  dialogueEditReceipt(session: V2Session, mutation: Mutation) {
+    const past = this.receipt(mutation)
+    if (!past) return
+    if (past.kind !== 'trace-edit' || past.sessionId !== session.id) return workspaceError(409, '这条请求已用于另一项操作，请重新确认')
+    const edit = this.traceState(session).traces.find(trace => trace.id === past.traceId)?.edit
+    if (!edit) return workspaceError(503, '暂时无法读取历史编辑回执')
+    return edit
+  }
+
+  pendingDialogueEdits(): V2Session[] {
+    this.current()
+    return this.board.sessions.filter(session => {
+      if (session.deletedAt || session.closed || workspaceArchived(this.workspace(session.workspaceId))) return false
+      const state = this.board.dialogueTraces?.[session.id]
+      const edit = state?.traces.find(trace => trace.id === state.active)?.edit
+      return !!edit && !edit.admitted && !this.deletedReason(session.workspaceId, session.id, edit.workOrderId)
+    })
+  }
+
+  /** Publish both the new cursor and the pending revision before admitting its first turn. */
+  startDialogueEdit(session: V2Session, mutation: Mutation, parentId: string, anchorId: string, edit: WorkspaceDialogueEdit,
+    cutoff?: {beforeSeq: number; frozenThrough: number}) {
+    this.assertActiveTrace(session, parentId)
+    if (this.receipt(mutation)) return workspaceError(409, '这条请求已用于另一项操作，请重新确认')
+    return this.commit(board => {
+      writable(board, session.workspaceId)
+      const current = findSession(board, session.workspaceId, session.id)
+      if (current.closed) return workspaceError(409, '这场会话已关闭，重新打开后才可编辑')
+      if (edit.workOrderId) {
+        const order = findDelegation(board, session.workspaceId, edit.workOrderId)
+        if (order.sessionId !== session.id) return workspaceError(404, '这张工单不属于本场会话')
+        if (orderEnded(order) || order.paused) return workspaceError(409, stoppedReason(order))
+        if (!order.remainingTurns) return workspaceError(409, BUDGET_USED)
+      }
+      const state = (board.dialogueTraces ??= {})[session.id] ??= initialTraceState()
+      const parent = state.traces.find(trace => trace.id === parentId)!
+      if (cutoff) parent.frozenThrough = cutoff.frozenThrough
+      state.traces.push({id: edit.traceId, parentId, anchorId, beforeSeq: cutoff?.beforeSeq, edit})
+      state.active = edit.traceId
+      board.receipts[mutation.key] = {kind: 'trace-edit', hash: mutation.hash, traceId: edit.traceId, sessionId: session.id}
+
+      // Keep the old dialogue and business outcomes. Queued words and unfinished reviews belong to the old trace.
+      board.starts = (board.starts ?? []).filter(row => {
+        if (row.sessionId !== session.id) return true
+        dropStart(board, row)
+        return false
+      })
+      board.groupStarts = (board.groupStarts ?? []).filter(row => row.sessionId !== session.id)
+      for (const receipt of Object.values(board.receipts)) {
+        if (receipt.kind === 'interject' && receipt.sessionId === session.id && (receipt.state === 'queued' || receipt.state === 'steering')) {
+          receipt.state = 'stopped'
+          receipt.reason = '这句话属于编辑前的对话'
+        }
+      }
+      for (const row of Object.values(board.engagementJobs ?? {})) if (row.sessionId === session.id) row.done = true
+      for (const row of Object.values(board.ownerActions ?? {})) if (row.sessionId === session.id) row.resolved = true
+      for (const row of Object.values(board.acceptances ?? {})) if (row.sessionId === session.id) {
+        row.cancelled = true
+        row.posted = true
+        if (row.state === 'pending') row.state = 'skipped'
+      }
+      return structuredClone(edit)
+    })
+  }
+
+  finishDialogueEdit(session: V2Session, traceId: string, messageId: string, admitted = true) {
+    this.assertActiveTrace(session, traceId)
+    this.commit(board => {
+      const edit = board.dialogueTraces?.[session.id]?.traces.find(trace => trace.id === traceId)?.edit
+      if (!edit) return workspaceError(409, '对话版本已更新，请刷新')
+      if (edit.messageId && edit.messageId !== messageId) return workspaceError(409, '编辑结果需要核对')
+      edit.messageId = messageId
+      if (admitted) edit.admitted = true
+    })
+  }
+
   private write<T extends MutationResult>(mutation: Mutation, change: (board: Board) => T): T {
     const past = this.receipt(mutation)
     // receipt() matched the operation path and exact body, so the persisted result has this command's shape.
-    if (past?.kind === 'mutation') return past.result as T
+    if (past?.kind === 'mutation') {
+      const result = past.result
+      if ('session' in result) this.session(result.session.workspaceId, result.session.id)
+      if ('delegation' in result) this.delegation(result.delegation.workspaceId, result.delegation.id)
+      return result as T
+    }
     return this.commit(board => {
       const result = change(board)
       board.receipts[mutation.key] = { kind: 'mutation', hash: mutation.hash, result: structuredClone(result) }
@@ -678,9 +813,10 @@ export class WorkspaceV2Store {
     if (context?.surface !== 'workspace' || !context.selectedId) return
     const workspace = this.board.workspaces.find(row => row.id === context.selectedId)
     if (!workspace || !archived && workspaceArchived(workspace)) return
-    const session = context.sessionId && this.board.sessions.find(s => s.id === context.sessionId && s.workspaceId === workspace.id)
-    const order = session && context.workOrderId && this.board.delegations.find(o => o.id === context.workOrderId && o.workspaceId === workspace.id && o.sessionId === session.id)
-    return {workspace, session:session || undefined, order:order || undefined}
+    const session = context.sessionId ? sessionRecord(this.board, workspace.id, context.sessionId) : undefined
+    if (!session || session.deletedAt) return {workspace, session:undefined, order:undefined}
+    const order = context.workOrderId ? orderRecord(this.board, workspace.id, context.workOrderId) : undefined
+    return {workspace, session, order:order?.sessionId === session.id && !order.deletedAt ? order : undefined}
   }
   isRetiredOrder(id: string | undefined): boolean {
     return !!id && this.retiredOrderIds.has(id)
@@ -727,8 +863,7 @@ export class WorkspaceV2Store {
   }
 
   orderLabel(workspaceId:string, orderId:string) {
-    this.current()
-    return this.board.delegations.find(order => order.workspaceId === workspaceId && order.id === orderId)?.title
+    return this.reference(workspaceId, 'order', orderId)?.title
   }
 
   /** Old liaison assignments can be identified by their joint workspace/order/session receipt and unchanged auto-generated labels. */
@@ -755,7 +890,7 @@ export class WorkspaceV2Store {
     for (const {key,receipt} of candidates) {
       const before = receipt.delegation
       const order = this.board.delegations.find(row => row.id === before.id && row.workspaceId === receipt.workspace.id)
-      if (!order) continue
+      if (!order || deletedReason(this.board, order.workspaceId, order.sessionId, order.id)) continue
       const session = this.session(order.workspaceId,order.sessionId), turnId = 'start-'+key.slice('req-'.length)
       const journal = evidence?.(session,turnId,order.id)
       const previous = this.board.originals?.[order.id]
@@ -789,6 +924,7 @@ export class WorkspaceV2Store {
     this.current()
     const archived = new Set(this.board.workspaces.filter(workspaceArchived).map(row => row.id))
     return this.board.delegations.filter(order => !order.paused && !orderEnded(order) && !archived.has(order.workspaceId) &&
+      !deletedReason(this.board, order.workspaceId, order.sessionId, order.id) &&
       this.board.followups?.[order.id]?.schedule?.enabled)
   }
 
@@ -796,7 +932,7 @@ export class WorkspaceV2Store {
     this.workspace(workspaceId)
     if (sessionId) this.session(workspaceId, sessionId)
     return this.board.delegations.flatMap(order => {
-      if (order.workspaceId !== workspaceId || sessionId && sessionId !== order.sessionId) return []
+      if (order.workspaceId !== workspaceId || order.deletedAt || sessionId && sessionId !== order.sessionId) return []
       const commitments = this.board.followups?.[order.id]?.commitments
       return commitments?.length ? [{order, commitments}] : []
     })
@@ -844,7 +980,7 @@ export class WorkspaceV2Store {
       if (turn.kind !== 'turn' || turn.state !== 'sent' && turn.state !== 'unknown' || turn.resultCheck !== 'pending' || turn.reserved.length !== 1 ||
         requestId && key !== 'req-' + requestId) continue
       const order = this.board.delegations.find(row => row.id === turn.reserved[0]!.id && row.sessionId === turn.sessionId)
-      if (order) rows.push({requestId: key.slice(4), order, at: turn.at, state:turn.state})
+      if (order && !deletedReason(this.board, order.workspaceId, order.sessionId, order.id)) rows.push({requestId: key.slice(4), order, at: turn.at, state:turn.state})
     }
     rows.sort((a,b) => b.at.localeCompare(a.at) || a.requestId.localeCompare(b.requestId))
     if (rows.length <= 15) return rows
@@ -864,6 +1000,7 @@ export class WorkspaceV2Store {
       const receipt = board.receipts[key] as Turn
       let fresh = 0
       for (const notice of notices) {
+        if (deletedReason(board, notice.workspaceId, notice.sessionId, notice.orderId)) continue
         const order = findDelegation(board, notice.workspaceId, notice.orderId)
         if (order.sessionId !== notice.sessionId || receipt.sessionId !== order.sessionId || !receipt.reserved.some(r => r.id === order.id)) {
           return workspaceError(409, '这份报告的负责工单已经变更')
@@ -876,7 +1013,8 @@ export class WorkspaceV2Store {
       // New results are reviewed once against the order's promise, in the same write that publishes them.
       const hold = receipt.reserved[0]
       const order = hold && board.delegations.find(row => row.id === hold.id && row.sessionId === receipt.sessionId)
-      if (fresh && receipt.review && order) {
+      const currentTrace = (receipt.traceId ?? INITIAL_WORKSPACE_TRACE) === (board.dialogueTraces?.[receipt.sessionId]?.active ?? INITIAL_WORKSPACE_TRACE)
+      if (fresh && receipt.review && order && currentTrace) {
         const records = board.acceptances ??= {}
         // Owner words for this order queued while this turn ran (a steer that did not land, a liaison supplement) come
         // first: they run next, so this result gets no automatic follow-up.
@@ -911,7 +1049,7 @@ export class WorkspaceV2Store {
 
   queueEngagement(jobs: EngagementJob[]) {
     this.current()
-    const fresh = jobs.filter(row => !this.board.engagementJobs?.[row.id])
+    const fresh = jobs.filter(row => !this.board.engagementJobs?.[row.id] && !this.deletedReason(row.workspaceId, row.sessionId, row.orderId))
     if (!fresh.length) return
     this.commit(board => {
       const jobs = board.engagementJobs ??= {}
@@ -927,10 +1065,11 @@ export class WorkspaceV2Store {
   }
 
   repeatedEngagement(orderId: string, generation: number, decision: EngagementDecision, evidence: string,
-    evidenceAt: (seq: number) => string | undefined): boolean {
+    evidenceAt: (seq: number) => string | undefined, traceId = INITIAL_WORKSPACE_TRACE): boolean {
     const same = (left: string | undefined, right: string | undefined) => left?.trim().replace(/\s+/g, ' ') === right?.trim().replace(/\s+/g, ' ')
     const recipients = [...decision.memberIds ?? []].sort().join(',')
     return Object.values(this.board.engagementJobs ?? {}).filter(row => row.done && row.orderId === orderId && row.generation === generation &&
+      (row.traceId ?? INITIAL_WORKSPACE_TRACE) === traceId &&
       row.decision?.kind === 'continue' && same(row.decision.text, decision.text) &&
       [...row.decision.memberIds ?? []].sort().join(',') === recipients && same(evidenceAt(row.seq), evidence)).length >= 2
   }
@@ -961,16 +1100,17 @@ export class WorkspaceV2Store {
 
   pendingEngagement(): EngagementJob[] {
     this.current()
-    return structuredClone(Object.values(this.board.engagementJobs ?? {}).filter(row => !row.done))
+    return structuredClone(Object.values(this.board.engagementJobs ?? {}).filter(row => !row.done && !this.deletedReason(row.workspaceId, row.sessionId, row.orderId)))
   }
 
   activeEngagement(job: EngagementJob) {
     const workspace = this.board.workspaces.find(item => item.id === job.workspaceId)
     const session = this.board.sessions.find(item => item.id === job.sessionId && item.workspaceId === job.workspaceId)
-    if (!workspace || workspaceArchived(workspace) || !session || session.closed) return false
+    if (!workspace || workspaceArchived(workspace) || !session || session.closed || session.deletedAt) return false
+    if ((job.traceId ?? INITIAL_WORKSPACE_TRACE) !== (this.board.dialogueTraces?.[session.id]?.active ?? INITIAL_WORKSPACE_TRACE)) return false
     if (!job.orderId) return true
     const order = this.board.delegations.find(item => item.id === job.orderId && item.sessionId === job.sessionId && item.workspaceId === job.workspaceId)
-    return !!order && !orderEnded(order) && !order.paused && order.generation === job.generation
+    return !!order && !order.deletedAt && !orderEnded(order) && !order.paused && order.generation === job.generation
   }
 
   /** Persist the next action before dispatch. Replayed receipts stay visible only within their original generation. */
@@ -985,6 +1125,7 @@ export class WorkspaceV2Store {
         const session = findSession(board, row.workspaceId, row.sessionId)
         const id = 'group-' + workspaceFingerprint([session.id, intake.source]).slice(0, 32)
         const existing = board.delegations.find(item => item.id === id)
+        if (existing?.deletedAt) { row.done = true; return }
         const order = existing ?? makeDelegation(workspace, session.id, {...intake, owner: '接口人', permission: 'ask'}, this.turnLimit, session.directory)
         if (!existing) {
           order.id = id
@@ -1034,6 +1175,7 @@ export class WorkspaceV2Store {
       if (decision.kind === 'ask' && decision.text && question) {
         const id = 'action-' + workspaceFingerprint([row.sessionId, row.orderId, row.generation, question.seq]).slice(0, 40)
         actions[id] ??= {id, workspaceId: row.workspaceId, sessionId: row.sessionId, orderId: row.orderId,
+          ...row.traceId && {traceId: row.traceId},
           generation: row.generation, messageId: 'g-' + question.seq, question: decision.text, at: question.at}
       }
       return structuredClone(row)
@@ -1046,6 +1188,7 @@ export class WorkspaceV2Store {
     if (!saved || saved.done) return
     this.commit(board => {
       const row = board.engagementJobs![id]!
+      if (deletedReason(board, row.workspaceId, row.sessionId, row.orderId)) { row.done = true; return }
       if (result) (board.resultNotices ??= {})[result.id] ??= result
       if (waitUntil && (row.attempts ?? 0) < 2) {
         delete row.decision
@@ -1075,7 +1218,8 @@ export class WorkspaceV2Store {
     const row = this.board.engagementJobs?.[id]
     if (!row || row.done || !this.activeEngagement(row)) return false
     return row.turn !== 'member' || !row.orderId || !Object.values(this.board.resultNotices ?? {}).some(result =>
-      result.orderId === row.orderId && result.requestId === 'checkpoint:' + row.generation + ':final')
+      result.orderId === row.orderId && result.requestId === 'checkpoint:' + row.generation + ':final' &&
+      (result.traceId ?? INITIAL_WORKSPACE_TRACE) === (row.traceId ?? INITIAL_WORKSPACE_TRACE))
   }
 
   private actionActive(row: StoredOwnerAction): boolean {
@@ -1088,6 +1232,7 @@ export class WorkspaceV2Store {
     if (!row || (!historical && !this.actionActive(row))) return
     const workspace = this.workspace(row.workspaceId)
     const session = this.session(row.workspaceId, row.sessionId)
+    if (row.orderId) this.delegation(row.workspaceId, row.orderId)
     const {generation, resolved, answerMessageId, ...action} = row
     return {...action, workspaceName: workspace.name, sessionTitle: session.title}
   }
@@ -1100,21 +1245,21 @@ export class WorkspaceV2Store {
     })
   }
 
-  /** The latest owner message that answered an item of this order generation, as its ledger sequence. */
-  lastOwnerAnswerSeq(orderId: string, generation: number): number | undefined {
+  /** The latest answer to this order generation that is visible in the current ledger. */
+  lastOwnerAnswerSeq(orderId: string, generation: number, visible: (seq: number) => boolean): number | undefined {
     this.current()
     const seqs = Object.values(this.board.ownerActions ?? {}).flatMap(row => {
       const seq = row.resolved && row.orderId === orderId && row.generation === generation ? /^g-(\d+)$/.exec(row.answerMessageId ?? '')?.[1] : undefined
-      return seq ? [Number(seq)] : []
+      return seq && visible(Number(seq)) ? [Number(seq)] : []
     })
     return seqs.length ? Math.max(...seqs) : undefined
   }
 
-  engagementCheckpoints(orderId: string, generation: number) {
+  engagementCheckpoints(orderId: string, generation: number, traceId = INITIAL_WORKSPACE_TRACE) {
     this.current()
     const prefix = 'checkpoint:' + generation + ':'
     return Object.values(this.board.resultNotices ?? {}).flatMap(row =>
-      row.orderId === orderId && row.requestId?.startsWith(prefix) ? [row.requestId.slice(prefix.length)] : [])
+      row.orderId === orderId && row.requestId?.startsWith(prefix) && (row.traceId ?? INITIAL_WORKSPACE_TRACE) === traceId ? [row.requestId.slice(prefix.length)] : [])
   }
 
   groupEvidence(orderId?: string): StoredResult[] {
@@ -1125,11 +1270,13 @@ export class WorkspaceV2Store {
   /** Reviews still to run, and verdict notes still to post. */
   pendingAcceptances() {
     this.current()
-    return Object.entries(this.board.acceptances ?? {}).flatMap(([turnId, row]) => row.state === 'pending' ? [{turnId, ...structuredClone(row)}] : [])
+    return Object.entries(this.board.acceptances ?? {}).flatMap(([turnId, row]) => row.state === 'pending' &&
+      !this.deletedReason(row.workspaceId, row.sessionId, row.orderId) ? [{turnId, ...structuredClone(row)}] : [])
   }
   unpostedAcceptances() {
     this.current()
-    return Object.entries(this.board.acceptances ?? {}).flatMap(([turnId, row]) => row.note && !row.posted ? [{turnId, ...structuredClone(row)}] : [])
+    return Object.entries(this.board.acceptances ?? {}).flatMap(([turnId, row]) => row.note && !row.posted &&
+      !this.deletedReason(row.workspaceId, row.sessionId, row.orderId) ? [{turnId, ...structuredClone(row)}] : [])
   }
   acceptance(turnId: string): AcceptanceRecord | undefined {
     this.current()
@@ -1158,6 +1305,7 @@ export class WorkspaceV2Store {
     if (this.board.acceptances?.[turnId]?.state !== 'pending') return {}
     return this.commit(board => {
       const record = board.acceptances![turnId]!
+      if (deletedReason(board, record.workspaceId, record.sessionId, record.orderId)) { record.state = 'skipped'; return {} }
       const order = findDelegation(board, record.workspaceId, record.orderId)
       const at = now()
       // A later turn's result was reviewed first: the order keeps showing that newer verdict, and this one is only recorded.
@@ -1228,7 +1376,8 @@ export class WorkspaceV2Store {
   /** Orders whose results are still short after the liaison's follow-up: 「等你决定」. */
   awaitingAcceptance() {
     this.current()
-    return this.board.delegations.filter(row => row.acceptance?.awaitingOwner && !orderEnded(row))
+    return this.board.delegations.filter(row => row.acceptance?.awaitingOwner && !orderEnded(row) &&
+      !this.deletedReason(row.workspaceId, row.sessionId, row.id))
   }
 
   /** Owner words about the order itself, by their request (409 when the request id was used for other words). */
@@ -1257,6 +1406,7 @@ export class WorkspaceV2Store {
       const scheduled = !!board.followups?.[job.id]?.schedule?.enabled
       const complete = judged === 'complete' && !scheduled
       const command: OwnerCommand = {workspaceId: session.workspaceId, sessionId: session.id, orderId, generation: job.generation, text, hash: mutation.hash,
+        ...session.traceId && {traceId: session.traceId},
         at: at.toISOString(), judged, ...(reason && {reason}), ...(scheduled && {scheduled: true as const}), outcome: complete ? 'completed' : 'held',
         ...inputAttachments?.length && {inputAttachments: structuredClone(inputAttachments)}}
       ;(board.commands ??= {})[mutation.id] = command
@@ -1282,12 +1432,16 @@ export class WorkspaceV2Store {
   unforwardedCommands() {
     this.current()
     return Object.entries(this.board.commands ?? {}).flatMap(([requestId, row]) =>
-      row.resolved?.kind === 'forward' && !choiceTaken(this.board, requestId, row) ? [{requestId, ...structuredClone(row)}] : [])
+      row.resolved?.kind === 'forward' && !choiceTaken(this.board, requestId, row) &&
+      (row.traceId ?? INITIAL_WORKSPACE_TRACE) === (this.board.dialogueTraces?.[row.sessionId]?.active ?? INITIAL_WORKSPACE_TRACE) &&
+      !this.deletedReason(row.workspaceId, row.sessionId, row.orderId) ? [{requestId, ...structuredClone(row)}] : [])
   }
   /** Commands whose words or note are not in the conversation yet (posted again after a restart). */
   unpostedCommands() {
     this.current()
-    return Object.entries(this.board.commands ?? {}).flatMap(([requestId, row]) => !row.ownerMessageId || !row.noteMessageId ? [{requestId, ...structuredClone(row)}] : [])
+    return Object.entries(this.board.commands ?? {}).flatMap(([requestId, row]) => (!row.ownerMessageId || !row.noteMessageId) &&
+      (row.traceId ?? INITIAL_WORKSPACE_TRACE) === (this.board.dialogueTraces?.[row.sessionId]?.active ?? INITIAL_WORKSPACE_TRACE) &&
+      !this.deletedReason(row.workspaceId, row.sessionId, row.orderId) ? [{requestId, ...structuredClone(row)}] : [])
   }
   /** Held owner words of a session, by their message id (or their request id). */
   heldCommand(workspaceId: string, sessionId: string, id: string): {requestId: string; command: OwnerCommand} {
@@ -1308,6 +1462,7 @@ export class WorkspaceV2Store {
       const session = findSession(board, workspaceId, sessionId)
       const row = board.commands?.[requestId]
       if (!row || row.workspaceId !== workspaceId || row.sessionId !== sessionId) return workspaceError(404, '这场会话里没有待你选择的这句话')
+      if ((row.traceId ?? INITIAL_WORKSPACE_TRACE) !== (board.dialogueTraces?.[sessionId]?.active ?? INITIAL_WORKSPACE_TRACE)) return workspaceError(409, '这项选择来自编辑前的对话')
       if (row.outcome !== 'held') return workspaceError(409, '这句话已按你的话收单，没有可交给执行者的选择')
       if (choiceTaken(board, requestId, row)) return workspaceError(409, row.resolved!.kind === 'forward' ? '这句话已经交给执行者' : '你已为这句话选择收单')
       const order = findDelegation(board, workspaceId, row.orderId)
@@ -1323,7 +1478,8 @@ export class WorkspaceV2Store {
   /** The order's enabled recurring schedule while the order can run (not finished, cancelled or paused). */
   activeSchedule(order: Pick<V2Delegation, 'id' | 'status' | 'paused'>) {
     this.current()
-    if (orderEnded(order) || order.paused) return
+    const stored = this.board.delegations.find(row => row.id === order.id)
+    if (orderEnded(order) || order.paused || stored && this.deletedReason(stored.workspaceId, stored.sessionId, stored.id)) return
     const schedule = this.board.followups?.[order.id]?.schedule
     return schedule?.enabled ? structuredClone(schedule) : undefined
   }
@@ -1338,7 +1494,13 @@ export class WorkspaceV2Store {
   present(order: V2Delegation, timeZone: string, now = new Date()): V2Delegation {
     const {nextCheckAt: _stored, hasSchedule: _flag, conversationId: _conversation, ...shown} = order
     const next = this.nextCheck(order, timeZone, now)
-    return {...shown, ...(next && {nextCheckAt: next}), ...(this.hasSchedule(order) && {hasSchedule: true as const})}
+    const sessionDeletedAt = this.reference(order.workspaceId, 'session', order.sessionId)?.deletedAt
+    const deletedHistorySessions = (order.historySessionIds ?? []).flatMap(id => {
+      const reference = this.reference(order.workspaceId, 'session', id)
+      return reference?.deletedAt ? [{id, title: reference.title, deletedAt: reference.deletedAt}] : []
+    })
+    return {...shown, ...(next && {nextCheckAt: next}), ...(this.hasSchedule(order) && {hasSchedule: true as const}),
+      ...(sessionDeletedAt && {sessionDeletedAt}), ...(deletedHistorySessions.length && {deletedHistorySessions})}
   }
   /** Remember which liaison conversation opened an order, so the owner's next words there ("先别改") can refer to it. */
   markConversation(workspaceId: string, orderId: string, conversationId: string) {
@@ -1350,7 +1512,8 @@ export class WorkspaceV2Store {
   /** The orders this liaison conversation opened most recently (newest first), kept only while they can still take words. */
   recentConversationOrders(conversationId: string, limit = 3): V2Delegation[] {
     this.current()
-    return this.board.delegations.filter(order => order.conversationId === conversationId)
+    return this.board.delegations.filter(order => order.conversationId === conversationId &&
+      !this.deletedReason(order.workspaceId, order.sessionId, order.id))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit)
       .filter(order => !orderEnded(order) && !order.paused)
   }
@@ -1367,7 +1530,7 @@ export class WorkspaceV2Store {
   conversationChoices(session: V2Session): {held: Record<string, V2Held>; actions: Record<string, V2MessageAction[]>} {
     this.current()
     const held: Record<string, V2Held> = {}, actions: Record<string, V2MessageAction[]> = {}
-    const orderOf = (row: {workspaceId: string; orderId: string}) => this.board.delegations.find(order => order.id === row.orderId && order.workspaceId === row.workspaceId)
+    const orderOf = (row: {workspaceId: string; orderId: string}) => orderRecord(this.board, row.workspaceId, row.orderId)
     // The same rule as the order page's 「标为完成」: an enabled schedule, paused or not, is stopped with the order.
     const completeAction = (order: V2Delegation): V2MessageAction => !orderEnded(order) && this.hasSchedule(order)
       ? {kind: 'complete', label: ACTION_LABEL.completeSchedule, stopSchedule: true} : {kind: 'complete', label: ACTION_LABEL.complete}
@@ -1377,9 +1540,10 @@ export class WorkspaceV2Store {
       const resolved = choiceTaken(this.board, requestId, row) ? row.resolved : undefined
       const done = resolved && {done: {at: resolved.at}}
       if (row.ownerMessageId && resolved?.kind !== 'forward') {
-        held[row.ownerMessageId] = row.outcome === 'completed' || resolved?.kind === 'complete' ? 'completed' : orderEnded(order) ? 'kept' : 'choosing'
+        held[row.ownerMessageId] = row.outcome === 'completed' || resolved?.kind === 'complete' ? 'completed' : order.deletedAt || orderEnded(order) ? 'kept' : 'choosing'
       }
       if (!row.noteMessageId) continue
+      if (order.deletedAt && !done) continue
       if (row.outcome === 'completed') {
         // Undo stays offered while this completion stands; reopened (or completed again) elsewhere, the note has no button.
         if (resolved || order.status === 'done' && order.completedFrom === requestId) actions[row.noteMessageId] = [{kind: 'reopen', label: ACTION_LABEL.reopen, ...done}]
@@ -1389,7 +1553,7 @@ export class WorkspaceV2Store {
     }
     for (const row of Object.values(this.board.acceptances ?? {})) {
       const order = orderOf(row)
-      if (row.sessionId !== session.id || row.workspaceId !== session.workspaceId || !row.pass || !row.messageId || !order) continue
+      if (row.sessionId !== session.id || row.workspaceId !== session.workspaceId || !row.pass || !row.messageId || !order || order.deletedAt && !row.completedAt) continue
       actions[row.messageId] = [{...completeAction(order), ...(row.completedAt && {done: {at: row.completedAt}})}]
     }
     return {held, actions}
@@ -1429,7 +1593,7 @@ export class WorkspaceV2Store {
       const workspace = board.workspaces.find(row => row.id === workspaceId) ?? workspaceError(404, '找不到这个工作区')
       if (workspace.id === board.personalWorkspaceId) return workspaceError(409, PERSONAL_NOT_ARCHIVABLE)
       if (workspaceArchived(workspace)) return { workspace }
-      const open = board.delegations.filter(order => order.workspaceId === workspaceId && !orderEnded(order))
+      const open = board.delegations.filter(order => order.workspaceId === workspaceId && !order.deletedAt && !orderEnded(order))
       if (open.length) {
         const titles = open.slice(0, 5).map(order => '「' + order.title + '」').join('、') + (open.length > 5 ? '等' : '')
         return workspaceError(409, '还有 ' + open.length + ' 张工单未结束：' + titles + '。请先完成或取消再归档')
@@ -1466,8 +1630,91 @@ export class WorkspaceV2Store {
     if (workspace.projectDirectory) return {source: 'workspace', path: workspace.projectDirectory}
   }
 
-  delegation(workspace: string, id: string) { return findDelegation(this.board, workspace, id) }
-  session(workspace: string, id: string) { return findSession(this.board, workspace, id) }
+  delegation(workspace: string, id: string) { this.current(); return findDelegation(this.board, workspace, id) }
+  session(workspace: string, id: string) {
+    this.current()
+    const session = findSession(this.board, workspace, id)
+    const delegationIds = session.delegationIds.filter(orderId => !orderRecord(this.board, workspace, orderId)?.deletedAt)
+    return delegationIds.length === session.delegationIds.length ? session : {...session, delegationIds}
+  }
+
+  /** Resolve one already-authorized historical reference without requiring a live target. */
+  reference(workspaceId: string, target: WorkspaceTarget, id: string) {
+    this.current()
+    const row = target === 'session' ? sessionRecord(this.board, workspaceId, id) : orderRecord(this.board, workspaceId, id)
+    return row && {title: row.title, ...(row.deletedAt && {deletedAt: row.deletedAt}), ...'status' in row && {status: row.status, sessionId: row.sessionId}}
+  }
+
+  /** A stored result can read its own version even after the linked conversation or order is deleted. */
+  resultSource(notice: StoredResult) {
+    this.current()
+    const order = orderRecord(this.board, notice.workspaceId, notice.orderId)
+    const session = sessionRecord(this.board, notice.workspaceId, notice.sessionId)
+    if (order && session && order.sessionId === session.id) return {order, session}
+  }
+
+  /** Published deliverables keep their original order and session even after removal from navigation. */
+  outputSources(workspaceId: string, orderId?: string) {
+    this.workspace(workspaceId)
+    const selected = this.board.delegations.filter(order => order.workspaceId === workspaceId && (!orderId || order.id === orderId) && !this.isRetiredOrder(order.id))
+    return [...new Set(selected.map(order => order.sessionId))].flatMap(sessionId => {
+      const session = sessionRecord(this.board, workspaceId, sessionId)
+      if (!session) return []
+      const orders = selected.filter(order => order.sessionId === sessionId).map(({id, title, deletedAt}) => ({id, title, ...deletedAt && {deletedAt}}))
+      return [{session, orders}]
+    })
+  }
+
+  deletedReason(workspaceId: string, sessionId: string, orderId?: string) {
+    this.current()
+    return deletedReason(this.board, workspaceId, sessionId, orderId)
+  }
+
+  messageReferences<T extends V2Message>(session: V2Session, messages: T[]): T[] {
+    this.current()
+    return messages.map(message => {
+      const orderId = messageWorkOrder(session, message)
+      const reference = orderId && this.reference(session.workspaceId, 'order', orderId)
+      return reference && reference.deletedAt ? {...message, workOrderId: orderId, workOrderDeletedAt: reference.deletedAt} : message
+    })
+  }
+
+  deleteTarget(mutation: Mutation, workspaceId: string, target: WorkspaceTarget, id: string, at = new Date()): Deletion {
+    return this.write(mutation, board => {
+      writable(board, workspaceId)
+      const row = target === 'order'
+        ? orderRecord(board, workspaceId, id) ?? workspaceError(404, '这个工作区没有这张工单')
+        : sessionRecord(board, workspaceId, id) ?? workspaceError(404, '这个工作区没有这场会话')
+      if (row.deletedAt) return {id, deletedAt: row.deletedAt}
+      row.deletedAt = at.toISOString()
+      const matches = (record: {workspaceId: string; sessionId: string}, orderId?: string) => record.workspaceId === workspaceId &&
+        (target === 'session' ? record.sessionId === id : orderId === id)
+      for (const receipt of Object.values(board.receipts)) {
+        // Session IDs are allocated once for the whole brain. These receipts have no workspace field.
+        if (receipt.kind !== 'interject' || receipt.state !== 'steering' && receipt.state !== 'queued') continue
+        if (target === 'session' ? receipt.sessionId !== id : receipt.workOrderId !== id) continue
+        receipt.state = 'stopped'
+        receipt.reason = target === 'session' ? SESSION_DELETED : ORDER_DELETED
+      }
+      for (const order of board.delegations) {
+        if (!matches(order, order.id) || order !== row && order.deletedAt) continue
+        advance(board, order)
+        if (order.acceptance?.awaitingOwner) delete order.acceptance.awaitingOwner
+        if (target === 'session' && !orderEnded(order)) {
+          order.status = 'waiting'
+          order.reason = '所属会话已删除'
+        }
+      }
+      if (board.starts) board.starts = board.starts.filter(start => {
+        if (!matches(start, start.delegationId)) return true
+        dropStart(board, start)
+        return false
+      })
+      if (board.groupStarts) board.groupStarts = board.groupStarts.filter(start => !matches(start, start.orderId))
+      return {id, deletedAt: row.deletedAt}
+    })
+  }
+
   view(id: string): V2WorkspaceView {
     const workspace = this.workspace(id)
     const latest = new Map<string, string>()
@@ -1475,10 +1722,15 @@ export class WorkspaceV2Store {
       if (r.kind === 'turn' && r.state !== 'unsent' && r.at > (latest.get(r.sessionId) ?? '')) latest.set(r.sessionId, r.at)
     }
     const activity = (s: V2Session) => latest.get(s.id) ?? s.createdAt
-    const orders = this.board.delegations.filter(d => d.workspaceId === id)
+    const orders = this.board.delegations.filter(d => d.workspaceId === id && !d.deletedAt).map(order => {
+      const sessionDeletedAt = sessionRecord(this.board, id, order.sessionId)?.deletedAt
+      return sessionDeletedAt ? {...order, sessionDeletedAt} : order
+    })
+    const activeOrders = new Set(orders.map(order => order.id))
     return {
       scope: this.scope, workspace,
-      sessions: this.board.sessions.filter(s => s.workspaceId === id).sort((a, b) => activity(b).localeCompare(activity(a))),
+      sessions: this.board.sessions.filter(s => s.workspaceId === id && !s.deletedAt).sort((a, b) => activity(b).localeCompare(activity(a)))
+        .map(session => ({...session, delegationIds: session.delegationIds.filter(orderId => activeOrders.has(orderId))})),
       orders, delegations: orders,
       decisions: this.board.decisions.filter(d => d.workspaceId === id),
     }
@@ -1646,7 +1898,8 @@ export class WorkspaceV2Store {
   /** Roster groups' liaison work whose line is not in the group yet. */
   pendingGroupStarts(sessionId?: string): GroupStart[] {
     this.current()
-    return structuredClone((this.board.groupStarts ?? []).filter(row => !sessionId || row.sessionId === sessionId))
+    return structuredClone((this.board.groupStarts ?? []).filter(row => (!sessionId || row.sessionId === sessionId) &&
+      !this.deletedReason(row.workspaceId, row.sessionId, row.orderId)))
   }
   /** The group line of this liaison work is posted. */
   groupStartPosted(requestId: string) {
@@ -1694,9 +1947,12 @@ export class WorkspaceV2Store {
    * finds the same line instead of saying it twice. Checked like a turn: the session is open, the order can take words.
    */
   recordGroupSay(mutation: Mutation, session: V2Session, workOrderId?: string) {
+    const traceId = this.assertActiveTrace(session, session.traceId)
+    if (workOrderId) this.delegation(session.workspaceId, workOrderId)
     const saved = this.receipt(mutation)
     if (saved) {
       if (saved.kind !== 'group-say' || saved.sessionId !== session.id) return workspaceError(409, '这条请求已用于另一项操作，请重新确认')
+      if ((saved.traceId ?? INITIAL_WORKSPACE_TRACE) !== traceId) return workspaceError(409, '这条发言已保存在原对话版本')
       return
     }
     this.commit(board => {
@@ -1707,7 +1963,7 @@ export class WorkspaceV2Store {
         if (order.sessionId !== session.id) return workspaceError(409, '这张工单属于另一场会话')
         if (orderEnded(order) || order.paused) return workspaceError(409, stoppedReason(order))
       }
-      board.receipts[mutation.key] = {kind: 'group-say', hash: mutation.hash, sessionId: session.id, at: now()}
+      board.receipts[mutation.key] = {kind: 'group-say', hash: mutation.hash, sessionId: session.id, at: now(), traceId}
     })
   }
 
@@ -1717,7 +1973,9 @@ export class WorkspaceV2Store {
    */
   chargeGroupCall(workspaceId: string, sessionId: string, orderId: string): string | undefined {
     this.current()
-    const order = this.board.delegations.find(row => row.id === orderId && row.workspaceId === workspaceId)
+    const refusal = this.deletedReason(workspaceId, sessionId, orderId)
+    if (refusal) return refusal
+    const order = orderRecord(this.board, workspaceId, orderId)
     if (!order || order.sessionId !== sessionId) return '这张工单不属于本群'
     if (this.board.workspaces.some(row => row.id === workspaceId && workspaceArchived(row))) return WORKSPACE_ARCHIVED
     if (orderEnded(order) || order.paused) return stoppedReason(order)
@@ -1732,7 +1990,9 @@ export class WorkspaceV2Store {
   /** Orders of a roster group that were working and now have no member call: waiting for the next follow-up. */
   settleGroupOrders(workspaceId: string, sessionId: string, busy: ReadonlySet<string>) {
     this.current()
-    const idle = this.board.delegations.filter(row => row.workspaceId === workspaceId && row.sessionId === sessionId && row.status === 'active' && !busy.has(row.id))
+    if (this.deletedReason(workspaceId, sessionId)) return
+    const idle = this.board.delegations.filter(row => row.workspaceId === workspaceId && row.sessionId === sessionId &&
+      !row.deletedAt && row.status === 'active' && !busy.has(row.id))
     if (!idle.length) return
     this.commit(board => {
       for (const row of idle) {
@@ -1745,7 +2005,7 @@ export class WorkspaceV2Store {
   /** Roster groups (to start their engines). */
   rosterSessions() {
     this.current()
-    return this.board.sessions.filter(isRosterGroup)
+    return this.board.sessions.filter(session => !session.deletedAt && isRosterGroup(session))
   }
 
   /** The last line of a roster group whose results were published (undefined: never). */
@@ -1763,9 +2023,11 @@ export class WorkspaceV2Store {
   publishGroupResults(workspaceId: string, sessionId: string, checkedTo: number, notices: StoredResult[],
     acceptance?: {turnId: string; orderId: string; batchId: string; done: string[]; results: number[]}): AcceptanceRecord | undefined {
     this.current()
-    const order = acceptance && this.board.delegations.find(item => item.id === acceptance.orderId && item.workspaceId === workspaceId)
-    const review = !!acceptance && !this.board.acceptances?.[acceptance.turnId] && !!order && order.sessionId === sessionId && !orderEnded(order) && !order.paused
-    const fresh = notices.filter(notice => !this.board.resultNotices?.[notice.id] && !this.board.groupEvidence?.[notice.id])
+    if (this.deletedReason(workspaceId, sessionId)) return
+    const order = acceptance && orderRecord(this.board, workspaceId, acceptance.orderId)
+    const review = !!acceptance && !this.board.acceptances?.[acceptance.turnId] && !!order && !order.deletedAt && order.sessionId === sessionId && !orderEnded(order) && !order.paused
+    const fresh = notices.filter(notice => !this.board.resultNotices?.[notice.id] && !this.board.groupEvidence?.[notice.id] &&
+      !this.deletedReason(notice.workspaceId, notice.sessionId, notice.orderId))
     if (!review && !fresh.length && (this.board.groupResultsChecked?.[sessionId] ?? 0) >= checkedTo) return
     return this.commit(board => {
       const session = findSession(board, workspaceId, sessionId)
@@ -1786,6 +2048,8 @@ export class WorkspaceV2Store {
   }
 
   act(mutation: Mutation, workspaceId: string, id: string, body: Body, at = new Date()) {
+    const current = this.delegation(workspaceId, id)
+    if (body.action !== 'complete' && body.action !== 'cancel' || body.from !== undefined) this.session(workspaceId, current.sessionId)
     return this.write(mutation, board => {
       writable(board, workspaceId)
       const delegation = findDelegation(board, workspaceId, id)
@@ -1937,7 +2201,8 @@ export class WorkspaceV2Store {
   }
 
   target(session: V2Session, requested: unknown): string | undefined {
-    const id = requested === undefined && session.delegationIds.length === 1 ? session.delegationIds[0] : requested
+    const {delegationIds} = this.session(session.workspaceId, session.id)
+    const id = requested === undefined && delegationIds.length === 1 ? delegationIds[0] : requested
     if (id === undefined) return
     if (typeof id !== 'string' || !id) return workspaceError(400, '请选择有效的工单')
     if (this.delegation(session.workspaceId, id).sessionId !== session.id) return workspaceError(409, '这张工单属于另一场会话，请打开它的负责会话')
@@ -1945,6 +2210,7 @@ export class WorkspaceV2Store {
   }
 
   context(session: V2Session, workOrderId?: string) {
+    this.session(session.workspaceId, session.id)
     const workspace = this.workspace(session.workspaceId)
     const delegations = workOrderId ? [this.delegation(workspace.id,workOrderId)] : []
     const decisions = this.board.decisions.filter(d => d.workspaceId === workspace.id && d.delegationId === workOrderId)
@@ -1954,7 +2220,8 @@ export class WorkspaceV2Store {
 
   pendingStarts(sessionId?: string) {
     this.current()
-    return structuredClone((this.board.starts ?? []).filter(row => !sessionId || row.sessionId === sessionId))
+    return structuredClone((this.board.starts ?? []).filter(row => (!sessionId || row.sessionId === sessionId) &&
+      !this.deletedReason(row.workspaceId, row.sessionId, row.delegationId)))
   }
 
   /** Accept the owner's supplement before the native conversation is free. Reservation consumes the row. */
@@ -2091,8 +2358,10 @@ export class WorkspaceV2Store {
   }
 
   reserve(mutation: Mutation, session: V2Session, workOrderId?: string, startGeneration?: number, staffToken?:string, review = false) {
+    this.assertActiveTrace(session, session.traceId)
     this.commit(board => {
       writable(board, session.workspaceId)
+      const storedSession = findSession(board, session.workspaceId, session.id)
       const priorTurn = board.receipts[mutation.key]
       if (priorTurn?.kind === 'turn' && priorTurn.staffToken && priorTurn.staffToken !== staffToken) {
         return workspaceError(409,'原发言所用的幕僚资料已变更，请提出新的要求')
@@ -2109,7 +2378,7 @@ export class WorkspaceV2Store {
         const job = workOrderId ? findDelegation(board, session.workspaceId, workOrderId) : undefined
         if ((!initial && !retry) || job && job.generation !== startGeneration) return workspaceError(409, '这项交办已有新的指示，请按当前工单继续')
       }
-      if (session.closed && startGeneration === undefined) return workspaceError(409, '这场会话已关闭，重新打开原会话即可继续补充')
+      if (storedSession.closed && startGeneration === undefined) return workspaceError(409, '这场会话已关闭，重新打开原会话即可继续补充')
       const reserved: Turn['reserved'] = []
       if (workOrderId) {
         const d = findDelegation(board, session.workspaceId, workOrderId)
@@ -2122,6 +2391,7 @@ export class WorkspaceV2Store {
         reserved.push({id:d.id, generation:d.generation})
       }
       board.receipts[mutation.key] = { kind: 'turn', state: 'pending', hash: mutation.hash, sessionId: session.id, reserved, at: now(), ...(staffToken && {staffToken}),
+        ...session.traceId && {traceId: session.traceId},
         ...(review && reserved.length === 1 && {review: true as const}) }
       if (start) board.starts = board.starts!.filter(row => row !== start)
     })
@@ -2133,7 +2403,9 @@ export class WorkspaceV2Store {
     const pending = Object.values(board.receipts).filter(r => r.kind === 'turn' && r.state === 'pending')
     for (const hold of receipt.reserved) {
       const delegation = board.delegations.find(d => d.id === hold.id)!
+      if (deletedReason(board, delegation.workspaceId, receipt.sessionId, delegation.id)) continue
       if (state === 'unsent') delegation.remainingTurns++
+      if ((receipt.traceId ?? INITIAL_WORKSPACE_TRACE) !== (board.dialogueTraces?.[receipt.sessionId]?.active ?? INITIAL_WORKSPACE_TRACE)) continue
       if (delegation.sessionId !== receipt.sessionId || delegation.generation !== hold.generation ||
         pending.some(r => r.kind === 'turn' && r.reserved.some(p => p.id === hold.id && p.generation === hold.generation))) continue
       delegation.status = 'waiting'
@@ -2155,8 +2427,8 @@ export class WorkspaceV2Store {
     this.current()
     return Object.entries(this.board.receipts).flatMap(([key, r]) => {
       if (r.kind !== 'turn' || !r.interrupted) return []
-      const orders = r.reserved.flatMap(hold => this.board.delegations.filter(d => d.id === hold.id && d.generation === hold.generation && d.sessionId === r.sessionId))
-      const session = this.board.sessions.find(row => row.id === r.sessionId)
+      const orders = r.reserved.flatMap(hold => this.board.delegations.filter(d => !d.deletedAt && d.id === hold.id && d.generation === hold.generation && d.sessionId === r.sessionId))
+      const session = this.board.sessions.find(row => row.id === r.sessionId && !row.deletedAt)
       // A session no longer on the board has nobody to remind; the mark is still returned so it gets cleared.
       return [{turnId: key.slice('req-'.length), sessionId: r.sessionId, workspaceId: session?.workspaceId ?? '', at: r.interrupted,
         orderIds: session ? orders.map(order => order.id) : []}]
@@ -2168,9 +2440,14 @@ export class WorkspaceV2Store {
     this.commit(board => { for (const key of keys) delete (board.receipts[key] as Turn).interrupted })
   }
 
-  unknownTurns(sessionId: string) {
+  unknownTurns(sessionId: string, traceId?: string) {
+    this.current()
+    const session = this.board.sessions.find(row => row.id === sessionId && !row.deletedAt)
+    if (!session) return []
     return Object.entries(this.board.receipts)
-      .filter(([, r]) => r.kind === 'turn' && r.sessionId === sessionId && r.state === 'unknown')
+      .filter(([, r]) => r.kind === 'turn' && r.sessionId === sessionId && r.state === 'unknown' &&
+        (!traceId || (r.traceId ?? INITIAL_WORKSPACE_TRACE) === traceId) &&
+        !r.reserved.some(hold => this.deletedReason(session.workspaceId, sessionId, hold.id)))
       .map(([key]) => key.slice('req-'.length))
   }
 
@@ -2183,8 +2460,8 @@ export class WorkspaceV2Store {
       turn.state = 'sent'
       if (turn.reserved.length === 1) turn.resultCheck = 'pending'
       for (const hold of turn.reserved) {
-        const job = findDelegation(board, session.workspaceId, hold.id)
-        if (job.sessionId !== session.id || job.generation !== hold.generation || job.reason !== UNKNOWN_TURN || job.status !== 'waiting') continue
+        const job = orderRecord(board, session.workspaceId, hold.id)
+        if (!job || deletedReason(board, session.workspaceId, session.id, job.id) || job.sessionId !== session.id || job.generation !== hold.generation || job.reason !== UNKNOWN_TURN || job.status !== 'waiting') continue
         const unresolved = Object.values(board.receipts).some(r => r.kind === 'turn' && r.state === 'unknown'
           && r.reserved.some(h => h.id === job.id && h.generation === job.generation))
         if (!unresolved) job.reason = job.remainingTurns ? '本轮对话已返回，等待下一次跟进' : BUDGET_USED

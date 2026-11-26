@@ -62,7 +62,7 @@ function fixture() {
     restart()
   }
   return {makeOrder,call,publish,collect,restart,downgrade,at,file,source,evidence,
-    see:()=>routes.notices.list(0),service:()=>routes.followup,clock,scope}
+    see:()=>routes.notices.list(0),record:(id:string)=>store.resultNotice(id),service:()=>routes.followup,clock,scope}
 }
 
 describe('SuperHub 工作区站内交付回执',()=>{
@@ -95,6 +95,37 @@ describe('SuperHub 工作区站内交付回执',()=>{
     expect((await f.call(base+'/attachments/'+doc.id)).status).toBe(404)
     expect((await f.call<{text:string}>(base)).data.text).toContain('未完成项')
     expect((await f.call<{order:{status:string}}>('workspaces/'+job.workspaceId+'/orders/'+job.id)).data.order.status).toBe('waiting')
+  })
+
+  it('marks each deleted link on read and keeps the original delivery and version readable', async () => {
+    const f = fixture(), job = f.makeOrder('删工单项目'), other = f.makeOrder('保留项目'), file = f.file('archived')
+    const readResult = (id: string, orderId: string): SavedOrderResults => ({attachments:[file],messages:[{
+      id,role:'agent',author:'执行者',at:f.at(),workOrderId:orderId,text:'工单回报\n交付留存',attachments:[{id:file.id,label:file.label}],
+    }]})
+    expect((await f.publish(job,'delete-a',readResult('source-a',job.id))).status).toBe(200)
+    expect((await f.publish(other,'keep-b',readResult('source-b',other.id))).status).toBe(200)
+    const old = f.see().items.find(row => row.orderId === job.id)!
+    const original = structuredClone(f.record(old.id))
+    const order = await f.call<{deletedAt:string}>('workspaces/' + job.workspaceId + '/orders/' + job.id + '/delete',{requestId:'delete-order'})
+    expect(order.status).toBe(200)
+    expect(f.see().items.find(row => row.id === old.id)).toMatchObject({orderDeletedAt:order.data.deletedAt,read:false})
+    expect(f.see().items.find(row => row.id === old.id)).not.toHaveProperty('sessionDeletedAt')
+    const session = await f.call<{deletedAt:string}>('workspaces/' + job.workspaceId + '/sessions/' + job.sessionId + '/delete',{requestId:'delete-session'})
+    expect(session.status).toBe(200)
+    const path = 'notices/' + old.id
+    const detail = await f.call<{notice:OrderResultNotice;text:string}>(path)
+    expect(detail.data).toMatchObject({notice:{orderDeletedAt:order.data.deletedAt,sessionDeletedAt:session.data.deletedAt},text:'交付留存'})
+    expect(f.record(old.id)).toEqual(original)
+    expect((await f.call<{notice:OrderResultNotice}>(path + '/read',{requestId:'read-deleted'})).data.notice.read).toBe(true)
+    expect((await f.call<{attachment:V2Attachment}>(path + '/attachments/' + file.id)).data.attachment).toEqual({...file,version:old.attachments[0]!.version})
+    f.restart()
+    f.collect()
+    const current = f.see()
+    expect(current).toMatchObject({total:2,unread:1})
+    const active = current.items.find(row => row.orderId === other.id)!
+    expect(active).not.toHaveProperty('orderDeletedAt')
+    expect(active).not.toHaveProperty('sessionDeletedAt')
+    expect(active.read).toBe(false)
   })
 
   it('reconstructs a recent delivery from the prior release with no re-execution, selects no old or unverified work and deduplicates on another boot',async()=>{

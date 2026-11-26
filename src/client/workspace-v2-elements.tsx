@@ -1,5 +1,5 @@
 import { createContext, useContext, useLayoutEffect, useRef, type ReactNode, type RefObject } from 'react'
-import type { V2Delegation, V2Session } from '../core/workspace-v2.ts'
+import { orderEnded, type V2Delegation, type V2Session } from '../core/workspace-v2.ts'
 
 const glyphs = {
   file: <><path d="M5 3h9l5 5v13H5z"/><path d="M14 3v6h5M8 13h8m-8 4h5"/></>,
@@ -31,7 +31,8 @@ export const ARCHIVED_NOTE = '工作区已归档，恢复后可继续。'
 export const executorName = { codex: 'Codex', 'claude-code': 'Claude Code', dsh: 'DSH' }
 export const sessionKind = (session: V2Session) => session.kind === 'group' ? '群聊' : '编程会话 · ' + executorName[session.executor]
 const stageName = { accepted: '已接手', active: '执行中', waiting: '等待', closed: '已关闭', done: '已完成' }
-export const delegationState = (job: V2Delegation) => job.paused && job.status !== 'done' ? '已暂停' : stageName[job.status]
+export const delegationState = (job: V2Delegation) => job.sessionDeletedAt && !orderEnded(job) ? '执行已停止'
+  : job.paused && job.status !== 'done' ? '已暂停' : stageName[job.status]
 export const readableTime = (iso: string) => new Date(iso).toLocaleString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
 
 export function Issue({ text, retry }: { text?: string; retry?: () => void }) {

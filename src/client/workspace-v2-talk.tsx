@@ -1,8 +1,8 @@
-import { useCallback, useContext, useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useContext, useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { messageWorkOrder, orderEnded, type V2Attachment, type V2AttachmentRef, type V2Delegation, type V2Delivery, type V2Held, type V2Message, type V2Session, type V2WorkspaceView } from '../core/workspace-v2.ts'
 import { Markdown } from './markdown.tsx'
 import type { Scoped } from './superhub-api.ts'
-import { segment, useV2PagedRead, useV2Read, useV2Write, V2Client } from './workspace-v2-api.ts'
+import { resourceQuery, segment, useV2PagedRead, useV2Read, useV2Write, V2Client } from './workspace-v2-api.ts'
 import { NewerEdge, OlderEdge, historyEdgeStyle } from './history-edge.tsx'
 import { MESSAGE_ROW, scrollParent, useEdgeSentinel, usePrependAnchor } from './scroll-anchor.ts'
 import { ARCHIVED_NOTE, executorName, Issue, readableTime, sessionKind, useArchived, V2Dialog, V2Icon } from './workspace-v2-elements.tsx'
@@ -13,15 +13,17 @@ import { GroupDeliveries, GroupRoster, GroupStatus, MemberBadges, MentionMenu, m
 import { ChatComposer, MessageInputAttachments, useChatAttachments } from './chat-attachments.tsx'
 import { OwnerActionReply, OwnerActions } from './workspace-owner-actions.tsx'
 import type { OwnerAction } from '../core/workspace-engagement.ts'
+import { DeleteWorkspaceTarget, MessageEditor, type MessageEdit } from './workspace-conversation-actions.tsx'
+import { attachmentResource } from './workspace-output-source.ts'
 
 interface BoardProps {
-  base: string; view: V2WorkspaceView; selected?: string; origin?: string; sourceMessage?: string
+  base: string; view: V2WorkspaceView; selected?: string; origin?: string; sourceMessage?: string; trace?: string
   open: (id: string) => void; back: () => void; openDelegation: (id: string) => void; create: () => void; changed: () => Promise<void>
   target: (sessionId: string, orderId?: string) => void; newOrder: (sessionId: string) => void
   visible: (sessionId?: string) => void
 }
 
-export function ConversationBoard({ base, view, selected, origin, sourceMessage, open, back, openDelegation, target, newOrder, visible, create, changed }: BoardProps) {
+export function ConversationBoard({ base, view, selected, origin, sourceMessage, trace, open, back, openDelegation, target, newOrder, visible, create, changed }: BoardProps) {
   const board = useRef<HTMLDivElement>(null)
   const [compact, setCompact] = useState(true)
   const [defaultId, setDefaultId] = useState(view.sessions[0]?.id)
@@ -51,11 +53,22 @@ export function ConversationBoard({ base, view, selected, origin, sourceMessage,
           <span><strong>{s.title}</strong><small>{sessionKind(s)}{s.closed && ' · 已关闭'}</small></span>
         </button>) : <p className="v2-quiet">这个工作区还没有会话。</p>}
     </nav>
-    {session ? <Transcript key={session.id + '/' + (origin ?? (session.delegationIds.length === 1 ? session.delegationIds[0] : ''))} base={base} session={session} view={view} origin={origin} compact={compact} back={back}
-      target={target} newOrder={newOrder} openDelegation={openDelegation} changed={changed} sourceMessage={sourceMessage}/>
-      : selected ? <div className="v2-empty">这场会话已不可用。 <button className="v2-link" onClick={back}>返回会话列表</button></div>
+    {session ? <Transcript key={JSON.stringify([session.id, origin ?? (session.delegationIds.length === 1 ? session.delegationIds[0] : ''), trace, sourceMessage])}
+      base={base} session={session} view={view} origin={origin} compact={compact} back={back} trace={trace}
+      target={target} newOrder={newOrder} openDelegation={openDelegation} changed={changed} sourceMessage={sourceMessage}
+      currentTrace={() => target(session.id, view.orders.some(order => order.id === origin && order.sessionId === session.id) ? origin : undefined)}/>
+      : selected ? <MissingSession path={base + '/sessions/' + segment(selected)} back={back}/>
       : !compact && (archived ? <section className="v2-empty"><p>{ARCHIVED_NOTE}</p></section>
         : <section className="v2-empty"><strong>开一场群聊</strong><p>你、接口人和本工作区的幕僚在群里一起干活，写 @名字 叫人。</p></section>)}
+  </div>
+}
+
+function MissingSession({path, back}: {path: string; back: () => void}) {
+  const state = useV2Read(path + '?limit=1', isSessionView)
+  const message = state.status === 410 ? '会话已删除。' : state.status === 404 ? '这场会话已不可用。' : !state.error && '正在读取会话…'
+  return <div className="v2-empty">
+    {message ? <span role="status">{message}</span> : <Issue text={state.error} retry={state.refresh}/>}
+    {' '}<button className="v2-link" onClick={back}>返回会话列表</button>
   </div>
 }
 
@@ -97,26 +110,28 @@ export function MessageChoices({ message, order, base, path, done }: {
 }
 
 export interface TranscriptProps {
-  base: string; session: V2Session; view: V2WorkspaceView; origin?: string; sourceMessage?: string; compact: boolean; back: () => void
+  base: string; session: V2Session; view: V2WorkspaceView; origin?: string; sourceMessage?: string; trace?: string; compact: boolean; back: () => void
+  currentTrace?: () => void
   openDelegation: (id: string) => void; changed: () => Promise<void>
   target: BoardProps['target']; newOrder: BoardProps['newOrder']
   /** Shown inside the work order's own page: the order's details live next to it, not in this conversation. */
   embedded?: boolean
 }
 
-export function Transcript({ base, session, view, origin, sourceMessage, compact, back, openDelegation, target, newOrder, changed, embedded }: TranscriptProps) {
+export function Transcript({ base, session, view, origin, sourceMessage, trace, compact, back, currentTrace, openDelegation, target, newOrder, changed, embedded }: TranscriptProps) {
   const { scope, revoke } = useContext(V2Client)
   const ownerActions = useContext(OwnerActions)
   const path = base + '/sessions/' + segment(session.id)
   // Paged: the newest page first (or the page around a linked message), older pages as the top comes near.
   const following = useRef(!sourceMessage)
-  const paged = useV2PagedRead<SessionView, SessionLine>(path, isSessionView, {
+  const paged = useV2PagedRead<SessionView, SessionLine>(trace ? resourceQuery(path, new URLSearchParams({trace})) : path, isSessionView, {
     interval: 4000, anchor: sourceMessage, following: () => following.current,
     // Portraits come with the speakers of each page; keep those of the pages already shown.
     combine: (previous, next) => ({...next, ...(previous?.portraits || next.portraits) && {portraits: {...previous?.portraits, ...next.portraits}}}),
   })
   const transcript = { error: paged.error, refresh: paged.refresh }
   const result = paged.view?.session.id === session.id && paged.view.session.workspaceId === view.workspace.id ? {...paged.view, messages: paged.messages} : undefined
+  const historical = !!result?.traceId && !!result.activeTraceId && result.traceId !== result.activeTraceId
   const write = useV2Write(), sessionAction = useV2Write(), stopWait = useV2Write(), stopMembers = useV2Write()
   // Archived: the conversation reads as before, but nothing here writes (composer, choices, close, reopen, new order).
   const archived = useArchived()
@@ -124,7 +139,7 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
   const jobs = view.orders.filter(j => j.sessionId === session.id)
   const hadOrigin = origin ? view.orders.find(j => j.id === origin) : undefined
   const job = origin ? jobs.find(j => j.id === origin) : jobs.length === 1 ? jobs[0] : undefined
-  const readOnlySource = !!origin && !job
+  const readOnlySource = historical || !!origin && !job
   const inputTarget = {workspaceId:session.workspaceId, sessionId:session.id}
   const files = useChatAttachments(scope, session.engine === 'roster' ? {...inputTarget, workOrderId:job?.id} : undefined, undefined, revoke)
   const sessionDraft = 'superhub-v2:draft:' + scope + ':' + session.workspaceId + ':' + session.id
@@ -136,7 +151,9 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
   })
   const latestDraft = useRef(draft)
   latestDraft.current = draft
-  const [attachment, setAttachment] = useState<{ message: string; ref: V2AttachmentRef }>()
+  const [attachment, setAttachment] = useState<{ message: string; traceId?: string; ref: V2AttachmentRef }>()
+  const [revision, setRevision] = useState<MessageEdit>()
+  const [savedMessage, setSavedMessage] = useState<{id: string; traceId: string}>()
   const [confirmClose, setConfirmClose] = useState(false)
   const edit = (value: string) => {
     setDraft(value)
@@ -196,11 +213,12 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
     // On opening, the newest message shows (a linked message is centred by its own effect below).
     if (!positioned.current) { positioned.current = true; if (!sourceMessage) showLatest(); return }
     if (following.current && !skip) showLatest()
-  }, [lastId])
-  usePortraitArrivals(history, path + (closed ? '/closed' : '/open'), readOnlySource ? undefined : result?.messages, result?.observedAt)
+  }, [lastId, result?.traceId])
+  usePortraitArrivals(history, JSON.stringify([path, closed, result?.traceId]), readOnlySource ? undefined : result?.messages, result?.observedAt)
   const byId = new Map(messages.map(m => [m.id, m]))
   const requested = sourceMessage ? byId.get(sourceMessage) : undefined
-  const anchoredId = requested && (!origin || job && messageWorkOrder(session, requested) === job.id) ? requested.id : undefined
+  const editAnchor = savedMessage && result?.traceId === savedMessage.traceId && byId.has(savedMessage.id) ? savedMessage.id : undefined
+  const anchoredId = editAnchor ?? (requested && (!origin || messageWorkOrder(session, requested) === origin) ? requested.id : undefined)
   const actionsByMessage = new Map<string, OwnerAction[]>()
   // What still waits for the owner is never hidden by paging: questions and choices anchored to a message outside the
   // loaded pages stand at the end of the conversation until their message is loaded, then only inline.
@@ -246,7 +264,9 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
   const canReopen = closed && !readOnlySource && !archived && (job ? [job] : jobs).some(row =>
     !orderEnded(row) && !row.paused && row.remainingTurns > 0)
   const dayTime = (at: string) => new Date(at).toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' })
-  const anchored = attachment && byId.get(attachment.message)?.attachments?.some(a => a.id === attachment.ref.id)
+  const attachmentMessage = attachment && byId.get(attachment.message)
+  const anchored = attachmentMessage && (attachmentMessage.traceId ?? result?.traceId) === attachment?.traceId
+    && attachmentMessage.attachments?.some(a => a.id === attachment.ref.id && a.version === attachment.ref.version)
   useEffect(() => { if (attachment && !anchored && result) setAttachment(undefined) }, [attachment, anchored, result])
   function focusMessage(id: string) {
     const node = document.getElementById(prefix + id)
@@ -259,6 +279,7 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
     if (paged.hasNewer) void paged.toLatest()
     // The host answers once the words are with the executor (or queued), so the composer is free again right away.
     const receipt = await write.post<Scoped & { session: V2Session }>(path + '/messages', { text: sent, ...(job && { workOrderId:job.id }), wait: false,
+      ...(result.activeTraceId && {expectedTraceId:result.activeTraceId}),
       ...(files.ready.length > 0 && {inputAttachments:files.ready.map(row => row.id)}) })
     // Keep whatever the owner typed while the words were on their way.
     if (receipt?.session.id === session.id) {
@@ -274,6 +295,7 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
     <header><div className="v2-chat-context">
       {compact && !embedded && <button className="v2-link" onClick={back}><V2Icon name="back"/>返回会话列表</button>}
       {hadOrigin && !embedded && <button className="v2-link" onClick={() => openDelegation(hadOrigin.id)}>返回工单</button>}
+      {historical && currentTrace && <button type="button" className="v2-link" onClick={currentTrace}>返回当前对话</button>}
     </div><h2 data-conversation-title tabIndex={-1}>{session.title}</h2>
       <div className="v2-chat-meta">{sessionKind(session)}{group ? ' · 你和 ' + group.members.length + ' 位成员'
         : session.kind === 'group' && session.engine !== 'roster' && authors.length > 0 && ' · ' + authors.join('、')}{closed && ' · 已关闭'}</div>
@@ -281,6 +303,7 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
       {group && <GroupRoster members={group.members} portraits={result?.portraits}/>}</header>
     <div className="v2-chat-history" ref={history}>
       <Issue text={transcript.error} retry={transcript.refresh}/>
+      {historical && <p className="v2-source-status" role="status">编辑前的对话</p>}
       {result?.issue && <div className="v2-source-status" role="status">{result.issue}</div>}
       {result && sourceMessage && !anchoredId && !paged.jumping && <p className="v2-source-status" role="status">{origin ? '这条工单原话当前不可读。' : '这条原话当前不可读。'}</p>}
       {!result && !transcript.error && <p role="status" className="v2-quiet">正在读取会话…</p>}
@@ -291,19 +314,24 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
         const orderId = messageWorkOrder(session, m)
         // A group tags every line said for an order (except on that order's own page, where all of them are).
         const messageOrder = orderId && (group ? !(embedded && jobs.length === 1) : jobs.length > 1) ? jobs.find(row => row.id === orderId) : undefined
+        const orderTag = m.workOrderDeletedAt ? <small className="v2-quiet v2-order-tag">工单已删除</small>
+          : messageOrder && <button className="v2-link v2-order-tag" onClick={() => openDelegation(messageOrder.id)}>{group && <V2Icon name="work"/>}{messageOrder.title}</button>
         const clock = new Date(m.at).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',hour12:false})
         const dateLine = (i === 0 || day !== dayTime(messages[i-1]!.at)) && <div className="v2-date">{day}</div>
         if (m.kind === 'event') return <li key={m.id} id={prefix + m.id} data-message-id={m.id} data-event={m.event} className="v2-group-event" tabIndex={-1}>
           {dateLine}<p><time dateTime={m.at}>{clock}</time><span>{m.text}</span></p>
-          {messageOrder && <button className="v2-link v2-order-tag" onClick={() => openDelegation(messageOrder.id)}><V2Icon name="work"/>{messageOrder.title}</button>}</li>
+          {orderTag}</li>
         const member = m.speakerId ? memberBySpeaker.get(m.speakerId) : undefined
         const progress = m.kind === 'progress'
         return <li key={m.id} id={prefix + m.id} data-message-id={m.id} data-kind={m.kind} className={m.id === anchoredId ? 'v2-source-turn' : undefined} tabIndex={-1}>
           {dateLine}
           <div className={'v2-turn ' + (m.role === 'user' ? 'mine' : '') + (progress ? ' progress' : '')}><ChatAvatar portrait={m.speakerId ? result?.portraits?.[m.speakerId] : undefined}/>
             <div className="v2-message"><div className="v2-byline"><strong>{m.author}</strong>{member && <MemberBadges member={member}/>}
-              {progress && <span className="v2-progress-tag">进行中</span>}<time dateTime={m.at}>{clock}</time></div>
-              {messageOrder && <button className={group ? 'v2-link v2-order-tag' : 'v2-link'} onClick={() => openDelegation(messageOrder.id)}>{group && <V2Icon name="work"/>}{messageOrder.title}</button>}
+              {progress && <span className="v2-progress-tag">进行中</span>}<time dateTime={m.at}>{clock}</time>
+              {m.role === 'user' && m.canEdit && result?.activeTraceId && !closed && !archived && !readOnlySource &&
+                <button type="button" className="v2-link v2-edit-message" disabled={write.busy}
+                  aria-label="编辑历史消息" onClick={() => setRevision({id:m.id, text:m.text, traceId:result.activeTraceId!, attachments:m.inputAttachments})}>编辑</button>}</div>
+              {orderTag}
               <div className="v2-bubble">
                 {quoted ? <button className="v2-quote" onClick={() => focusMessage(quoted.id)}>回复{quoted.author} · {quoted.text}</button>
                   : m.replyTo && (paged.hasOlder ? <button className="v2-quote" onClick={() => locate(m.replyTo!)}>回复更早的一条发言 · 查看</button>
@@ -312,7 +340,7 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
                 <Markdown text={m.text} className="v2-markdown" decorate={group ? mentionDecorator(m.mentions, group.members, result?.portraits) : undefined}/>
                 <MessageInputAttachments scope={scope} target={{...inputTarget, workOrderId:orderId}} attachments={m.inputAttachments}/>
                 {m.quote && <details className="v2-relay-quote"><summary>{m.quote.label}</summary><div className="v2-relay-text">{m.quote.text}</div></details>}
-                {m.attachments?.map(ref => <button key={ref.id} className="v2-link v2-attachment" onClick={() => setAttachment({message:m.id,ref})}><V2Icon name="box"/>{ref.label}</button>)}
+                {m.attachments?.map(ref => <button key={ref.id} className="v2-link v2-attachment" onClick={() => setAttachment({message:m.id,traceId:m.traceId ?? result?.traceId,ref})}><V2Icon name="box"/>{ref.label}</button>)}
               </div>
               {m.delivery && <small className="v2-delivery-note" data-delivery={m.delivery}>{deliveryNote[m.delivery]}</small>}
               {group && <GroupDeliveries deliveries={m.deliveries} members={group.members}/>}
@@ -371,7 +399,7 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
     {session.kind === 'coding' && !readOnlySource && !embedded && <SessionExecution key={session.id} base={base} session={session}/>}
     {/* A group's commands outside any order, per member; their approval cards already stand above the composer. */}
     {group && !readOnlySource && !embedded && <SessionExecution key={session.id} base={base} session={session} members={group.members}/>}
-    {readOnlySource && <p className="v2-quiet">{hadOrigin?.historySessionIds?.includes(session.id) ? '这场历史会话仅供查看。' : '所选工单不属于这场会话。'}</p>}
+    {readOnlySource && !historical && <p className="v2-quiet">{hadOrigin?.historySessionIds?.includes(session.id) ? '这场历史会话仅供查看。' : '所选工单不属于这场会话。'}</p>}
     <footer className="v2-chat-foot">{jobs.filter(j => !embedded || j.id !== job?.id).map(j => <button key={j.id} className="v2-link" onClick={() => openDelegation(j.id)}><V2Icon name="work"/>打开工单「{j.title}」</button>)}
       {!closed && !readOnlySource && !archived && <button className="v2-link" onClick={() => newOrder(session.id)}>新建工单</button>}
       {canReopen && <button className="v2-button" disabled={sessionAction.busy} onClick={async () => {
@@ -379,6 +407,7 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
         await Promise.all([transcript.refresh(), changed()])
       }}>恢复会话</button>}
       {!closed && !readOnlySource && !archived && <button className="v2-link v2-close-chat" disabled={sessionAction.busy} onClick={() => setConfirmClose(true)}>关闭会话</button>}
+      {!readOnlySource && <DeleteWorkspaceTarget path={path} kind="会话" title={session.title} done={() => { back(); void changed() }}/>}
     </footer>
     {canReopen && <Issue text={sessionAction.error}/>}
     {confirmClose && !archived && <V2Dialog title="关闭会话？" meta={session.title} close={() => setConfirmClose(false)}><p>关闭后仍可阅读发言和工单。</p><Issue text={sessionAction.error}/>
@@ -387,7 +416,20 @@ export function Transcript({ base, session, view, origin, sourceMessage, compact
         if (receipt) setConfirmClose(false)
         await Promise.all([transcript.refresh(),changed()])
       }}>确认关闭</button></V2Dialog>}
-    {attachment && anchored && <V2AttachmentDialog path={path + '/attachments/' + segment(attachment.ref.id)} reference={attachment.ref} context={session.title} close={() => setAttachment(undefined)}/>}
+    {attachment && anchored && <V2AttachmentDialog path={attachmentResource(base, {sessionId:session.id, messageId:attachment.message, traceId:attachment.traceId, attachment:attachment.ref})}
+      reference={attachment.ref} context={session.title} close={() => setAttachment(undefined)}/>}
+    {revision && !archived && <MessageEditor base={path} sessionId={session.id} edit={revision} maxLength={64000} close={() => setRevision(undefined)}
+      saved={receipt => {
+        setRevision(undefined)
+        setAttachment(undefined)
+        if ((sourceMessage || trace) && currentTrace) currentTrace()
+        else {
+          following.current = true
+          setSavedMessage({id:receipt.messageId, traceId:receipt.traceId})
+          void paged.toLatest()
+        }
+        void changed()
+      }}/>}
   </section>
 }
 
@@ -402,10 +444,12 @@ function staticPreview(content: string) {
   return '<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src data:; style-src \'unsafe-inline\'; base-uri \'none\'; form-action \'none\'">' + template.innerHTML
 }
 
-export function V2AttachmentDialog({ path, reference, context, close }: { path: string; reference: V2AttachmentRef; context: string; close: () => void }) {
+export function V2AttachmentDialog({ path, reference, context, close, actions }: {
+  path: string; reference: V2AttachmentRef; context: string; close: () => void; actions?: ReactNode
+}) {
   const query = useV2Read(path, isAttachmentView)
   const item = query.data?.attachment.id === reference.id ? query.data.attachment : undefined
-  return <V2Dialog title={reference.label} meta={context} close={close}><Issue text={query.error} retry={query.refresh}/>
+  return <V2Dialog title={reference.label} meta={context} close={close}>{actions}<Issue text={query.error} retry={query.refresh}/>
     {!item && !query.error && <p role="status">正在打开附件…</p>}
     {item && <V2AttachmentContent item={item}/>}
   </V2Dialog>

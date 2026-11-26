@@ -211,6 +211,7 @@ const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
 export interface GroupSchedulerOptions {
   inputScoped?: boolean
+  idPrefix?: string
   members: readonly GroupMember[]
   say: GroupSay
   now?: () => number
@@ -224,6 +225,8 @@ export interface GroupSchedulerOptions {
 
 export class GroupScheduler {
   private state: GroupSchedulerState
+  private retired = false
+  private readonly idPrefix: string
   private members: GroupMember[] = []
   private readonly say: GroupSay
   private readonly now: () => number
@@ -233,6 +236,7 @@ export class GroupScheduler {
   readonly limits: GroupLimits
 
   constructor(options: GroupSchedulerOptions) {
+    this.idPrefix = options.idPrefix ?? ''
     this.say = options.say
     this.now = options.now ?? Date.now
     this.holdOrderWakes = options.holdOrderWakes === true
@@ -318,8 +322,13 @@ export class GroupScheduler {
    * `steer`：该叫的人正在干活时不排队，给出 `steer` 效果，让宿主把这句话立即送进它在跑的回合（主人的话要马上到）。
    */
   ownerSaid(input: { text: string; workOrderId?: string; attachments?: GroupLineInput['attachments']; inputAttachments?: GroupLine['inputAttachments']; requestId?: string; steer?: boolean }): { line: GroupLine; effects: GroupEffect[] } {
+    const line = this.recordOwner(input)
+    return { line, effects: this.ownerLine(line, { ...input.steer && { steer: true } }) }
+  }
+
+  recordOwner(input: {text: string; workOrderId?: string; attachments?: GroupLineInput['attachments']; inputAttachments?: GroupLineInput['inputAttachments']; requestId?: string}) {
     const { ids, all } = parseMentions(input.text, this.members)
-    const line = this.say.say({
+    return this.say.say({
       kind: 'message', speakerId: OWNER_ID, author: OWNER_NAME, text: input.text, mentions: ids,
       ...all && { all: true as const },
       ...input.workOrderId !== undefined && { workOrderId: input.workOrderId },
@@ -327,7 +336,6 @@ export class GroupScheduler {
       ...input.inputAttachments?.length && { inputAttachments: input.inputAttachments },
       ...input.requestId !== undefined && { requestId: input.requestId },
     })
-    return { line, effects: this.ownerLine(line, { ...input.steer && { steer: true } }) }
   }
 
   /**
@@ -584,7 +592,7 @@ export class GroupScheduler {
       ...terminal && call.engagement && { engagement: { callId: call.id, triggerSeq: call.triggerSeq, memberId: call.memberId, by: call.by, ...call.engagement } },
     })
     call.posted.push(line.seq)
-    if (!call.engagement) this.callFrom(call, text, line.seq, effects)
+    if (!this.retired && !call.engagement) this.callFrom(call, text, line.seq, effects)
     return line
   }
 
@@ -689,7 +697,7 @@ export class GroupScheduler {
       return effects
     }
     const reply = stripOwnName(member.name, String(text ?? '').trim())
-    if (call.toolCalls === 0 && !call.retried && promisesWork(reply) && !this.callsSomeone(call, reply)) {
+    if (!this.retired && call.toolCalls === 0 && !call.retried && promisesWork(reply) && !this.callsSomeone(call, reply)) {
       call.retried = true
       call.lastLine = reply
       call.held.push(reply)
@@ -784,6 +792,14 @@ export class GroupScheduler {
     return effects
   }
 
+  /** A superseded trace keeps evidence from offered calls and ends its queued work. */
+  retire() {
+    this.retired = true
+    this.state.calls = this.state.calls.filter(call => RUNNING.includes(call.status))
+    this.state.batches = []
+    this.state.parked = []
+  }
+
   /**
    * 宿主重启后：`alive` 是仍在跑的回合（callId）。不在其中的回合作废并离开批次；批次因此落地且有结果的，
    * 唤醒派活者一次；排队的叫人照常开始（groups.js:1082-1114 `settleRoomBatches`）。
@@ -832,7 +848,7 @@ export class GroupScheduler {
   // -------------------------------------------------------------------------------------------
   // 叫人、排队与批次
 
-  private id(prefix: string) { return `${prefix}${this.state.nextId++}` }
+  private id(prefix: string) { return `${this.idPrefix}${prefix}${this.state.nextId++}` }
 
   /**
    * 叫一组成员，同一次叫人共享一个批次（groups.js:1273-1298 `callIn`）。成员已有兼容的排队叫人（同一派活者，
@@ -965,6 +981,7 @@ export class GroupScheduler {
 
   /** 空闲成员开始其排队的叫人：主人的叫人先于别人的（轮中主人发言不排在后面），其余按先后。 */
   private pump(effects: GroupEffect[]) {
+    if (this.retired) return
     this.pruneStaleEngagements()
     for (const member of this.members) {
       if (this.state.calls.some(call => call.memberId === member.id && RUNNING.includes(call.status))) continue

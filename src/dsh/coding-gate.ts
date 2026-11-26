@@ -45,6 +45,7 @@ export interface GateTurn {
   workspaceId: string
   /** The coding session, or the group conversation of a group member. */
   sessionId: string
+  traceId?: string
   orderId?: string
   /** One gated run: a coding turn, or one push of a group member's call. */
   turnId: string
@@ -80,6 +81,7 @@ export interface CodingGateOptions {
   approvals: GateApprovals
   /** Current state of a work order; throws when it no longer exists. */
   order(workspaceId: string, orderId: string): GateOrder
+  executionRefusal?: (turn: Pick<GateTurn, 'workspaceId' | 'sessionId' | 'orderId' | 'traceId'>) => string | undefined
   review?: Reviewer
   reviewTimeoutMs?: number
   logger?: Logger
@@ -286,6 +288,12 @@ export class CodingGate {
       } catch (error) { this.options.logger?.warn('命令把关记录写入失败：%s', String(error)) }
       return {decision: allow ? 'allow' : 'deny', reason: toTool}
     }
+    const refuseExecution = () => {
+      const reason = this.options.executionRefusal?.(turn)
+      if (reason) return finish('rejected', 'gate', reason, 'SuperHub：' + reason + '，本次工具调用没有执行。' + carryOn)
+    }
+    const refused = refuseExecution()
+    if (refused) return refused
     if (risk.risk === 'normal') return finish('auto', 'policy', risk.reason, 'SuperHub：普通命令，直接执行。')
     if (orderIssue) return finish('gate-unavailable', 'gate', orderIssue, 'SuperHub 把关服务' + orderIssue + '，高危命令（' + risk.reason + '）没有执行。' + carryOn)
     if (tier === 'full-access') return finish('auto', 'policy', '完全访问：' + risk.reason, 'SuperHub：完全访问档，直接执行并留痕。')
@@ -302,6 +310,8 @@ export class CodingGate {
         try {
           const verdict = await this.options.review({title: order!.title, promise: order!.promise, original: order!.original ?? order!.promise,
             command: shown, cwd, tool: turn.tool, risk: risk.reason}, AbortSignal.any([signal, entry.controller.signal, AbortSignal.timeout(reviewWindow)]))
+          const refused = refuseExecution()
+          if (refused) return refused
           if (verdict.decision === 'allow') return finish('reviewer-allowed', 'reviewer', verdict.reason, 'SuperHub 自动审查已放行：' + verdict.reason)
           return finish('reviewer-denied', 'reviewer', verdict.reason, 'SuperHub 自动审查拒绝了这条命令：' + verdict.reason + '。' + carryOn)
         } catch (error) {
@@ -310,11 +320,13 @@ export class CodingGate {
         }
       }
     }
+    const refusedAfterReview = refuseExecution()
+    if (refusedAfterReview) return refusedAfterReview
     const remaining = deadline - Date.now()
     const approvalMinutes = minutes(this.approvalMs)
     if (remaining <= 0) return finish('expired', 'gate', [fallback, '审批窗口已到期'].filter(Boolean).join('；'), 'SuperHub：这条命令的审批已过期。' + carryOn)
     const id = 'a-' + randomUUID()
-    const live = () => this.turns.get(token) === entry
+    const live = () => this.turns.get(token) === entry && !this.options.executionRefusal?.(turn)
     let outcome: ApprovalOutcome
     const waiting = (on: boolean) => { try { entry.observer?.approval?.(on) } catch (error) { this.options.logger?.warn('命令把关的等待提示出错：%s', String(error)) } }
     waiting(true)
@@ -324,13 +336,15 @@ export class CodingGate {
         staff: turn.member ? turn.member.name + (turn.tool === 'dsh' ? '' : '（' + gateToolLabel(turn.tool) + '）') : gateToolLabel(turn.tool), staffId: turn.member?.id ?? turn.tool,
         command: shown, workdir: cwd, mode: 'danger-full-access', reason: risk.reason + (fallback ? '（' + fallback + '）' : ''),
         workspace: {scope: this.options.scope, workspaceId: turn.workspaceId, sessionId: turn.sessionId, ...(turn.orderId && {orderId: turn.orderId}), turnId: turn.turnId, tool: turn.tool,
-          ...(turn.member && {memberId: turn.member.id})},
+          ...(turn.traceId && {traceId: turn.traceId}), ...(turn.member && {memberId: turn.member.id})},
       }, AbortSignal.any([signal, entry.controller.signal]), live, id, remaining)
     } catch (error) {
       return finish('gate-unavailable', 'gate', '审批服务出错：' + String(error).slice(0, 120), 'SuperHub 审批服务出错，高危命令没有执行。' + carryOn)
     } finally { waiting(false) }
     const note = fallback ? '；' + fallback : ''
     const decision: V2CommandDecision = outcome === 'allowed-once' ? 'allowed' : outcome === 'rejected' ? 'rejected' : 'expired'
+    const refusedAfterApproval = refuseExecution()
+    if (refusedAfterApproval) { this.remember(id, 'rejected'); return refusedAfterApproval }
     this.remember(id, decision)
     if (decision === 'allowed') return finish('allowed', 'owner', '主人允许本次执行' + note, 'SuperHub：主人已允许本次执行。')
     if (decision === 'rejected') return finish('rejected', 'owner', '主人拒绝' + note, 'SuperHub：主人拒绝了这条命令（' + risk.reason + '）。' + carryOn)
@@ -359,13 +373,14 @@ export class CodingGate {
       if (filter.sessionId !== undefined && bound.sessionId !== filter.sessionId) return []
       if (filter.orderId !== undefined && (bound.orderId ?? null) !== filter.orderId) return []
       return [{id: row.id, workspaceId: bound.workspaceId, sessionId: bound.sessionId, workOrderId: bound.orderId ?? null, turnId: bound.turnId,
-        tool: bound.tool, ...(bound.memberId && {memberId: bound.memberId}), command: row.command, cwd: row.workdir, reason: row.reason, requestedAt: row.requestedAt, expiresAt: row.expiresAt}]
+        tool: bound.tool, ...(bound.traceId && {traceId: bound.traceId}), ...(bound.memberId && {memberId: bound.memberId}), command: row.command, cwd: row.workdir, reason: row.reason, requestedAt: row.requestedAt, expiresAt: row.expiresAt}]
     }).sort((a, b) => a.expiresAt.localeCompare(b.expiresAt))
   }
 
   /** The owner's decision from an authenticated SuperHub page. False when it is no longer pending there. */
   answer(id: string, allow: boolean, where: {workspaceId: string; sessionId?: string; orderId?: string | null}): boolean {
     const row = this.pending(where).find(item => item.id === id)
+    if (row && allow && this.options.executionRefusal?.({...row, orderId: row.workOrderId ?? undefined})) return false
     return !!row && this.options.approvals.decide(id, allow)
   }
 

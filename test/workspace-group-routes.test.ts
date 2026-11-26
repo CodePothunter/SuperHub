@@ -22,7 +22,7 @@ import type { CommandIntent } from '../src/dsh/workspace-order-command.ts'
 import { WorkspaceStaffStore } from '../src/dsh/workspace-staff-store.ts'
 import { workspaceV2Routes, type GroupMessage, type GroupMemberState, type GroupPauseState, type WorkspaceApprovals } from '../src/dsh/workspace-v2.ts'
 import { appendCommandLog } from '../src/dsh/workspace-command-log.ts'
-import { WorkspaceV2Store } from '../src/dsh/workspace-v2-store.ts'
+import { mutationKey, WorkspaceV2Store } from '../src/dsh/workspace-v2-store.ts'
 import type { OrderResultNotice, ResultNoticeList } from '../src/core/workspace-notices.ts'
 import type { EngagementCoordinator, EngagementDecision, EngagementInput, OwnerAction } from '../src/core/workspace-engagement.ts'
 import type { ExperienceEvidence } from '../src/core/workspace-experience.ts'
@@ -1071,6 +1071,145 @@ describe('工单交付提醒：成员在群里交出成果', () => {
   })
 })
 
+describe('在同一工作区会话编辑主人旧消息', () => {
+  it('按消息身份续写，并在原 trace 留住同路径交付、后文与迟到回复，重复请求只落一次', async () => {
+    const f = fixture({turnLimit: 20})
+    const ws = await f.workspace(), group = await f.group(ws)
+    const first = f.route().assign('fork-order-1', '由研究员交付计划', undefined, ws.id, group.id, {title: '计划', promise: '可读计划'}, 'researcher')
+    const second = f.route().assign('fork-order-2', '由工程师交付说明', undefined, ws.id, group.id, {title: '说明', promise: '可读说明'}, 'engineer')
+    const workOrderId = first.delegation.id
+    const root = '/' + ws.id, sessionPath = root + '/sessions/' + group.id
+    const display = (query = '') => f.call<{traceId: string; activeTraceId: string; messages: GroupMessage[]; session: V2Session}>(sessionPath + query)
+    await vi.waitFor(() => expect(f.dsh.count('researcher') + f.codex.count('engineer')).toBe(2))
+    f.dsh.answer('researcher', '先核对计划的范围。')
+    f.codex.answer('engineer', '先了解说明的结构。')
+    await vi.waitFor(() => expect(f.dsh.count('liaison')).toBe(1))
+    f.dsh.answer('liaison', '已核对第一张工单的开头。')
+    await vi.waitFor(() => expect(f.dsh.count('liaison')).toBe(2))
+    f.dsh.answer('liaison', '已核对另一张工单的开头。')
+
+    await f.say(group, '@研究员 保留这一条前提', {workOrderId})
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(2))
+    f.dsh.answer('researcher', '前提已确认。')
+    const repeated = '@研究员 做一份七天计划'
+    const original = await f.say(group, repeated, {workOrderId})
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(3))
+    const path = join(f.host().workDir(group), '计划.md')
+    writeFileSync(path, '# 七天计划')
+    f.dsh.answer('researcher', '初版交付 [计划](计划.md)')
+    const secondOwner = await f.say(group, repeated, {workOrderId})
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(4))
+    f.dsh.answer('researcher', '编辑前较晚的答复。')
+    await f.say(group, '@工程师 另一个工单的后文', {workOrderId: second.delegation.id})
+    await vi.waitFor(() => expect(f.codex.count('engineer')).toBe(2))
+    const oldCall = f.codex.last('engineer')
+    const before = (await display()).data
+    const originalOutput = before.messages.find(message => message.text.startsWith('初版交付'))!
+    expect(before.traceId).toBe('initial')
+    expect(before.messages.find(message => message.id === original.data.messageId)?.canEdit).toBe(true)
+    expect(originalOutput.canEdit).toBeUndefined()
+    const text = '@研究员 改成三天计划'
+    const payload = {requestId: f.id(), expectedTraceId: before.traceId, text}
+    const url = sessionPath + '/messages/' + original.data.messageId + '/edit'
+    const revise = () => f.call<{sessionId: string; traceId: string; messageId: string}>(url, payload)
+    const [edited, retry] = await Promise.all([revise(), revise()])
+    expect(edited.status).toBe(200)
+    expect(retry).toEqual(edited)
+    expect(edited.data.sessionId).toBe(group.id)
+    expect(edited.data.traceId).not.toBe(before.traceId)
+    expect((await f.call(url, {...payload, requestId: f.id()})).status).toBe(409)
+    expect((await f.say(group, '旧窗口的发言', {expectedTraceId: before.traceId, workOrderId})).status).toBe(409)
+
+    oldCall.sink.finished(oldCall.call.callId, {text: '另一个工单的迟到回复。', status: 'completed', toolCalls: 1})
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(5))
+    expect(f.dsh.last('researcher').call.prompt).toContain('保留这一条前提')
+    expect(f.dsh.last('researcher').call.prompt).toContain(text)
+    expect(f.dsh.last('researcher').call.prompt).not.toMatch(/七天计划|较晚的答复|迟到回复/)
+    writeFileSync(path, '# 三天计划')
+    f.dsh.answer('researcher', '改稿交付 [计划](计划.md)')
+
+    const current = (await display()).data
+    const historical = (await display('?around=' + originalOutput.id)).data
+    expect(current.traceId).toBe(edited.data.traceId)
+    expect(current.messages.map(message => message.text).join('\n')).not.toMatch(/七天计划|较晚的答复|迟到回复/)
+    expect(historical.traceId).toBe(before.traceId)
+    expect(historical.activeTraceId).toBe(current.traceId)
+    expect(historical.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({id: secondOwner.data.messageId, text: repeated}),
+    ]))
+    expect(historical.messages.some(message => message.text === '另一个工单的迟到回复。')).toBe(false)
+    const late = f.host().lines(group, before.traceId).find(line => line.text === '另一个工单的迟到回复。')!
+    expect((await display('?trace=' + before.traceId + '&around=g-' + late.seq)).data.messages.at(-1)?.text).toBe(late.text)
+    const sources = (await f.call<{outputs: WorkspaceOutput[]}>(root + '/outputs')).data.outputs
+    expect(sources).toHaveLength(1)
+    const versions = sources[0]!.versions!
+    expect(versions.map(version => version.traceId).sort()).toEqual([before.traceId, current.traceId].sort())
+    const contents = async () => Object.fromEntries(await Promise.all(versions.map(async version => {
+      const query = '?trace=' + version.traceId + '&version=' + version.attachment.version + '&message=' + version.messageId
+      const response = await f.call<{traceId: string; attachment: {content: string; version: string}}>(sessionPath + '/attachments/' + version.attachment.id + query)
+      expect(response.status).toBe(200)
+      expect(response.data.attachment.version).toBe(version.attachment.version)
+      return [version.traceId, response.data.attachment.content]
+    })))
+    expect(await contents()).toEqual({[before.traceId]: '# 七天计划', [current.traceId]: '# 三天计划'})
+    f.restart()
+    expect((await revise()).data).toEqual(edited.data)
+    expect((await display()).data.traceId).toBe(current.traceId)
+    expect(f.dsh.count('researcher')).toBe(5)
+    expect(await contents()).toEqual({[before.traceId]: '# 七天计划', [current.traceId]: '# 三天计划'})
+    expect((await f.call<{sessions: V2Session[]}>(root)).data.sessions.map(session => session.id)).toEqual([group.id])
+    expect(f.order(ws, second.delegation.id).sessionId).toBe(group.id)
+    expect((await f.call(sessionPath + '/delete', {requestId: f.id()})).status).toBe(200)
+    const firstVersion = versions.find(version => version.traceId === before.traceId)!
+    const outputPath = root + '/orders/' + workOrderId + '/outputs/' + firstVersion.attachment.id
+      + '?trace=' + firstVersion.traceId + '&message=' + firstVersion.messageId + '&version=' + firstVersion.attachment.version
+    expect((await f.call(sessionPath + '?trace=' + before.traceId)).status).toBe(410)
+    expect((await f.call<{attachment: {content: string}}>(outputPath)).data.attachment.content).toBe('# 七天计划')
+    expect((await f.call(outputPath.replace(workOrderId, second.delegation.id))).status).toBe(404)
+  })
+
+  it('旧群账本无摘要的文件不会被编辑时的同路径内容冒充', async () => {
+    const f = fixture(), ws = await f.workspace(), group = await f.group(ws)
+    const job = f.route().assign('unversioned-order', '由研究员交付旧报告', undefined, ws.id, group.id, {title: '旧报告', promise: '旧报告正文'}, 'researcher')
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(1))
+    f.dsh.answer('researcher', '准备阶段结束。', false)
+    const anchor = await f.say(group, '@研究员 核对旧报告', {workOrderId: job.delegation.id})
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(2))
+    f.dsh.answer('researcher', '正在核对。', false)
+    const work = f.host().workDir(group), path = join(work, '旧报告.md')
+    const engine = await f.host().engine(group)
+    const original = engine.ledger.say({kind: 'message', speakerId: 'researcher', author: '研究员', text: '工单回报\n旧报告',
+      workOrderId: job.delegation.id, attachments: [{name: '旧报告', path}]})
+    writeFileSync(path, '# 当前同名文件是另一版')
+    const url = '/' + ws.id + '/sessions/' + group.id
+    const edit = await f.call(url + '/messages/' + anchor.data.messageId + '/edit', {requestId: f.id(), expectedTraceId: 'initial', text: '@研究员 改写请求'})
+    expect(edit.status).toBe(200)
+    const attachmentId = 'g-' + original.seq + '-0'
+    const historical = (await f.call<{messages: GroupMessage[]}>(url + '?trace=initial')).data.messages.find(message => message.id === 'g-' + original.seq)!
+    expect(historical.attachments).toEqual([{id: attachmentId, label: '旧报告'}])
+    const file = await f.call(url + '/attachments/' + attachmentId + '?trace=initial')
+    expect(file).toMatchObject({status: 404, data: {error: expect.stringContaining('原版本不可用')}})
+  })
+
+  it.each([['pause', '暂停'], ['complete', '已完成'], ['budget', '额度已用完']])('工单 %s 时在切换对话版本前拒绝编辑', async (action, reason) => {
+    const f = fixture({turnLimit: action === 'budget' ? 2 : 10})
+    const ws = await f.workspace(), group = await f.group(ws)
+    const job = f.route().assign('fork-closed-order', '由研究员确认需求', undefined, ws.id, group.id, {title: '需求', promise: '确认需求'}, 'researcher')
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(1))
+    f.dsh.answer('researcher', '已读需求。', false)
+    const anchor = await f.say(group, '@研究员 核实这句原话', {workOrderId: job.delegation.id})
+    await vi.waitFor(() => expect(f.dsh.count('researcher')).toBe(2))
+    f.dsh.answer('researcher', '已核实。', false)
+    if (action !== 'budget') expect((await f.call('/' + ws.id + '/orders/' + job.delegation.id + '/action', {requestId: f.id(), action})).status).toBe(200)
+    const url = '/' + ws.id + '/sessions/' + group.id
+    const edited = await f.call(url + '/messages/' + anchor.data.messageId + '/edit', {requestId: f.id(), expectedTraceId: 'initial', text: '@研究员 改稿'})
+    expect(edited).toMatchObject({status: 409, data: {error: expect.stringContaining(reason)}})
+    expect(f.store().traceState(group).traces.map(trace => trace.id)).toEqual(['initial'])
+    expect((await f.view(group)).data.messages.some(message => message.id === anchor.data.messageId)).toBe(true)
+    expect(f.dsh.count('researcher')).toBe(2)
+  })
+})
+
 describe('工作区产物：各工单交付成果按文件合在一处', () => {
   const pause = () => new Promise(resolve => setTimeout(resolve, 5))
   const list = (f: ReturnType<typeof fixture>, ws: V2Workspace) => f.call<{ workspaceId: string; outputs: WorkspaceOutput[]; issue?: string }>('/' + ws.id + '/outputs')
@@ -1170,6 +1309,60 @@ describe('工作区产物：各工单交付成果按文件合在一处', () => {
     expect(read).toMatchObject({ status: 200, data: { outputs: [{ label: '计费表', orders: [{ id: job.delegation.id }] }] } })
     expect(read.data.issue).toBeUndefined()
     expect((await f.host().engine(job.session)).readOnly).toBe(true)
+  })
+})
+
+describe('群会话和工单的删除', () => {
+  it('只叫停已删除工单和它的审批，同场另一单可交付，随后可单独删除会话', async () => {
+    const f = fixture(), space = await f.workspace(), session = await f.group(space)
+    const first = f.route().assign('first-delete-source', '调研第一单', undefined, space.id, session.id, undefined, 'researcher').delegation
+    const other = f.route().assign('keep-source', '处理另一单', undefined, space.id, session.id, undefined, 'engineer').delegation
+    await vi.waitFor(() => expect(f.dsh.count('researcher') + f.codex.count('engineer')).toBe(2))
+    const earlier = f.dsh.last('researcher'), current = f.codex.last('engineer')
+    const at = new Date().toISOString()
+    for (const [id, order, tool] of [['first-card',first,'dsh'],['other-card',other,'codex']] as const) {
+      f.pending.push({id, workspaceId:space.id, sessionId:session.id, workOrderId:order.id, turnId:id, tool,
+        command:'核对结果',cwd:f.root,reason:'需要主人确认',requestedAt:at,expiresAt:at})
+    }
+    const orderPath = '/' + space.id + '/orders/' + first.id
+    const deletion = await f.call<{deletedAt:string}>(orderPath + '/delete',{requestId:f.id()})
+    expect(deletion.status).toBe(200)
+    expect(f.dsh.cancelled).toContain(earlier.call.callId)
+    expect(f.codex.cancelled).not.toContain(current.call.callId)
+    expect(f.answered).toEqual([{id:'first-card',allow:false,where:{workspaceId:space.id,sessionId:session.id,orderId:first.id}}])
+    earlier.sink.finished(earlier.call.callId,{status:'completed',text:'工单回报\n这一句晚到了',toolCalls:0})
+    const before = await f.view(session)
+    expect(before.data.group.approvals.map(row => row.id)).toEqual(['other-card'])
+    expect(before.data.messages.some(message => message.text.includes('这一句晚到了'))).toBe(false)
+    expect(before.data.messages.find(message => message.workOrderId === first.id)).toMatchObject({workOrderDeletedAt:deletion.data.deletedAt})
+    expect((await f.say(session,'@研究员 重新派发',{workOrderId:first.id})).status).toBe(410)
+    expect((await f.call('/' + space.id + '/sessions/' + session.id + '/approvals/first-card',{requestId:f.id(),allow:true})).status).toBe(410)
+    f.codex.answer('engineer','工单回报\n另一单已核对')
+    await vi.waitFor(() => expect(f.store().resultNotices().map(notice => notice.orderId)).toEqual([other.id]))
+    const deleted = await f.call<{deletedAt:string}>('/' + space.id + '/sessions/' + session.id + '/delete',{requestId:f.id()})
+    expect(deleted.status).toBe(200)
+    f.restart()
+    expect((await f.view(session)).status).toBe(410)
+    expect(f.host().loaded(session.id)).toBeUndefined()
+    expect((await f.call<{order:V2Delegation}>('/' + space.id + '/orders/' + other.id)).data.order.sessionDeletedAt).toBe(deleted.data.deletedAt)
+  })
+
+  it('重启时跳过已经提交删除的未协调工单，即使先前的进程来不及清理运行中的回合', async () => {
+    const f = fixture(), space = await f.workspace(), session = await f.group(space)
+    const first = f.route().assign('died-first-source','旧工单',undefined,space.id,session.id,undefined,'researcher').delegation
+    const other = f.route().assign('alive-other-source','正在比较数据',undefined,space.id,session.id,undefined,'engineer').delegation
+    await vi.waitFor(() => expect(f.dsh.count('researcher') + f.codex.count('engineer')).toBe(2))
+    const callId = f.dsh.last('researcher').call.callId, otherCall = f.codex.last('engineer').call.callId
+    f.dsh.alive.add(callId)
+    f.codex.alive.add(otherCall)
+    f.store().deleteTarget(mutationKey(['delete-order'],{requestId:f.id()}),space.id,'order',first.id)
+    expect(f.dsh.cancelled).not.toContain(callId)
+    f.restart()
+    await vi.waitFor(() => expect(f.codex.reattached).toContain(otherCall))
+    expect(f.dsh.reattached).not.toContain(callId)
+    const view = (await f.view(session)).data
+    expect(view.group.members.find(row => row.id === 'researcher')?.workOrderId).toBeUndefined()
+    expect(view.group.members.find(row => row.id === 'engineer')?.workOrderId).toBe(other.id)
   })
 })
 

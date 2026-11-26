@@ -334,7 +334,7 @@ export interface OpenOrderGroup { workspace: string; orders: V2Delegation[] }
 /** 各未归档工作区里未关闭的工单（不含已完成、已取消）。 */
 export function openOrders(workspaces: Pick<WorkspaceV2Store, 'list' | 'view'>): OpenOrderGroup[] {
   return workspaces.list().filter(space => !workspaceArchived(space)).flatMap(space => {
-    const orders = workspaces.view(space.id).orders.filter(order => !orderEnded(order))
+    const orders = workspaces.view(space.id).orders.filter(order => !order.sessionDeletedAt && !orderEnded(order))
     return orders.length ? [{ workspace: space.name, orders }] : []
   })
 }

@@ -14,6 +14,8 @@ import { ChatComposer, MessageInputAttachments, useChatAttachments } from './cha
 import { NoticeScheduleActions, SCHEDULE_STYLE } from './workspace-schedules.tsx'
 import { NewerEdge, OlderEdge, historyEdgeStyle } from './history-edge.tsx'
 import { useEdgeSentinel, usePrependAnchor } from './scroll-anchor.ts'
+import { speechCursor } from '../core/paging.ts'
+import { MessageEditor, type MessageEdit } from './workspace-conversation-actions.tsx'
 
 interface Links {
   openProfileImport: (id: string) => void
@@ -27,6 +29,10 @@ interface Props extends Links {
   scope: string; surface: SuperhubSurface; selectedId?: string; sessionId?: string; workOrderId?: string; changed: () => void; close: () => void
   workspace?: { id: string; name: string }
   pending?: ReactNode
+  trace?: string
+  sourceMessage?: string
+  sourceSession?: string
+  currentTrace?: () => void
 }
 
 const style = `
@@ -44,7 +50,7 @@ const style = `
 .wv2 .v2-liaison .v2-turn.settled .v2-notice-text { color:var(--v-muted); }
 `
 
-const speechId = (m: Pick<ChatMessage, 'role' | 'seq' | 'firstSeq'>) => m.role + '-' + (m.firstSeq ?? m.seq)
+const speechId = (m: Pick<ChatMessage, 'role' | 'seq' | 'firstSeq' | 'messageId'>) => m.role + '-' + speechCursor(m)
 type LiaisonSpeech = Pick<ChatMessage, 'role' | 'time' | 'text' | 'discussions' | 'workspaces' | 'profileImports' | 'inputAttachments'>
 type ChatNotice = ChatView['notices'][number]
 
@@ -53,26 +59,29 @@ function NoticeBody({ notice, openRoom, openDelegation, openSchedules }: Pick<Li
   return <>
     <p className="v2-notice-text">{notice.text}</p>
     {notice.status && <small className="v2-notice-status">{notice.status}</small>}
-    {notice.order && openDelegation && <button type="button" className="v2-link" onClick={() => openDelegation(notice.order!.workspaceId, notice.order!.orderId)}>打开工单</button>}
+    {notice.order?.orderDeletedAt ? <small className="v2-notice-status">工单已删除</small>
+      : notice.order && openDelegation && <button type="button" className="v2-link" onClick={() => openDelegation(notice.order!.workspaceId, notice.order!.orderId)}>打开工单</button>}
     {notice.roomId && openRoom && <button type="button" className="v2-link" onClick={() => openRoom(notice.roomId!)}>打开讨论</button>}
     {notice.schedule && <NoticeScheduleActions schedule={notice.schedule} status={notice.status} openSchedules={openSchedules}/>}
   </>
 }
 
-function LiaisonTurn({ message, result, notice, id, scope, sessionId, openProfileImport, openRoom, openWorkspace, openDelegation, openSchedules }: Links & { id?:string; scope: string; sessionId?: string; message: LiaisonSpeech; result?: DiscussionResult; notice?: ChatNotice }) {
+function LiaisonTurn({ message, result, notice, id, scope, sessionId, editMessage, openProfileImport, openRoom, openWorkspace, openDelegation, openSchedules }: Links & { id?:string; scope: string; sessionId?: string; message: LiaisonSpeech; result?: DiscussionResult; notice?: ChatNotice; editMessage?: () => void }) {
   const mine = message.role === 'you'
   const at = new Date(message.time).toISOString()
-  return <li data-message-id={id} className={'v2-turn' + (mine ? ' mine' : '') + (notice?.done ? ' settled' : '')}>
+  return <li data-message-id={id} className={'v2-turn' + (mine ? ' mine' : '') + (notice?.done ? ' settled' : '')} tabIndex={-1}>
     <ChatAvatar portrait={mine ? ownerPortrait : liaisonPortrait}/>
-    <div className="v2-message"><div className="v2-byline"><strong>{mine ? '我' : '接口人'}</strong><time dateTime={at}>{readableTime(at)}</time></div>
+    <div className="v2-message"><div className="v2-byline"><strong>{mine ? '我' : '接口人'}</strong><time dateTime={at}>{readableTime(at)}</time>
+      {editMessage && <button type="button" aria-label="编辑历史消息" className="v2-link v2-edit-message" onClick={editMessage}>编辑</button>}</div>
       <div className="v2-bubble">
         {notice && <NoticeBody notice={notice} openRoom={openRoom} openDelegation={openDelegation} openSchedules={openSchedules}/>}
         {result && <DiscussionReply result={result} open={openRoom} className="v2-markdown"/>}
         {message.text && <Markdown text={message.text} className="v2-markdown"/>}
         <MessageInputAttachments scope={scope} target={sessionId ? {sessionId} : undefined} attachments={message.inputAttachments}/>
         <RoomReceipts discussions={message.discussions} open={openRoom}/>
-        {message.workspaces?.map(({id, name, delegationId, delegationTitle}) =>
-          delegationId && openDelegation ? <button key={id + '/' + delegationId} className="v2-link" onClick={() => openDelegation(id, delegationId)}>
+        {message.workspaces?.map(({id, name, delegationId, delegationTitle, workOrderDeletedAt}) =>
+          workOrderDeletedAt ? <small key={id + '/' + delegationId} className="v2-notice-status">{delegationTitle && delegationTitle + ' · '}工单已删除</small>
+          : delegationId && openDelegation ? <button key={id + '/' + delegationId} className="v2-link" onClick={() => openDelegation(id, delegationId)}>
             {delegationTitle ? '打开工单「' + delegationTitle + '」' : '打开工单'}</button>
             : <button key={id} className="v2-link" onClick={() => openWorkspace(id)}>打开工作区「{name}」</button>)}
         {message.profileImports?.map(({importId}) => <button type="button" key={importId} className="v2-link" onClick={() => openProfileImport(importId)}>核对资料</button>)}
@@ -81,10 +90,13 @@ function LiaisonTurn({ message, result, notice, id, scope, sessionId, openProfil
   </li>
 }
 
-export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, openWorkspace, openDelegation, openSchedules, workspace, surface, selectedId, sessionId, workOrderId, changed, pending }: Props) {
+export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, openWorkspace, openDelegation, openSchedules, workspace, surface, selectedId, sessionId, workOrderId, changed, pending, trace, sourceMessage, sourceSession, currentTrace }: Props) {
   const { revoke } = useContext(V2Client)
-  const following = useRef(true)
-  const chat = useChat(changed, scope, revoke, () => following.current)
+  const following = useRef(!sourceMessage)
+  const chat = useChat(changed, scope, revoke, () => following.current, {trace, message:sourceMessage, sessionId:sourceSession})
+  const historical = !!chat.traceId && !!chat.activeTraceId && chat.traceId !== chat.activeTraceId
+  const [revision, setRevision] = useState<MessageEdit>()
+  const [savedMessage, setSavedMessage] = useState<string>()
   const key = 'superhub-v2:draft:' + scope + ':liaison:' + (['people','calendar'].includes(surface) ? surface + ':' + (selectedId ?? '') : workspace?.id ?? '')
   const [draft, setDraft] = useState(() => { try { return sessionStorage.getItem(key) ?? '' } catch { return '' } })
   const latestDraft = useRef(draft)
@@ -109,7 +121,9 @@ export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, op
   const inRange = (at: number) => (!chat.hasOlder || !loaded.length || at >= loaded[0]!.time) && (!chat.hasNewer || !loaded.length || at <= loaded.at(-1)!.time)
   const results = (chat.discussionResults ?? []).filter(result => inRange(Date.parse(result.at)))
   const notices = chat.notices.filter(notice => liaisonNotice(notice) && inRange(Date.parse(notice.at)))
-  const feed: { id: string | undefined; message: LiaisonSpeech; result?: DiscussionResult; notice?: ChatNotice }[] = messages.map(message => ({ id: speechId(message), message }))
+  const feed: { id: string | undefined; message: LiaisonSpeech; editableId?: string; result?: DiscussionResult; notice?: ChatNotice }[] = messages.map(message => ({
+    id: speechId(message), message, ...(message.role === 'you' && message.canEdit && {editableId:speechCursor(message)}),
+  }))
   for (const result of results) feed.push({ id: result.id, result, message: { role: 'liaison', text: '', time: Date.parse(result.at) } })
   for (const notice of notices) feed.push({ id: 'notice-' + notice.key, notice, message: { role: 'liaison', text: '', time: Date.parse(notice.at) } })
   if (live && livePublic && !chat.hasNewer) feed.push({ id: liveId, message: { ...live, role: 'liaison', time: live.firstSpokenAt ?? live.since } })
@@ -119,7 +133,7 @@ export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, op
   for (const result of results) timeline.push({ id: result.id, at: Date.parse(result.at) })
   for (const notice of notices) timeline.push({ id: 'notice-' + notice.key, at: Date.parse(notice.at) })
   if (liveId && livePublic) timeline.push({id:liveId, at:live!.firstSpokenAt ?? live!.since})
-  usePortraitArrivals(history, chat.sessionId, timeline, chat.observedAt)
+  usePortraitArrivals(history, JSON.stringify([chat.sessionId, chat.traceId]), historical ? undefined : timeline, chat.observedAt)
   // Older pages load as the top comes near; the first visible message stays where it was.
   const scroller = useCallback(() => history.current, [])
   const top = useRef<HTMLDivElement>(null), bottom = useRef<HTMLDivElement>(null)
@@ -135,10 +149,19 @@ export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, op
     const skip = appending.current || chat.hasNewer
     appending.current = false
     if (element && following.current && !skip) element.scrollTop = element.scrollHeight
-  }, [messages.length, messages.at(-1)?.seq, results.length, results.at(-1)?.id, notices.length, notices.at(-1)?.key, live?.text, live?.discussions?.length, live?.workspaces?.length, live?.profileImports?.length])
+  }, [chat.traceId, messages.length, messages.at(-1)?.seq, results.length, results.at(-1)?.id, notices.length, notices.at(-1)?.key, live?.text, live?.discussions?.length, live?.workspaces?.length, live?.profileImports?.length])
+  const source = savedMessage ?? sourceMessage
+  const sourceRow = source && messages.find(message => speechCursor(message) === source)
+  const anchored = sourceRow ? speechId(sourceRow) : undefined
+  useLayoutEffect(() => {
+    if (!anchored) return
+    const node = Array.from(history.current?.querySelectorAll<HTMLElement>('[data-message-id]') ?? []).find(el => el.dataset.messageId === anchored)
+    node?.focus({preventScroll:true})
+    node?.scrollIntoView({block:'center'})
+  }, [anchored])
   // What the owner sees here is read: on opening, and whenever the newest message (or a reminder) changes.
   // A reply still being written is not counted as unread, so it is marked when it lands.
-  useMarkLiaisonSeen(chat.observedAt, feed.filter(row => !live || row.id !== liveId).map(row => row.id + (row.notice?.done ? '!' : '')).join('|'))
+  useMarkLiaisonSeen(historical ? undefined : chat.observedAt, feed.filter(row => !live || row.id !== liveId).map(row => row.id + (row.notice?.done ? '!' : '')).join('|'))
 
   function edit(value: string) {
     setDraft(value)
@@ -146,7 +169,7 @@ export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, op
     try { if (value) sessionStorage.setItem(key, value); else sessionStorage.removeItem(key) } catch { /* The draft remains in this window. */ }
   }
   async function send() {
-    if (active.current || !chat.sessionId || !files.canSend(draft)) return
+    if (active.current || historical || !chat.sessionId || !files.canSend(draft)) return
     active.current = true
     setSending(true)
     setDelivered(false)
@@ -154,7 +177,7 @@ export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, op
     if (chat.hasNewer) void chat.toLatest()
     try {
       if (await chat.say(draft, 'auto', {surface, ...(selectedId && {selectedId}),
-        ...(surface === 'workspace' && sessionId && {sessionId, ...(workOrderId && {workOrderId})})}, files.ready)) {
+        ...(surface === 'workspace' && sessionId && {sessionId, ...(workOrderId && {workOrderId})})}, files.ready, chat.traceId)) {
         if (openDestination.current !== destination) {
           try { if (sessionStorage.getItem(key) === draft) sessionStorage.removeItem(key) } catch { /* Optional in embedded hosts. */ }
           return
@@ -169,28 +192,39 @@ export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, op
     }
   }
 
-  return <V2Dialog title="接口人" meta={workspace?.name} close={close} size="wide">
+  return <><V2Dialog title="接口人" meta={workspace?.name} close={close} size="wide">
     <style>{style + chatAvatarStyle + SCHEDULE_STYLE + historyEdgeStyle}</style><div className="v2-liaison">
-      {pending && <div className="v2-liaison-actions">{pending}</div>}
+      {pending && !historical && <div className="v2-liaison-actions">{pending}</div>}
+      {historical && <div className="v2-source-status">编辑前的对话 {currentTrace && <button type="button" className="v2-link" onClick={currentTrace}>返回当前对话</button>}</div>}
       <div className="v2-liaison-history" ref={history} onScroll={event => {
         const el = event.currentTarget
         following.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60
       }}>
         <OlderEdge edge={top} hasOlder={chat.hasOlder} loading={chat.loadingOlder} error={chat.olderError} count={loaded.length} load={loadOlder}/>
         {feed.length > 0 && <ol className="v2-turns" aria-label="接口人对话">
-          {feed.map(({ id, message, result, notice }) => <LiaisonTurn key={id ?? 'liaison-live'} id={id} scope={scope} sessionId={chat.sessionId} message={message} result={result} notice={notice} openProfileImport={openProfileImport} openRoom={openRoom} openWorkspace={openWorkspace} openDelegation={openDelegation} openSchedules={openSchedules}/>)}
+          {feed.map(({ id, message, editableId, result, notice }) => <LiaisonTurn key={id ?? 'liaison-live'} id={id} scope={scope} sessionId={chat.sessionId} message={message} result={result} notice={notice}
+            editMessage={!historical && !sending && editableId && chat.activeTraceId
+              ? () => setRevision({id:editableId, text:message.text, traceId:chat.activeTraceId!, attachments:message.inputAttachments}) : undefined}
+            openProfileImport={openProfileImport} openRoom={openRoom} openWorkspace={openWorkspace} openDelegation={openDelegation} openSchedules={openSchedules}/>)}
         </ol>}
         <NewerEdge edge={bottom} hasNewer={chat.hasNewer} loading={chat.loadingNewer} error={chat.newerError} load={loadNewer}
           latest={() => { following.current = true; void chat.toLatest() }}/>
       </div>
-      <form className="v2-compose" onSubmit={event => { event.preventDefault(); void send() }}>
+      {historical && <Issue text={chat.error} retry={chat.refresh}/>}
+      {!historical && <form className="v2-compose" onSubmit={event => { event.preventDefault(); void send() }}>
         <ChatComposer draft={files} text={draft} sending={sending} disabled={!chat.sessionId}
           status={chat.busy ? '正在等待接口人回复…' : delivered && !draft && !files.items.length ? '已送达接口人' : !chat.sessionId && !chat.error ? '正在连接接口人…' : ''}>
           <textarea rows={1} aria-label="对接口人说" maxLength={40_000} value={draft} placeholder="你想交办什么事？" onChange={event => edit(event.target.value)}
             onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }}/>
         </ChatComposer>
         <Issue text={chat.error} retry={chat.refresh}/>
-      </form>
+      </form>}
     </div>
   </V2Dialog>
+  {revision && chat.sessionId && <MessageEditor base="/chat" sessionId={chat.sessionId} edit={revision}
+    maxLength={40_000} close={() => setRevision(undefined)} saved={receipt => {
+      setRevision(undefined)
+      if ((trace || sourceMessage) && currentTrace) currentTrace()
+      else { following.current = true; setSavedMessage(receipt.messageId); void chat.toLatest() }
+    }}/>}</>
 }

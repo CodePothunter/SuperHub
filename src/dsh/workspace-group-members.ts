@@ -73,6 +73,8 @@ export interface GroupContext {
   workspaceId: string
   /** 群 = 工作区里的一场会话的 id。 */
   groupId: string
+  traceId?: string
+  canStart?: () => boolean
   workspaceName: string
   title: string
   /** 成员干活的目录：工作区绑定的项目目录，未绑定时 SuperHub 工作目录。 */

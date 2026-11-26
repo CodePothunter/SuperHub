@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
-import type { CommitmentKind, FollowupView, OrderCommitment, WeeklyReport, WeeklySchedule } from '../core/workspace-followup.ts'
+import type { CommitmentKind, CommitmentSource, FollowupView, OrderCommitment, WeeklyReport, WeeklySchedule } from '../core/workspace-followup.ts'
 import { messageWorkOrder, orderEnded, type V2Delegation, type V2Session } from '../core/workspace-v2.ts'
 import { Markdown } from './markdown.tsx'
 import { segment, useV2Read, useV2Write } from './workspace-v2-api.ts'
@@ -10,6 +10,8 @@ const kinds = { mine: '我方承诺', theirs: '对方承诺', request: '待回�
 const weekdays = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
 const dueLabels = { unscheduled:'', upcoming:'到期', today:'今天到期', overdue:'已逾期', resolved:'已处理' }
 type Post = (body: Record<string, unknown>) => Promise<FollowupView | undefined>
+type OpenSessionSource = (sessionId: string, messageId?: string, trace?: string) => void
+type OpenLiaisonSource = (source: CommitmentSource) => void
 
 function dueLabel(entry: OrderCommitment, timeZone: string) {
   if (!entry.dueAt) return dueLabels[entry.dueState]
@@ -19,8 +21,8 @@ function dueLabel(entry: OrderCommitment, timeZone: string) {
   return date + ' · ' + dueLabels[entry.dueState]
 }
 
-export function OrderFollowup({ base, job, session, openSource }: {
-  base: string; job: V2Delegation; session: V2Session; openSource: (sessionId: string, messageId?: string) => void
+export function OrderFollowup({ base, job, session, openSource, openLiaisonSource }: {
+  base: string; job: V2Delegation; session?: V2Session; openSource: OpenSessionSource; openLiaisonSource?: OpenLiaisonSource
 }) {
   const path = base + '/orders/' + segment(job.id) + '/followup'
   const query = useV2Read(path, isFollowupView, 15000)
@@ -28,7 +30,7 @@ export function OrderFollowup({ base, job, session, openSource }: {
   const [dialog, setDialog] = useState<'record' | 'schedule' | { reportId: string }>()
   const view = query.data
   const archived = useArchived()
-  const mutable = !job.paused && !orderEnded(job) && !archived
+  const mutable = !!session && !view?.sessionDeletedAt && !job.paused && !orderEnded(job) && !archived
   const current = view?.reports.find(report => report.week === view.currentWeek)
   const selected = dialog && typeof dialog === 'object' && view?.reports.find(report => report.id === dialog.reportId)
   const schedule = view?.schedule
@@ -56,10 +58,9 @@ export function OrderFollowup({ base, job, session, openSource }: {
           <div className="v2-followup-meta"><strong>{kinds[entry.kind]}</strong>{entry.person && <span>{entry.person}</span>}
             <span className={entry.dueState === 'overdue' || entry.dueState === 'today' ? 'v2-followup-due' : undefined}>{dueLabel(entry, view.timeZone)}</span></div>
           <p className="v2-followup-quote">{entry.quote}</p>
-          <small>{entry.source.kind === 'liaison' ? '接口人对话' : session.title} · {entry.source.author} · <time dateTime={entry.source.at}>{readableTime(entry.source.at)}</time></small>
+          <small>{entry.source.kind === 'liaison' ? '接口人对话' : session?.title ?? '所属会话'} · {entry.source.author} · <time dateTime={entry.source.at}>{readableTime(entry.source.at)}</time></small>
           <div className="v2-actions">
-            {entry.source.kind === 'session' && entry.source.sessionId === session.id &&
-              <button type="button" className="v2-link" onClick={() => openSource(session.id,entry.source.messageId)}>定位原话</button>}
+            <FollowupSourceLink source={entry.source} openSource={openSource} openLiaisonSource={openLiaisonSource}/>
             {mutable && !entry.resolved && <button type="button" className="v2-link" disabled={write.busy}
               onClick={() => { void post({ action:'resolve', id:entry.id }) }}>标记已处理</button>}
           </div>
@@ -69,7 +70,7 @@ export function OrderFollowup({ base, job, session, openSource }: {
         <div className="v2-section-head"><h2>周报</h2>{mutable &&
           <button type="button" className="v2-link" onClick={() => setDialog('schedule')}>设置周期</button>}</div>
         {schedule?.enabled && <p className="v2-period">每{weekdays[schedule.weekday]} {schedule.time} · {view.timeZone}{!mutable && ' · 已暂停出稿'}</p>}
-        {schedule?.enabled && !mutable && !archived && <button type="button" className="v2-link" disabled={write.busy}
+        {schedule?.enabled && !mutable && !archived && session && <button type="button" className="v2-link" disabled={write.busy}
           onClick={() => { void post({ action:'schedule', enabled:false }) }}>停用周期</button>}
         {(current || mutable) && <button type="button" className="v2-button" disabled={write.busy} onClick={() => { void openCurrent() }}>
           {current ? '打开本周周报' : '生成本周周报'}</button>}
@@ -80,14 +81,23 @@ export function OrderFollowup({ base, job, session, openSource }: {
       </section>
     </div>}
     {!dialog && <Issue text={write.error}/>}
-    {dialog === 'record' && mutable && view && <RecordDialog job={job} path={base + '/sessions/' + segment(session.id)} session={session}
+    {dialog === 'record' && mutable && session && view && <RecordDialog job={job} path={base + '/sessions/' + segment(session.id)} session={session}
       timeZone={view.timeZone} post={post} busy={write.busy} error={write.error} close={close} openSession={() => openSource(session.id)}/>}
     {dialog === 'schedule' && mutable && view && <ScheduleDialog schedule={view.schedule} timeZone={view.timeZone} jobTitle={job.title}
       post={post} busy={write.busy} error={write.error} close={close}/>}
-    {selected && <ReportDialog report={selected} session={session} openSource={openSource} close={close}/>}
+    {selected && <ReportDialog report={selected} openSource={openSource} openLiaisonSource={openLiaisonSource} close={close}/>}
     {dialog && typeof dialog === 'object' && !selected && <V2Dialog title="打开周报" close={close}>
       <Issue text={query.error || '正在核对这份周报。'} retry={query.refresh}/></V2Dialog>}
   </div>
+}
+
+function FollowupSourceLink({source, openSource, openLiaisonSource, label = '定位原话'}: {
+  source: CommitmentSource; openSource: OpenSessionSource; openLiaisonSource?: OpenLiaisonSource; label?: string
+}) {
+  if (source.sessionDeletedAt) return <span className="v2-quiet">来源会话已删除</span>
+  if (source.kind === 'liaison') return openLiaisonSource
+    ? <button type="button" className="v2-link" onClick={() => openLiaisonSource(source)}>{label}</button> : null
+  return <button type="button" className="v2-link" onClick={() => openSource(source.sessionId,source.messageId,source.traceId)}>{label}</button>
 }
 
 function RecordDialog({ job, path, session, timeZone, post, busy, error, close, openSession }: {
@@ -156,8 +166,8 @@ function ScheduleDialog({ schedule, timeZone, jobTitle, post, busy, error, close
     </form></V2Dialog>
 }
 
-function ReportDialog({ report, session, openSource, close }: {
-  report: WeeklyReport; session: V2Session; openSource: (sessionId: string, messageId?: string) => void; close: () => void
+function ReportDialog({ report, openSource, openLiaisonSource, close }: {
+  report: WeeklyReport; openSource: OpenSessionSource; openLiaisonSource?: OpenLiaisonSource; close: () => void
 }) {
   const [copy, setCopy] = useState<'done' | 'manual'>()
   const field = useRef<HTMLTextAreaElement>(null)
@@ -166,12 +176,15 @@ function ReportDialog({ report, session, openSource, close }: {
   }, [copy])
   const heading = '# ' + report.title + '\n'
   const body = report.markdown.startsWith(heading) ? report.markdown.slice(heading.length) : report.markdown
-  const localSources = report.sources.filter(source => source.kind === 'session' && source.sessionId === session.id)
+  const sources = report.sources.filter(source => source.kind === 'session' || openLiaisonSource)
   return <V2Dialog title={report.title} close={close}>
     <div className="v2-report-body"><Markdown className="v2-markdown" text={body}/></div>
-    {localSources.length > 0 && <details className="v2-followup-archive"><summary>回到会话核对</summary>
-      {localSources.map(source => <button type="button" className="v2-row" key={source.messageId}
-        onClick={() => openSource(session.id,source.messageId)}>{source.author} · {readableTime(source.at)}</button>)}</details>}
+    {sources.length > 0 && <details className="v2-followup-archive"><summary>回到会话核对</summary>
+      {sources.map(source => <div className="v2-row" key={JSON.stringify([source.sessionId,source.traceId,source.messageId])}>
+        <FollowupSourceLink source={source} openSource={(...args) => {close();openSource(...args)}}
+          openLiaisonSource={openLiaisonSource && (item => {close();openLiaisonSource(item)})}
+          label={source.author + ' · ' + readableTime(source.at)}/>
+      </div>)}</details>}
     <div className="v2-actions"><button type="button" className="v2-button" onClick={async () => {
       try { await navigator.clipboard.writeText(report.markdown); setCopy('done') }
       catch { setCopy('manual'); field.current?.select() }

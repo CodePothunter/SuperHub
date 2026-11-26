@@ -22,10 +22,15 @@ export const LEDGER_DELTA_MAX = 24
 export type GroupLineKind = 'message' | 'progress' | 'event'
 export const GROUP_LINE_KINDS: readonly GroupLineKind[] = ['message', 'progress', 'event']
 
-export interface GroupAttachment { name: string; path: string; mime?: string; size?: number }
+export interface GroupAttachment {
+  name: string; path: string; mime?: string; size?: number
+  /** Digest of the published bytes (missing on messages written before versioning). */
+  version?: string
+}
 
 export interface GroupLine {
   seq: number
+  traceId?: string
   /** ISO 时间。 */
   at: string
   /** `message` 发言；`progress` 成员干活中途的话；`event` 宿主写的事件行（超时、暂停、叫停……，界面淡色）。 */
@@ -104,6 +109,7 @@ function validLine(value: unknown): value is GroupLine {
     && typeof line.speakerId === 'string' && line.speakerId !== '' && typeof line.author === 'string' && typeof line.text === 'string'
     && Array.isArray(line.mentions) && line.mentions.every(id => typeof id === 'string')
     && optionalSeq(line.replyTo) && optionalString(line.workOrderId) && optionalString(line.batchId) && optionalString(line.event) && validEngagement(line.engagement)
+    && optionalString(line.traceId)
     && optionalString(line.memberCallId)
     && (line.memberCompleted === undefined || line.memberCompleted === true && line.kind === 'message' && !!line.memberCallId)
     && validExperienceRefs(line.experienceRefs)
@@ -112,7 +118,8 @@ function validLine(value: unknown): value is GroupLine {
     && (line.quote === undefined || (!!line.quote && typeof line.quote === 'object' && typeof (line.quote as {label?: unknown}).label === 'string'
       && typeof (line.quote as {text?: unknown}).text === 'string'))
     && (line.attachments === undefined || (Array.isArray(line.attachments) && line.attachments.every(item => item && typeof item === 'object'
-      && typeof (item as GroupAttachment).name === 'string' && typeof (item as GroupAttachment).path === 'string')))
+      && typeof (item as GroupAttachment).name === 'string' && typeof (item as GroupAttachment).path === 'string'
+      && ((item as GroupAttachment).version === undefined || /^[a-f0-9]{64}$/.test((item as GroupAttachment).version!)))))
 }
 
 /** 读出整本账本：跳过空行、读不出的行和序号不前进的行（重复或乱序的写入）。 */
@@ -152,6 +159,12 @@ function appendLine(path: string, line: GroupLine) {
   } finally { closeSync(fd) }
 }
 
+export interface GroupLedgerTrace {
+  id: string
+  prefix: readonly GroupLine[]
+  nextSeq: (minimum: number) => number
+}
+
 export class GroupLedger implements GroupSay {
   readonly path: string
   readonly seenPath: string
@@ -159,13 +172,13 @@ export class GroupLedger implements GroupSay {
   private hasMaterials?: boolean
   private seenBy: Record<string, number> | undefined
 
-  constructor(readonly dir: string, private readonly now: () => number = Date.now) {
+  constructor(readonly dir: string, private readonly now: () => number = Date.now, private readonly trace?: GroupLedgerTrace) {
     this.path = join(dir, GROUP_LEDGER_FILE)
     this.seenPath = join(dir, GROUP_SEEN_FILE)
   }
 
   private book(): GroupLine[] {
-    return this.lines ??= readGroupLedger(this.path)
+    return this.lines ??= [...this.trace?.prefix ?? [], ...readGroupLedger(this.path)]
   }
 
   get lastSeq(): number { return this.book().at(-1)?.seq ?? 0 }
@@ -177,8 +190,11 @@ export class GroupLedger implements GroupSay {
     if (typeof input.speakerId !== 'string' || input.speakerId === '') throw new Error('群账本的行需要发言人。')
     if (typeof input.author !== 'string' || typeof input.text !== 'string') throw new Error('群账本的行需要作者与正文。')
     const book = this.book()
+    const minimum = this.lastSeq + 1
+    const seq = this.trace?.nextSeq(minimum) ?? minimum
     const line: GroupLine = {
-      seq: this.lastSeq + 1,
+      seq,
+      ...this.trace && {traceId: this.trace.id},
       at: new Date(this.now()).toISOString(),
       kind: input.kind,
       speakerId: input.speakerId,
@@ -195,7 +211,8 @@ export class GroupLedger implements GroupSay {
       ...input.quote !== undefined && { quote: { label: input.quote.label, text: input.quote.text } },
       ...input.ref !== undefined && { ref: input.ref },
       ...input.requestId !== undefined && { requestId: input.requestId },
-      ...input.engagement && { engagement: { ...input.engagement } },
+      ...input.engagement && { engagement: { ...input.engagement,
+        ...(input.speakerId === 'owner' && input.engagement.triggerSeq === minimum && {triggerSeq: seq}) } },
       ...input.memberCallId && { memberCallId: input.memberCallId },
       ...input.memberCompleted && { memberCompleted: input.memberCompleted },
       ...input.experienceRefs && { experienceRefs: input.experienceRefs.map(ref => ({...ref})) },

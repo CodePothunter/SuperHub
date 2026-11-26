@@ -1,9 +1,10 @@
 import { useState } from 'react'
-import type { WorkspaceOutput } from '../core/workspace-v2.ts'
-import { segment, useV2Read } from './workspace-v2-api.ts'
+import type { WorkOrderOutput, WorkspaceOutput } from '../core/workspace-v2.ts'
+import { useV2Read } from './workspace-v2-api.ts'
 import { Issue, readableTime, V2Icon } from './workspace-v2-elements.tsx'
 import { isWorkspaceOutputs } from './workspace-v2-response.ts'
 import { V2AttachmentDialog } from './workspace-v2-talk.tsx'
+import { attachmentResource, outputSourceKey } from './workspace-output-source.ts'
 
 /** How many of the latest outputs the overview shows. */
 export const RECENT_OUTPUTS = 5
@@ -20,12 +21,12 @@ export function arrangeOutputs(rows: WorkspaceOutput[], sort: OutputSort, filter
 
 /** The orders and deliverers the outputs came from, each once, in the order they last delivered. */
 export function outputChoices(rows: WorkspaceOutput[]) {
-  const orders = new Map<string, string>(), people = new Map<string, string>()
+  const orders = new Map<string, WorkspaceOutput['orders'][number]>(), people = new Map<string, string>()
   for (const row of arrangeOutputs(rows, 'recent')) {
-    for (const order of row.orders) if (!orders.has(order.id)) orders.set(order.id, order.title)
+    for (const order of row.orders) if (!orders.has(order.id)) orders.set(order.id, order)
     for (const person of row.deliveredBy) if (!people.has(person.id)) people.set(person.id, person.name)
   }
-  return {orders: [...orders].map(([id, title]) => ({id, title})), deliveredBy: [...people].map(([id, name]) => ({id, name}))}
+  return {orders: [...orders.values()], deliveredBy: [...people].map(([id, name]) => ({id, name}))}
 }
 
 /**
@@ -33,7 +34,7 @@ export function outputChoices(rows: WorkspaceOutput[]) {
  * 15 s; otherwise it is read when the orders change (`revision`). Each read goes through every conversation of the
  * workspace, so a quiet workspace is not polled.
  */
-export interface OutputsFeed { live: boolean; revision?: number }
+export interface OutputsFeed { live: boolean; revision?: string | number }
 
 /** A chosen order or deliverer that is no longer among the outputs (the order was retired, say) stops narrowing the list. */
 export function availableFilter(filter: OutputFilter, choices: ReturnType<typeof outputChoices>): OutputFilter {
@@ -56,19 +57,40 @@ function OutputRow({ row, open, tag }: { row: WorkspaceOutput; open: () => void;
       <small>{row.deliveredBy.map(person => person.name).join('、')} · {readableTime(row.at)}</small>
     </button>
     <ul className="v2-output-tags" aria-label="来自工单">{row.orders.map(order => <li key={order.id}>
-      <button type="button" className="v2-output-tag" aria-label={tag.label(order.title)} onClick={() => tag.pick(order.id)}>
-        <V2Icon name="work"/>{order.title}</button></li>)}</ul>
+      {order.deletedAt ? <span className="v2-output-tag"><V2Icon name="work"/>{order.title} · 工单已删除</span>
+        : <button type="button" className="v2-output-tag" aria-label={tag.label(order.title)} onClick={() => tag.pick(order.id)}>
+          <V2Icon name="work"/>{order.title}</button>}</li>)}</ul>
   </li>
 }
 
 /** Opens a file in the same reader as an order's 「交付成果」. */
-function OutputReader({ base, row, close }: { base: string; row: WorkspaceOutput; close: () => void }) {
-  return <V2AttachmentDialog path={base + '/sessions/' + segment(row.sessionId) + '/attachments/' + segment(row.attachment.id)}
-    reference={row.attachment} context={row.orders.map(order => order.title).join('、')} close={close}/>
+export function OutputSourceAction({row, open}: {row:WorkOrderOutput; open?: (row:WorkOrderOutput) => void}) {
+  return row.sessionDeletedAt ? <span className="v2-quiet">来源会话已删除</span> : open &&
+    <button type="button" className="v2-link" onClick={() => open(row)}>查看来源</button>
+}
+
+function OutputReader({ base, row, close, openSource, selectedOrder }: {
+  base: string; row: WorkspaceOutput; close: () => void; openSource?: (row: WorkOrderOutput) => void; selectedOrder?: string
+}) {
+  const versions = row.versions ?? [row]
+  const [chosen, choose] = useState(() => outputSourceKey(versions.find(version => version.orderId === selectedOrder) ?? versions[0] ?? row))
+  const version = versions.find(item => outputSourceKey(item) === chosen) ?? row
+  return <V2AttachmentDialog path={attachmentResource(base, version)} reference={version.attachment}
+    context={row.orders.map(order => order.title).join('、')} close={close}
+    actions={<div className="v2-actions">
+      {versions.length > 1 && <label>交付版本<select value={outputSourceKey(version)} onChange={event => choose(event.target.value)}>
+        {versions.map((item, index) => <option key={outputSourceKey(item)} value={outputSourceKey(item)}>
+          {index === 0 ? '最近交付' : '较早交付 ' + (versions.length - index)} · {readableTime(item.at)}
+          {item.orderId && ' · ' + (row.orders.find(order => order.id === item.orderId)?.title ?? '工单')}
+        </option>)}</select></label>}
+      <OutputSourceAction row={version} open={openSource && (source => {close();openSource(source)})}/>
+    </div>}/>
 }
 
 /** The overview's 「最近产物」: the latest few, and the way to the full board. Nothing when nothing was delivered. */
-export function RecentOutputs({ base, feed, showAll, openOrder }: { base: string; feed: OutputsFeed; showAll: () => void; openOrder: (id: string) => void }) {
+export function RecentOutputs({ base, feed, showAll, openOrder, openSource }: {
+  base: string; feed: OutputsFeed; showAll: () => void; openOrder: (id: string) => void; openSource?: (row: WorkOrderOutput) => void
+}) {
   const query = useWorkspaceOutputs(base, feed)
   const [file, setFile] = useState<string>()
   const rows = query.data?.outputs ?? []
@@ -80,12 +102,12 @@ export function RecentOutputs({ base, feed, showAll, openOrder }: { base: string
     <Issue text={query.error || query.data?.issue} retry={query.refresh}/>
     <ul className="v2-card v2-output-list">{rows.slice(0, RECENT_OUTPUTS).map(row => <OutputRow key={row.key} row={row} open={() => setFile(row.key)}
       tag={{label: title => '打开工单「' + title + '」', pick: openOrder}}/>)}</ul>
-    {selected && <OutputReader base={base} row={selected} close={() => setFile(undefined)}/>}
+    {selected && <OutputReader key={selected.key} base={base} row={selected} openSource={openSource} close={() => setFile(undefined)}/>}
   </section>
 }
 
 /** The 「产物」 board: every file the workspace's orders delivered, sorted and filtered here (not in the address). */
-export function OutputsBoard({ base, feed }: { base: string; feed: OutputsFeed }) {
+export function OutputsBoard({ base, feed, openSource }: { base: string; feed: OutputsFeed; openSource?: (row: WorkOrderOutput) => void }) {
   const query = useWorkspaceOutputs(base, feed)
   const [sort, setSort] = useState<OutputSort>('recent')
   const [chosen, setFilter] = useState<OutputFilter>({})
@@ -105,7 +127,7 @@ export function OutputsBoard({ base, feed }: { base: string; feed: OutputsFeed }
           <option value="recent">最近交付</option><option value="name">名称</option></select></label>
         <label>工单<select aria-label="按工单筛选" value={filter.order ?? ''} onChange={e => setFilter({...filter, order: e.target.value || undefined})}>
           <option value="">全部工单</option>
-          {choices.orders.map(order => <option key={order.id} value={order.id}>{order.title}</option>)}</select></label>
+          {choices.orders.map(order => <option key={order.id} value={order.id}>{order.title}{order.deletedAt && ' · 工单已删除'}</option>)}</select></label>
         <label>交付人<select aria-label="按交付人筛选" value={filter.by ?? ''} onChange={e => setFilter({...filter, by: e.target.value || undefined})}>
           <option value="">全部交付人</option>
           {choices.deliveredBy.map(person => <option key={person.id} value={person.id}>{person.name}</option>)}</select></label>
@@ -116,6 +138,6 @@ export function OutputsBoard({ base, feed }: { base: string; feed: OutputsFeed }
         : <div className="v2-empty"><p>没有符合这些条件的产物。</p>
           <button type="button" className="v2-link" onClick={() => setFilter({})}>清除筛选</button></div>}
     </> : !data.issue && <div className="v2-empty"><strong>还没有产物</strong><p>工单交出的文件会集中列在这里，并标明来自哪张工单。</p></div>)}
-    {selected && <OutputReader base={base} row={selected} close={() => setFile(undefined)}/>}
+    {selected && <OutputReader key={selected.key} base={base} row={selected} openSource={openSource} selectedOrder={filter.order} close={() => setFile(undefined)}/>}
   </section>
 }

@@ -14,7 +14,8 @@ function member({ messages, system }) {
   const context = systemText(system) + '\n' + messages.map(said).join('\n')
   const name = /〔群成员身份〕你是「([^」]+)」/.exec(context)?.[1]
   // DSH adds its own user-role context (runtime snapshot, time) after the group's prompt.
-  const prompt = said(messages.findLast(m => m.role === 'user' && said(m).includes('群成员：')) ?? {})
+  const prompt = said(messages.findLast(m => m.role === 'user' &&
+    (said(m).includes('群成员：') || said(m).startsWith('〔群里的新消息：主人在你干活时说了话'))) ?? {})
   const replied = text => messages.some(m => m.role === 'assistant' && said(m).includes(text))
   if (name === '接口人') {
     if (prompt.includes('核对一下试点的联系人')) return text('我已经核对了试点联系人，可以在这张工单里查看结果。')
@@ -34,6 +35,9 @@ function coordinate(messages) {
   const prompt = messages.filter(m => m.role === 'user').map(said).findLast(text => text.startsWith('{"turn":'))
   let input
   try { input = prompt && JSON.parse(prompt) } catch { return undefined }
+  if (input?.order && input.source?.text?.startsWith('@研究员 请核对报名表')) {
+    return text(JSON.stringify({kind:'continue', text:input.source.text, memberIds:['researcher']}))
+  }
   if (input?.turn === 'member' && input.order && input.source?.text?.includes('[交接清单](交接清单.md)')) {
     return text(JSON.stringify({kind:'deliver', text:'交接清单已整理好，核对交付日期一项已列入。', final:true, evidenceSeqs:[input.source.seq]}))
   }
@@ -64,6 +68,14 @@ function response({ messages, sessionId, tools, system }) {
   const done = id => messages.some(m => m.role === 'tool' && m.toolCallId === id)
   const owner = messages.findLast(m => m.role === 'user' && m.source?.kind === 'user')
   const words = owner?.content?.filter(b => b.type === 'text').map(b => b.text).join('\n').trim()
+  if (words === '接口人续写保留的共同前文') return text('记住了续写验收的共同前文。')
+  if (words === '请先拟七天的续写验收计划') return text('旧版计划按七天安排。')
+  if (words === '接口人续写时排除这条后文') return text('旧版后文已经收到。')
+  if (words === '请先拟三天的续写验收计划') {
+    const retained = history.includes('接口人续写保留的共同前文')
+      && !history.includes('请先拟七天的续写验收计划') && !history.includes('接口人续写时排除这条后文')
+    return text(retained ? '已按原前文续写三天计划。' : '续写的历史范围有误。')
+  }
   const importRequest = '这是另一个助手对我的了解，帮我导入。\n'
   if (sessionId?.startsWith('chief-liaison-') && words?.startsWith(importRequest)) {
     if (!done('paste-profile')) return call('paste-profile','chief_import',{action:'submit',source:'Claude'})

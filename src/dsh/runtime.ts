@@ -24,6 +24,7 @@ import { CodingGate, llmReviewer } from './coding-gate.ts'
 import { BrainRepo } from './brain.ts'
 import { createProfileImportService, llmProfileOrganizer } from './assistant-import.ts'
 import { inboxDispatchState, LIAISON_HISTORY_MAX, LIAISON_PROMPT, LiaisonChat, offsetSpeech, type ChatMessage, type LiaisonParts } from './chat.ts'
+import { LiaisonTraces, liaisonEditError } from './liaison-traces.ts'
 import { chatAttachmentError, ChatAttachments } from './chat-attachments.ts'
 import { registerCodexApprovals, type CodexApprovalConfig } from './codex-approvals.ts'
 import { contextTokens, handoffText, hasRawConnectorHistory, liaisonGuard, LiaisonToolVisibility, mergeHistory, nextPartId, rotateLine, SteerCutter, type LiaisonToolStatus } from './liaison.ts'
@@ -48,6 +49,7 @@ import { createExperienceLearning } from './workspace-experience-learning.ts'
 import { commandExperienceEvidence } from './workspace-experience-evidence.ts'
 import { NativeExperience } from './workspace-native-experience.ts'
 import { isRosterGroup, workspaceScope, WorkspaceV2Store } from './workspace-v2-store.ts'
+import { INITIAL_WORKSPACE_TRACE } from './workspace-dialogue-trace.ts'
 import { workspaceCalendarRoutes } from './workspace-calendar.ts'
 import { workspaceHistoryRoutes } from './workspace-history.ts'
 import { createV2DialogueSource } from './workspace-v2-dialogue.ts'
@@ -56,7 +58,7 @@ import { DshMemberRunner } from './workspace-group-dsh-member.ts'
 import { CodingMemberRunner } from './workspace-group-coding-member.ts'
 import { groupRoster, LIAISON_MEMBER_ID, memberRunCard } from './workspace-group-members.ts'
 import { WorkspaceGroupHost } from './workspace-group-host.ts'
-import { GROUP_LEDGER_FILE, memberCompletionEvidenceId, readGroupLedger } from './workspace-group-ledger.ts'
+import { memberCompletionEvidenceId } from './workspace-group-ledger.ts'
 import { LIAISON_AUTHOR } from '../core/workspace-v2.ts'
 import { acquireLock } from './lock.ts'
 import { makeNotifier, Outbox, type Notice } from './outbox.ts'
@@ -153,9 +155,11 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
       verifyOriginal: (evidence, audience) => v2Routes.verifyLearningOriginal(evidence, audience),
       resolveOriginals: (evidence, audience) => v2Routes.resolveLearningOriginals(evidence, audience),
       verifyEvidence(evidence) {
-        const {workspaceId, sessionId, orderId} = evidence
+        const {workspaceId, sessionId, orderId, traceId} = evidence
         if (workspaceId && workspaceArchived(workspaceStore.workspace(workspaceId))) return false
         if (orderId && !workspaceId) return false
+        if (workspaceId && (sessionId && workspaceStore.deletedReason(workspaceId,sessionId,orderId) ||
+          orderId && workspaceStore.reference(workspaceId,'order',orderId)?.deletedAt)) return false
         const order = workspaceId && orderId ? workspaceStore.delegation(workspaceId,orderId) : undefined
         if (evidence.kind === 'owner' && !evidence.id.startsWith('group:')) {
           return superhub.receipts().some(({source}) => source.requestId === evidence.id && source.text.includes(evidence.quote ?? '')
@@ -172,26 +176,31 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
           return !!v2Routes.verifyLearningOriginal(evidence, {staffId: evidence.staffId})
         }
         if (evidence.kind === 'owner' && evidence.id.startsWith('group:')) {
+          if (!isRosterGroup(session)) return false
           const seq = Number(evidence.messageId?.slice(2))
-          const rows = groupHost.loaded(session.id)?.ledger.all() ?? readGroupLedger(join(groupHost.paths(session).dir,GROUP_LEDGER_FILE))
+          const rows = groupHost.lines(session, traceId ?? INITIAL_WORKSPACE_TRACE)
           return evidence.id === 'group:' + sessionId + ':' + seq &&
-            rows.some(row=>row.seq === seq && row.speakerId === 'owner' && row.workOrderId === orderId && row.text.includes(evidence.quote ?? ''))
+            rows.some(row=>row.seq === seq && (row.traceId ?? INITIAL_WORKSPACE_TRACE) === (traceId ?? INITIAL_WORKSPACE_TRACE) &&
+              row.speakerId === 'owner' && row.workOrderId === orderId && row.text.includes(evidence.quote ?? ''))
         }
         if (evidence.kind === 'group' && evidence.id.startsWith('group-member:')) {
           if (!isRosterGroup(session) || !/^g-[1-9]\d*$/.test(evidence.messageId ?? '')) return false
           const seq = Number(evidence.messageId!.slice(2))
-          const rows = groupHost.loaded(session.id)?.ledger.all() ?? readGroupLedger(join(groupHost.paths(session).dir,GROUP_LEDGER_FILE))
-          const line = rows.find(row => row.seq === seq && row.workOrderId === orderId)
+          const rows = groupHost.lines(session, traceId ?? INITIAL_WORKSPACE_TRACE)
+          const line = rows.find(row => row.seq === seq && row.workOrderId === orderId &&
+            (row.traceId ?? INITIAL_WORKSPACE_TRACE) === (traceId ?? INITIAL_WORKSPACE_TRACE))
           if (!line || [LIAISON_MEMBER_ID, 'owner', 'host'].includes(line.speakerId) || !line.text.includes(evidence.quote ?? '')
             || !staffStore.view(workspaceId).members.some(member => member.id === line.speakerId)) return false
           if (memberCompletionEvidenceId(sessionId, line) === evidence.id) return true
           const formal = orderId && [...workspaceStore.groupEvidence(orderId), ...workspaceStore.resultNotices()].some(result =>
-            result.workspaceId === workspaceId && result.sessionId === sessionId && result.orderId === orderId && result.messageId === evidence.messageId)
+            result.workspaceId === workspaceId && result.sessionId === sessionId && result.orderId === orderId && result.messageId === evidence.messageId &&
+            (result.traceId ?? INITIAL_WORKSPACE_TRACE) === (traceId ?? INITIAL_WORKSPACE_TRACE))
           return !!formal && memberCompletionEvidenceId(sessionId, line, true) === evidence.id
         }
         if (evidence.kind === 'delivery' && evidence.version) {
           return workspaceStore.resultNotices().some(row=>row.id === evidence.id && row.workspaceId === workspaceId
-            && row.sessionId === sessionId && row.orderId === orderId && row.messageId === evidence.messageId && row.version === evidence.version)
+            && row.sessionId === sessionId && row.orderId === orderId && row.messageId === evidence.messageId && row.version === evidence.version
+            && (row.traceId ?? INITIAL_WORKSPACE_TRACE) === (traceId ?? INITIAL_WORKSPACE_TRACE))
         }
         return true
       } })
@@ -232,40 +241,47 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
      * 接口人会话：所有子代理的默认父节点，也是主人对话的入口；不承载工单状态。
      * 对话太长时换一段新会话（liaison.ts）：hqSession 是当前这一段，之前的段记在设置里，仍算接口人自己。
      */
-    let hqSession = HQ_SESSION
     let hqWorkspace: string | undefined
-    let titled = false
+    let titled: string | undefined
     /** 最近一次拿到的接口人 Agent（插话打断和换段检查用）。 */
     let hqAgent: Agent | undefined
     /** 已经带上接口人设定的 Agent 实例（会话卸载后重新加载会是新实例）。 */
     const briefed = new WeakSet<Agent>()
     const liaisonDir = join(chiefHome, 'liaison')
-    const binding = () => { const b = settings.get().liaison; return b?.brain === root ? b : undefined }
-    const earlier = () => binding()?.parts ?? []
-    const baseId = () => binding()?.base ?? hqSession
-    const isLiaison = (id: string) => id === hqSession || earlier().includes(id)
+    const legacyBinding = () => { const b = settings.get().liaison; return b?.brain === root ? b : undefined }
+    const traces = new LiaisonTraces(join(chiefHome, brainScope, 'liaison-traces.json'), legacyBinding()?.base ?? HQ_SESSION)
+    const hqSession = () => traces.binding?.segments.at(-1)?.id ?? legacyBinding()?.session ?? HQ_SESSION
+    const earlier = () => traces.binding?.segments.slice(0,-1).map(part => part.id) ?? legacyBinding()?.parts ?? []
+    const baseId = () => traces.sessionId
+    const isLiaison = (id: string) => id === hqSession() || traces.nativeIds().has(id) || earlier().includes(id)
     const historyFile = () => join(liaisonDir, `${baseId()}.history.json`)
     const handoffFile = (id: string) => join(liaisonDir, `${id}.handoff.md`)
     let archive: ChatMessage[] | undefined
     const archived = (): ChatMessage[] => {
+      if (traces.binding) return traces.binding.archived
       if (archive) return archive
       try { archive = JSON.parse(readFileSync(historyFile(), 'utf8')) as ChatMessage[] } catch { archive = [] }
       return archive
     }
+    const traceBinding = () => traces.binding ?? {
+      segments: [...earlier(), hqSession()].map((id, index) => ({ id, offset: index * PART_SEQ })),
+      archived: archived(),
+    }
     let rotating: Promise<void> | undefined
-    const parts: LiaisonParts = { current: () => hqSession, base: baseId, offset: () => earlier().length * PART_SEQ, archived, ready: async () => {
+    const parts: LiaisonParts = { current: hqSession, base: baseId,
+      offset: () => traces.binding?.segments.at(-1)?.offset ?? earlier().length * PART_SEQ, archived, ready: async () => {
       await rotating
-      const agent = hqAgent?.id === hqSession ? hqAgent : await hq()
+      const agent = hqAgent?.id === hqSession() ? hqAgent : await hq()
       if (!hasRawConnectorHistory(agent.session?.toolHistory?.())) return
       await maybeRotate()
       await rotating
-      if (hqSession === agent.id) throw Object.assign(new Error('上一轮正在收尾，接口人稍后会在同一段对话中接收你的话。'), { status: 503 })
+      if (hqSession() === agent.id) throw Object.assign(new Error('上一轮正在收尾，接口人稍后会在同一段对话中接收你的话。'), { status: 503 })
     } }
     const inputAttachments = new ChatAttachments({ root, scope: brainScope, ctx, profilePatch: opts.patchPath, validateTarget(target, action) {
       const fail = (message: string) => { throw Object.assign(new Error(message), { status: 409 }) }
       if (!target.workspaceId) {
         if (target.sessionId !== parts.base() || target.workOrderId) fail('接口人对话已切换，请刷新后再打开附件')
-        if (action === 'upload' && hqAgent?.id === hqSession) return hqSession
+        if (action === 'upload' && hqAgent?.id === hqSession()) return hqAgent.id
         return
       }
       const group = workspaceStore.session(target.workspaceId, target.sessionId)
@@ -289,7 +305,7 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
      */
     let guarded = false
     try {
-      const off = ctx.tools.guard?.(liaisonGuard(id => isLiaison(id)))
+      const off = ctx.tools.guard?.(liaisonGuard(isLiaison, undefined, id => id !== hqSession() && traces.nativeIds().has(id)))
       if (off) { releases.push(off); guarded = true }
     } catch (error) { ctx.logger.warn('接口人的工具拦截没装上：%s', String(error)) }
     if (!guarded) flag('接口人的执行时工具拦截未启用。请在修复前关闭手机访问；沙箱可能仍提供命令或写文件工具。')
@@ -323,19 +339,18 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
       if ((next.liaisonModel !== prev.liaisonModel || next.liaisonReasoningEffort !== prev.liaisonReasoningEffort) && hqAgent) applyModel(hqAgent)
     }))
 
-    const hq = async (): Promise<Agent> => {
-      const sessionId = hqSession
+    const openLiaison = async (sessionId: string, createMissing = false): Promise<Agent> => {
       let result = await ctx.sessionController.resolveAgent(sessionId)
       if ('error' in result) {
-        if (result.error.code !== 'session/not-found') throw new Error(`接口人会话不可用：${result.error.code}`)
+        if (!createMissing || result.error.code !== 'session/not-found') throw new Error(`接口人会话不可用：${result.error.code}`)
         hqWorkspace ??= (await ctx.workspaceRegistry.create(root, '第二大脑')).id
         await ctx.sessionController.create({ sessionId, workspaceId: hqWorkspace })
         result = await ctx.sessionController.resolveAgent(sessionId)
         if ('error' in result) throw new Error(`无法创建接口人会话：${result.error.code}`)
       }
-      if (!titled) {
+      if (sessionId === hqSession() && titled !== sessionId) {
         // 每次启动设置一次标题：会话活跃后改名才可靠，重复设置无副作用。
-        titled = true
+        titled = sessionId
         const renamed = await ctx.sessionController.rename({ sessionId, title: '接口人' }).catch((e: unknown) => ({ error: e }))
         if (renamed && typeof renamed === 'object' && 'error' in renamed) ctx.logger.warn('接口人会话改名失败：%o', renamed)
       }
@@ -371,9 +386,12 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
         toolVisibility.attach(agent)
         applyModel(agent)
       }
-      if (sessionId === hqSession) hqAgent = agent
+      if (sessionId === hqSession()) hqAgent = agent
       return agent
     }
+    const hq = () => openLiaison(hqSession(), !traces.binding)
+    let liaisonActive = true
+    releases.push(() => { liaisonActive = false })
     const chat = new LiaisonChat(ctx.sessionController, parts, hq,
       () => [
         ...outbox.recent(30).map(projectNotice).filter(row => row !== undefined),
@@ -381,7 +399,7 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
           text: `「${action.roomTitle}」${action.text}`, roomId: action.roomId, status: action.answered ? '已回答' : action.kind === 'question' ? '待回答' : '待提交工单', done: action.answered === true })),
       ],
       eventId => inboxDispatchState(store, eventId),
-      () => recentTicketReplies(store.tickets(), rooms.list()), (workspaceId,orderId) => workspaceStore.orderLabel(workspaceId,orderId),
+      () => recentTicketReplies(store.tickets(), rooms.list()), (workspaceId,orderId) => workspaceStore.reference(workspaceId,'order',orderId),
       (receipts, options) => rooms.discussionResults(receipts, options),
       { service: inputAttachments, forRequest: source => superhub.ownerTurnOrigin(source)?.inputAttachments },
       async (requestId, text) => {
@@ -391,6 +409,46 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
         if (!needsFresh()) return
         await maybeRotate(true)
         if (needsFresh()) throw Object.assign(Error('接口人正在处理原工作区的消息。请等本轮结束后重新发送，届时会用当前范围打开新一段。'),{status:409})
+      }, {
+        traces, binding: traceBinding,
+        waitRotation: async () => { await rotating },
+        events: async sessionId => {
+          const query = ctx.get('sessionQuery')
+          if (!query) throw liaisonEditError(503, '当前 DSH 宿主无法读取原来的对话段')
+          const snapshot = await query.observeSession(sessionId, {projectionMode:'none', signal:AbortSignal.timeout(10_000)})
+          try { return snapshot.events.slice() } finally { snapshot[Symbol.dispose]() }
+        },
+        origin: source => superhub.ownerTurnOrigin(source),
+        checkPrefix: (events, context, text) => {
+          const workspaceId = workspaceStore.focus(context)?.workspace.id
+          if (nativeExperience.needsFreshHistory(events,{workspaceId,task:text})) {
+            throw liaisonEditError(409, '这段历史包含已退出当前授权范围的经验，无法从此处继续')
+          }
+        },
+        create: async sessionId => {
+          hqWorkspace ??= (await ctx.workspaceRegistry.create(root, '第二大脑')).id
+          await ctx.sessionController.create({ sessionId, workspaceId: hqWorkspace })
+        },
+        prepare: async (sessionId, sourceId) => {
+          if (existsSync(handoffFile(sourceId)) && !existsSync(handoffFile(sessionId))) {
+            writeFileSync(handoffFile(sessionId), readFileSync(handoffFile(sourceId)), { mode:0o600 })
+          }
+          const child = await openLiaison(sessionId)
+          if (hasRawConnectorHistory(child.session?.toolHistory?.())) {
+            throw liaisonEditError(409, '这段原生对话包含已退出当前授权范围的连接器上下文，无法从此处继续')
+          }
+          return child
+        },
+        deliver: async (edit, send) => {
+          const receipt = await superhub.submit({ scope: brainScope, requestId: edit.messageId, text: edit.request.text, context: edit.context },
+            { channel: 'chat', sessionId: baseId(), chatMode: 'queue', inputAttachments: edit.attachments, readOnly: edit.readOnly })
+          await superhub.deliver(receipt.id, receipt.items[0]!.id, receipt.source.text, edit.messageId, send)
+        },
+        assertCurrent: () => {
+          if (!liaisonActive || settings.get().brain && settings.get().brain !== root) {
+            throw liaisonEditError(409, '第二大脑已切换，请刷新接口人对话')
+          }
+        },
       })
 
     /**
@@ -399,7 +457,7 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
      */
     const maybeRotate = async (restrictedHistory = false) => {
       const agent = hqAgent
-      const idle = () => agent?.id === hqSession && agent.status !== 'running' && !rotating && !chat.sending()
+      const idle = () => agent?.id === hqSession() && agent.status !== 'running' && !rotating && !chat.sending() && !chat.editingHistory()
         && (agent.inbox?.nextTurn.length ?? 0) + (agent.inbox?.nextStep.length ?? 0) === 0
       if (!agent || !idle()) return
       const events = agent.session?.snapshotEvents() ?? []
@@ -410,7 +468,7 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
       if ((!restrictedHistory && !legacyConnectors && (!used || used < line)) || !idle()) return
       const omitHistory = restrictedHistory || nativeExperience.needsFreshHistory(events,{task:''})
       rotating = (async () => {
-        const previous = hqSession, next = nextPartId(previous), base = baseId()
+        const previous = hqSession(), next = nextPartId(previous), base = baseId()
         // The context-window lookup can overlap a completed send. Archive the last idle snapshot.
         const { messages } = chat.project(agent.session?.snapshotEvents() ?? [])
         mkdirSync(liaisonDir, { recursive: true, mode: 0o700 })
@@ -423,11 +481,13 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
         }
         hqWorkspace ??= (await ctx.workspaceRegistry.create(root, '第二大脑')).id
         await ctx.sessionController.create({ sessionId: next, workspaceId: hqWorkspace })
-        writeFileSync(join(liaisonDir, `${base}.history.json`), JSON.stringify(merged))
-        archive = merged
-        settings.update({ liaison: { session: next, brain: root, base, parts: [...earlier(), previous] } })
-        hqSession = next
-        titled = false
+        if (traces.binding) {
+          traces.rotate({ archived: merged, segments: [...traces.binding.segments, { id: next, offset: parts.offset() + PART_SEQ }] })
+        } else {
+          writeFileSync(join(liaisonDir, `${base}.history.json`), JSON.stringify(merged))
+          archive = merged
+          settings.update({ liaison: { session: next, brain: root, base, parts: [...earlier(), previous] } })
+        }
         await hq()
         await ctx.sessionController.rename({ sessionId: previous, title: `接口人（第 ${earlier().length} 段，已归档）` }).catch(() => undefined)
         log(`接口人对话换段：${previous} → ${next}（${legacyConnectors ? '更新连接器授权范围' : `上一段用了约 ${used} tokens，线是 ${line}`}）`)
@@ -440,7 +500,7 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
     let rotateCheck: ReturnType<typeof setTimeout> | undefined
     const offEvents = ctx.on?.('session/event', (session, event) => {
       if (event.type === 'turn/end') nativeExperience.finishTurn(session.id)
-      if (session.id !== hqSession) return
+      if (session.id !== hqSession()) return
       cutter.observe(event)
       if (event.type === 'turn/end') {
         clearTimeout(rotateCheck)
@@ -593,10 +653,12 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
         : reviewRound ? ticket.assignments[Number(reviewRound) - 1] : undefined)
       const delivery = ticket && (notice.delivery ? noticeDelivery(root, ticket, notice)
         : original ? resultDelivery(root, ticket, original) : undefined)
+      const orderDeletedAt = notice.order && workspaceStore.reference(notice.order.workspaceId,'order',notice.order.orderId)?.deletedAt
+      const order = notice.order && { ...notice.order, ...orderDeletedAt && { orderDeletedAt } }
       return { key: notice.key, at: notice.at, text: notice.text, ...notice.ticketId ? { ticketId: notice.ticketId } : {},
-        ...notice.kind ? { kind: notice.kind } : {}, ...delivery ? { delivery } : {}, ...notice.order ? { order: notice.order } : {},
+        ...notice.kind ? { kind: notice.kind } : {}, ...delivery ? { delivery } : {}, ...order ? { order } : {},
         ...notice.delivery && !delivery ? { deliveryUnavailable: true } : {}, ...notice.schedule ? { schedule: notice.schedule } : {},
-        ...noticeState(notice.key, notice.ticketId, notice.order) }
+        ...orderDeletedAt ? { status:'工单已删除' } : noticeState(notice.key, notice.ticketId, notice.order) }
     }
     function noticeState(key: string, ticketId?: string, order?: Notice['order']): { status?: string; done?: boolean } {
       if (key.startsWith('schedule:')) {
@@ -709,13 +771,17 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
       })?.id,
     }, modelDefaults, staffStore, nativeExperience, (id, orderId) => {
       if (workspaceArchived(workspaceStore.workspace(id))) return false
-      return !orderId || !orderEnded(workspaceStore.delegation(id, orderId))
+      if (!orderId) return true
+      const order = workspaceStore.reference(id, 'order', orderId)
+      return !!order?.sessionId && !workspaceStore.deletedReason(id, order.sessionId, orderId) && order.status !== 'done' && order.status !== 'closed'
     })
     const offRoomCreated = ctx.on?.('agent/created', ({ agent }) => rooms.attachContext(agent))
     if (offRoomCreated) releases.push(offRoomCreated)
     const offNativeExperience = ctx.on?.('agent/pre-step', async ({agent}, next) => {
       const selected = isLiaison(agent.id) || !!rooms.roomIdForAgent(agent)
       const decision = await next()
+      if (decision.kind === 'enter' && agent.id !== hqSession() && traces.nativeIds().has(agent.id)
+        && decision.messages.some(message => message.source?.kind === 'user')) return { kind: 'reject' }
       return selected ? nativeExperience.step(agent.id, decision, !agent.ctx?.systemPrompt?.context) : decision
     })
     if (offNativeExperience) releases.push(offNativeExperience)
@@ -783,6 +849,14 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
     const bundledHook = fileURLToPath(new URL('./coding-gate-hook.js', import.meta.url))
     const gate = new CodingGate({ scope: brainScope, socketDir: join(chiefHome, 'run'), approvals, logger: ctx.logger,
       hookScript: existsSync(bundledHook) ? bundledHook : join(pluginRoot, 'lib', 'coding-gate-hook.js'),
+      executionRefusal: ({workspaceId, sessionId, orderId, traceId}) => {
+        try {
+          const deleted = workspaceStore.deletedReason(workspaceId, sessionId, orderId)
+          if (deleted) return deleted
+          workspaceStore.assertActiveTrace({workspaceId, id: sessionId}, traceId ?? INITIAL_WORKSPACE_TRACE)
+        }
+        catch (error) { return error instanceof Error ? error.message : '这场会话已不可用' }
+      },
       order: (workspaceId, orderId) => {
         const order = workspaceStore.delegation(workspaceId, orderId)
         let original: string | undefined
@@ -851,10 +925,12 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
     const dialogue = createV2DialogueSource({ ctx, root, scope: brainScope, codex: opts.codex, gate, internalDirectories: [chiefHome], experience,
       onCodingResult(result) {
         const {workspaceId, sessionId, orderId, turnId} = result
-        const original = dialogue.experienceSource?.(workspaceStore.session(workspaceId, sessionId), turnId)
+        if (workspaceStore.deletedReason(workspaceId, sessionId, orderId)) return
+        const session = workspaceStore.turnTrace(workspaceStore.session(workspaceId, sessionId), turnId)
+        const original = dialogue.experienceSource?.(session, turnId)
         if (!original) return
         const staffId = original.staffId
-        const where = {workspaceId, sessionId, orderId, staffId}
+        const where = {workspaceId, sessionId, traceId: session.traceId, orderId, staffId}
         const commands = result.commands.slice(-8)
         const messages = result.messages.filter(item => item.text.trim()).reverse().slice(0, Math.min(6, 8 - commands.length)).reverse()
         const evidence: ExperienceEvidence[] = messages.map(message => ({
@@ -910,6 +986,7 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
     releases.push(() => v2Routes.dispose())
     v2Routes.recover()
     releases.push(...registerTools(ctx, { ...deps, calendarWeek: day => calendarRoutes.week(day), personDetail:historyRoutes.personDetail, isLiaison, lookup, readOnlyExecution: (id: string) => executors.readOnly(id), executionBinding: (id: string) => executors.binding(id), schedules: { store: schedules, timeZone }, ui, control: opts.control, importer, exporter, superhub, modelDefaults, workspaceStore, staffStore, learning, assign: v2Routes.assign, follow: v2Routes.follow, orderFollowup: v2Routes.followup, groups: groupHost, inputAttachments,
+      liaisonSource: chat.source.bind(chat),
       groupTurn: agentId => {
         if (!dshMembers.isMemberSession(agentId)) return undefined
         const call = dshMembers.callOf(agentId)
@@ -1033,11 +1110,12 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
       void remote.drain(async r => (await discussions.remoteReport(r.ticketId, r.assignmentId, r.report)) ?? engine.remoteReport(r.ticketId, r.assignmentId, r.report), m => ctx.logger.warn('%s', m))
         .catch(e => ctx.logger.warn('读取工作电脑回传失败：%s', String(e)))
     }, REMOTE_INTERVAL)
-    void hq().then(agent => hasRawConnectorHistory(agent.session?.toolHistory?.()) ? maybeRotate() : undefined)
+    void chat.recoverEdit().catch(e => ctx.logger.warn('接口人续写接收状态待核对：%s', String(e)))
+      .then(() => hq()).then(agent => hasRawConnectorHistory(agent.session?.toolHistory?.()) ? maybeRotate() : undefined)
       .catch(e => ctx.logger.warn('接口人会话初始化失败：%s', String(e)))
     // 热重载只处理已经加载的旧段，避免为诊断把全部历史上下文都加载进内存。
     // Agents.get 的实际返回值是存活 Agent；ports 只声明了其他调用处需要的祖先头信息。
-    for (const id of earlier()) {
+    for (const id of new Set([...earlier(), ...traces.nativeIds()])) {
       const loaded = ctx.agents.get(id) as unknown as Agent | undefined
       if (loaded?.id === id) toolVisibility.attach(loaded)
     }

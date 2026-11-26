@@ -48,13 +48,15 @@ export function composeWeeklyReport(order: V2Delegation, messages: V2Message[], 
   const title = order.title + ' · ' + week + ' 当周周报'
   const sources: CommitmentSource[] = []
   const cite = (source: CommitmentSource) => {
-    const found = sources.findIndex(item => item.kind === source.kind && item.sessionId === source.sessionId && item.messageId === source.messageId)
+    const found = sources.findIndex(item => item.kind === source.kind && item.sessionId === source.sessionId &&
+      item.messageId === source.messageId && (item.traceId ?? 'initial') === (source.traceId ?? 'initial'))
     if (found !== -1) return '〔' + (found + 1) + '〕'
     sources.push(source)
     return '〔' + sources.length + '〕'
   }
   const fromSession = (message: V2Message): CommitmentSource => ({
     kind: 'session', sessionId: order.sessionId, messageId: message.id, author: message.author, at: message.at,
+    ...(message.traceId && {traceId: message.traceId}),
   })
   const rows = messages.filter(message => message.role === 'agent' && inPeriod(message.at))
   const parts = ['# ' + inline(title, 300), '', '本工单由' + inline(order.owner, 160) + '负责。', '', '## 本周交付', '']

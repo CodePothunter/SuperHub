@@ -60,11 +60,13 @@ export function knownDeny(exists: (name: string) => boolean, deny: readonly stri
  * restrict() 碰不到它们（DS-Bot 的 tools.js 也是这样处理的）。拦截不管工具注册在哪，每次调用都会过一遍。
  * 只拦接口人自己（各段会话）；接口人派出的幕僚照常有自己的工具。
  */
-export function liaisonGuard(isLiaison: (id: string) => boolean, deny: readonly string[] = LIAISON_DENY) {
+export function liaisonGuard(isLiaison: (id: string) => boolean, deny: readonly string[] = LIAISON_DENY,
+  inactive?: (id: string) => boolean) {
   const blocked = new Set(deny)
   return (execution: { readonly name: string; readonly agent?: { readonly id: string } }): string | undefined => {
     const id = execution.agent?.id
     if (!id || !isLiaison(id)) return undefined
+    if (inactive?.(id)) return '这次工具调用来自编辑前的对话，请在当前对话继续。'
     // DSH 远程模块的工具能在别的机器上开会话、发指令、传文件：工作电脑上的事一律走外务的派工和核验
     if (execution.name.startsWith('remote_'))
       return `接口人不能用 ${execution.name} 直接操作别的机器：工作电脑上的事用 chief_inbox 交给外务，经派工和核验回传。`
@@ -293,7 +295,7 @@ export function mergeHistory(archived: readonly ChatMessage[], current: readonly
   const all = [...archived, ...current].filter(message => {
     const dispatches = message.dispatches?.map(dispatch => dispatch.eventId).sort()
     const discussions = message.discussions?.map(room => room.requestId ?? room.id).sort()
-    const key = JSON.stringify([message.time, message.role, message.text.slice(0, 40), dispatches ?? [], discussions ?? [],
+    const key = JSON.stringify([message.time, message.role, message.text.slice(0, 40), dispatches ?? [], discussions ?? [], message.requestId,
       ...(message.inputAttachments?.length ? [message.requestId, message.inputAttachments.map(({id}) => id)] : [])])
     if (seen.has(key)) return false
     seen.add(key)

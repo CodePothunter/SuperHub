@@ -89,17 +89,20 @@ const outcome = { soft: live }
 const directory = process.env.CHIEF_ACCEPTANCE_BASE ?? join(homedir(), '.cache', 'chief-acceptance')
 const host = await acceptanceHost({ probe: 'liaison-core-probe.mjs', directory, mobile: !live, ...live ? { model: liveModel, extraEnv: { CHIEF_ACCEPTANCE_REAL_MODEL: '1' } } : {} })
 console.log('Liaison core regression host', host.work, live ? `（真实模型 ${liveModel}）` : '（确定性模型夹具）')
-const codexAudit = join(host.work, 'codex-audit')
-const codexRows = () => existsSync(codexAudit) ? readFileSync(codexAudit, 'utf8').trim().split('\n').filter(Boolean).map(row => JSON.parse(row)) : []
+const auditName = '.codex-fixture-audit.jsonl'
+const codexRows = ticket => {
+  const file = join(host.brain, 'work', ticket, auditName)
+  return existsSync(file) ? readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map(row => JSON.parse(row)) : []
+}
 if (!live) {
   host.install('@deepseek-ai/dsh-subagent-codex@0.2.2-rc.1')
-  const executable = join(host.work, 'codex-fixture')
+  const executable = join(host.work, 'codex-fixture.cjs')
   // A Codex 0.170 App Server stand-in. The first command is denied by the owner; the second offers
   // only accept or cancel (as 0.170 does for escalations) and is left to expire.
   writeFileSync(executable, `#!/usr/bin/env node
 const { createInterface } = require('node:readline')
 const { appendFileSync } = require('node:fs')
-const audit = ${JSON.stringify(codexAudit)}
+const audit = ${JSON.stringify(auditName)}
 appendFileSync(audit, JSON.stringify({ argv: process.argv.slice(2), ticket: process.cwd().split('/').at(-1) }) + '\\n')
 const send = value => console.log(JSON.stringify(value))
 const threadId = 'core-thread', turnId = 'core-turn'
@@ -627,7 +630,7 @@ try {
     const pending = (pattern, timeout = 60_000) => until(async () => (await host.api('/settings/approvals')).find(row => row.ticket === writeTicket && pattern.test(row.command)), `待审批命令 ${pattern}`, timeout)
     const denied = approved && await check('命令审批', 'Codex 申请越过沙箱时登记待审批命令', () => pending(/ark\.example\.invalid/))
     await check('命令审批', 'Codex 以禁用原生子代理的参数启动', () => {
-      const started = codexRows().find(row => row.argv)
+      const started = codexRows(writeTicket).find(row => row.argv)
       assert.ok(started, 'Codex 夹具没有启动')
       assert.ok(started.argv.includes('features.multi_agent_v2.disable_native_tools=true'), started.argv.join(' '))
     })
@@ -692,7 +695,7 @@ try {
           assert.deepEqual(thread.executions.at(-1).approvals.map(item => item.status), ['requested', 'rejected', 'requested', 'expired'])
         })
         await check('命令审批', '拒绝与过期都回复 decline，不以 cancel 中断回合', () => {
-          assert.deepEqual(codexRows().filter(row => row.decision).map(row => [row.id, row.decision]), [['deny-me', 'decline'], ['expire-me', 'decline']])
+          assert.deepEqual(codexRows(writeTicket).filter(row => row.decision).map(row => [row.id, row.decision]), [['deny-me', 'decline'], ['expire-me', 'decline']])
         })
         await check('命令审批', '过期后提醒标记为已过期，命令从等你决定移除', async () => {
           const notice = (await host.api('/chat')).notices.find(row => row.key === `approval:${writeTicket}:${expiring.id}`)

@@ -90,6 +90,7 @@ function experienceEvidence(value: unknown, workspaceId?: string): ExperienceEvi
     if (row.workspaceId !== undefined && row.workspaceId !== workspaceId) return workspaceError(403, '经验依据必须来自所属范围')
     return {kind:row.kind as ExperienceEvidence['kind'], id:field(row.id,'依据编号',240),
       workspaceId: optional(row.workspaceId,'依据工作区',160), sessionId:optional(row.sessionId,'依据会话',240),
+      ...(row.traceId !== undefined && {traceId: optional(row.traceId,'依据对话版本',240)}),
       orderId:optional(row.orderId,'依据工单',160), messageId:optional(row.messageId,'依据消息',240),
       turnId:optional(row.turnId,'依据回合',240), fileId:optional(row.fileId,'依据文件',240),
       staffId:optional(row.staffId,'依据所属幕僚',160), resultId:optional(row.resultId,'依据交付',240),

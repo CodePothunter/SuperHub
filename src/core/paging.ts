@@ -65,4 +65,4 @@ export function pageWindow<T>(all: readonly T[], key: (item: T) => string, query
 }
 
 /** 接口人消息的分页游标：回复取第一条事件的序号（回复增长时不变），主人的话取自己的序号。 */
-export const speechCursor = (message: { seq: number; firstSeq?: number }) => String(message.firstSeq ?? message.seq)
+export const speechCursor = (message: { seq: number; firstSeq?: number; messageId?: string }) => message.messageId ?? String(message.firstSeq ?? message.seq)

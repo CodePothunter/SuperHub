@@ -4,9 +4,12 @@ export type DueState = 'unscheduled' | 'upcoming' | 'today' | 'overdue' | 'resol
 export interface CommitmentSource {
   kind: 'session' | 'liaison'
   sessionId: string
+  traceId?: string
   messageId: string
   author: string
   at: string
+  /** View only, for an explicitly deleted workspace conversation. */
+  sessionDeletedAt?: string
 }
 
 export interface OrderCommitment {
@@ -42,6 +45,7 @@ export interface FollowupView {
   orderId: string
   timeZone: string
   currentWeek: string
+  sessionDeletedAt?: string
   commitments: OrderCommitment[]
   schedule: WeeklySchedule | null
   reports: WeeklyReport[]

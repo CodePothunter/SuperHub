@@ -11,17 +11,21 @@
  * - 运行器由运行时提供（DSH 模型成员一个、Codex / Claude Code 各一个），这里只给它们套上目录锁。
  */
 import { existsSync, lstatSync, readFileSync } from 'node:fs'
-import { join, sep } from 'node:path'
+import { join } from 'node:path'
 import { workspaceArchived, type V2Session } from '../core/workspace-v2.ts'
 import { directoryLocks, type DirectoryHolder, type DirectoryLocks } from './directory-locks.ts'
 import { directoryKey } from './project-directory.ts'
 import type { Logger } from './ports.ts'
 import { GroupEngine, GROUP_SCHEDULER_FILE, type GroupEngineOptions } from './workspace-group-engine.ts'
+import { keepGroupFile, readGroupFile } from './workspace-group-files.ts'
+import { GROUP_LEDGER_FILE, readGroupLedger, type GroupLine } from './workspace-group-ledger.ts'
+import { INITIAL_WORKSPACE_TRACE } from './workspace-dialogue-trace.ts'
 import { GROUP_MEMBERS_FILE, type GroupContext, type GroupMemberKind, type GroupRosterMember, type MemberCall, type MemberCallSink, type MemberReattach, type MemberRunner } from './workspace-group-members.ts'
 import type { GroupEffect, GroupLimits } from './workspace-group-scheduler.ts'
 import { dialogueKey } from './workspace-speaker-id.ts'
 import { scopedDirectory } from './workspace-v2-dialogue.ts'
 import type { WorkspaceV2Store } from './workspace-v2-store.ts'
+import { fileVersion } from './workspace-notices.ts'
 
 export interface GroupHostOptions {
   /** The brain root (resolved). */
@@ -52,14 +56,16 @@ export interface GroupHostHandlers {
 export class WorkspaceGroupHost {
   /** `readOnly`: opened for reading while its workspace was archived (`GroupEngine.open`). */
   private readonly engines = new Map<string, { engine: GroupEngine; ready: Promise<GroupEngine>; readOnly: boolean }>()
+  private readonly history = new Map<string, Map<string, Promise<GroupEngine>>>()
+  private readonly retired = new Map<string, Map<string, GroupEngine>>()
+  private readonly sequences = new Map<string, number>()
   private handlers: GroupHostHandlers = {}
   private readonly locked: GroupDirectoryLocks
   private readonly runners: Partial<Record<GroupMemberKind, MemberRunner>>
   private disposed = false
 
   constructor(private readonly options: GroupHostOptions) {
-    const superhub = join(options.root, 'work', 'superhub-v2') + sep
-    this.locked = new GroupDirectoryLocks(options.locks ?? directoryLocks, group => group.workDir.startsWith(superhub) ? undefined : 'dir:' + directoryKey(group.workDir), options.logger)
+    this.locked = new GroupDirectoryLocks(options.locks ?? directoryLocks, group => 'dir:' + directoryKey(group.workDir), options.logger)
     this.runners = Object.fromEntries(Object.entries(options.runners).map(([kind, runner]) => [kind, runner && this.locked.wrap(runner)]))
   }
 
@@ -69,13 +75,38 @@ export class WorkspaceGroupHost {
   attach(handlers: GroupHostHandlers) { this.handlers = handlers }
 
   /** The group's record directory and its SuperHub working directory (created when missing). */
-  paths(session: Pick<V2Session, 'id' | 'workspaceId'>): { dir: string; work: string } {
+  paths(session: Pick<V2Session, 'id' | 'workspaceId'>, traceId = INITIAL_WORKSPACE_TRACE): { dir: string; work: string } {
     const area = dialogueKey(this.options.scope, session.workspaceId), room = dialogueKey(area, session.id)
-    const dir = scopedDirectory(this.options.root, ['ops', 'superhub-v2-dialogues', area, room])
+    const records = ['ops', 'superhub-v2-dialogues', area, room]
+    if (traceId !== INITIAL_WORKSPACE_TRACE) records.push('traces', dialogueKey(traceId))
+    const dir = scopedDirectory(this.options.root, records)
     const work = scopedDirectory(this.options.root, ['work', 'superhub-v2', area, room])
     // DSH discovers project instructions from cwd up to the nearest .git marker: stop it inside the group's directory.
     scopedDirectory(work, ['.git'])
     return { dir, work }
+  }
+
+  /** A child reads the exact inherited prefix from the parent and owns all newly appended lines. */
+  lines(session: Pick<V2Session, 'id' | 'workspaceId'>, traceId?: string): GroupLine[] {
+    const state = this.options.store.traceState(session)
+    const rows = (id: string): GroupLine[] => {
+      const trace = state.traces.find(trace => trace.id === id)
+      if (!trace) throw new Error('这场会话没有这个历史版本')
+      const prefix = trace.parentId && trace.beforeSeq !== undefined ? rows(trace.parentId).filter(line => line.seq < trace.beforeSeq!) : []
+      return [...prefix, ...readGroupLedger(join(this.paths(session, id).dir, GROUP_LEDGER_FILE))]
+    }
+    return rows(traceId ?? state.active)
+  }
+
+  private allocator(session: V2Session) {
+    return (minimum: number) => {
+      let latest = this.sequences.get(session.id)
+      if (latest === undefined) latest = Math.max(0, ...this.options.store.traceState(session).traces.map(trace =>
+        readGroupLedger(join(this.paths(session, trace.id).dir, GROUP_LEDGER_FILE)).at(-1)?.seq ?? 0))
+      const next = Math.max(minimum, latest + 1)
+      this.sequences.set(session.id, next)
+      return next
+    }
   }
 
   /** Where the members work now; a project directory is checked again (and throws its reason when unusable). */
@@ -95,24 +126,67 @@ export class WorkspaceGroupHost {
    */
   engine(session: Pick<V2Session, 'id' | 'workspaceId'>): Promise<GroupEngine> {
     if (this.disposed) return Promise.reject(new Error('群聊运行环境已切换，请重新打开'))
-    const known = this.engines.get(session.id)
-    if (known && !known.readOnly) return known.ready
-    const archived = workspaceArchived(this.options.store.workspace(session.workspaceId))
-    if (known && archived) return known.ready
-    // Opened read-only while archived, restored since: started for real now.
-    if (known) { known.engine.dispose(); this.engines.delete(session.id) }
     const stored = this.options.store.session(session.workspaceId, session.id)
     if (stored.engine !== 'roster') return Promise.reject(new Error('这场会话不是群聊'))
-    const { dir } = this.paths(stored)
+    const traceId = this.options.store.traceState(stored).active
+    const known = this.engines.get(session.id)
+    const archived = workspaceArchived(this.options.store.workspace(session.workspaceId))
+    if (known?.engine.traceId === traceId && known.readOnly === archived) return known.ready
+    if (known?.engine.traceId !== traceId) this.retire(session.id)
+    else if (known) { known.engine.dispose(); this.engines.delete(session.id) }
+    const engine = this.build(stored, traceId)
+    const ready = (archived ? engine.open() : engine.start()).then(() => engine)
+    ready.catch(() => { if (this.engines.get(stored.id)?.engine === engine) this.engines.delete(stored.id) })
+    this.engines.set(stored.id, { engine, ready, readOnly: archived })
+    return ready
+  }
+
+  /** Read an old trace without starting its scheduler or accepting work. */
+  historical(session: V2Session, traceId: string): Promise<GroupEngine> {
+    const previous = this.retired.get(session.id)?.get(traceId)
+    if (previous?.started) return Promise.resolve(previous)
+    const cached = this.history.get(session.id) ?? new Map<string, Promise<GroupEngine>>()
+    this.history.set(session.id, cached)
+    const known = cached.get(traceId)
+    if (known) return known
+    const engine = this.build(session, traceId)
+    const ready = engine.open().then(() => engine)
+    ready.catch(() => cached.delete(traceId))
+    cached.set(traceId, ready)
+    return ready
+  }
+
+  private build(stored: V2Session, traceId: string) {
+    const { dir } = this.paths(stored, traceId)
+    const state = this.options.store.traceState(stored)
+    const trace = state.traces.find(trace => trace.id === traceId)
+    if (!trace) throw new Error('这场会话没有这个历史版本')
+    const prefix = trace.parentId && trace.beforeSeq !== undefined ? this.lines(stored, trace.parentId).filter(line => line.seq < trace.beforeSeq!) : []
     const workspaceId = stored.workspaceId, groupId = stored.id
     const current = () => this.options.store.session(workspaceId, groupId)
+    const canStart = () => {
+      try { return this.options.store.assertActiveTrace(stored, traceId) === traceId }
+      catch { return false }
+    }
     let engine!: GroupEngine
     engine = new GroupEngine({
       scope: this.options.scope, workspaceId, groupId, dir,
+      trace: {id: traceId, prefix, nextSeq: this.allocator(stored)},
+      ...traceId !== INITIAL_WORKSPACE_TRACE && {idPrefix: dialogueKey(groupId, traceId).slice(0, 12) + '-'},
+      canStart,
+      recoveryRefusal: orderId => this.options.store.deletedReason(workspaceId, groupId, orderId),
+      archiveFiles: (files, workDir) => files.map(file => {
+        const content = readGroupFile(workDir, file)
+        if (!content) return file
+        const version = fileVersion(content)
+        try { keepGroupFile(this.paths(stored).dir, content) }
+        catch (error) { this.options.logger?.warn('群交付版本未存下：%s', String(error)) }
+        return {...file, version}
+      }),
       workDir: () => this.workDir(stored),
       info: () => {
         const space = this.options.store.workspace(workspaceId)
-        return { workspaceName: space.name, goal: space.goal, title: current().title }
+        return { workspaceName: space.name, goal: space.goal, title: stored.title }
       },
       roster: () => this.options.roster(workspaceId),
       runners: this.runners,
@@ -123,19 +197,39 @@ export class WorkspaceGroupHost {
           original:order.hasOriginal ? this.options.store.orderOriginal(workspaceId,orderId).text : undefined}
       },
       ...this.options.approvals && { approvals: this.options.approvals },
-      onEffects: effects => this.handlers.onEffects?.(current(), effects, engine),
-      onChange: () => this.handlers.onChange?.(current(), engine),
-      admit: call => this.handlers.admit?.(current(), call),
+      onEffects: effects => { if (canStart()) this.handlers.onEffects?.(current(), effects, engine) },
+      onChange: () => { if (canStart()) this.handlers.onChange?.(current(), engine) },
+      admit: call => canStart() ? this.handlers.admit?.(current(), call) : '对话版本已更新',
       engage: (orderId, memberId) => this.handlers.engage?.(current(), orderId, memberId),
       ...this.handlers.holdOrderWakes && { holdOrderWakes: true },
       ...this.options.logger && { logger: this.options.logger },
       ...this.options.now && { now: this.options.now },
       ...this.options.limits && { limits: this.options.limits },
     })
-    const ready = (archived ? engine.open() : engine.start()).then(() => engine)
-    ready.catch(() => this.engines.delete(groupId))
-    this.engines.set(groupId, { engine, ready, readOnly: archived })
-    return ready
+    return engine
+  }
+
+  retire(sessionId: string) {
+    const known = this.engines.get(sessionId)
+    if (!known) return
+    this.engines.delete(sessionId)
+    const retired = this.retired.get(sessionId) ?? new Map<string, GroupEngine>()
+    retired.set(known.engine.traceId ?? INITIAL_WORKSPACE_TRACE, known.engine)
+    this.retired.set(sessionId, retired)
+    known.engine.retire()
+  }
+
+  stopSession(sessionId: string) {
+    this.engines.get(sessionId)?.engine.shutdown()
+    for (const engine of this.retired.get(sessionId)?.values() ?? []) engine.shutdown()
+    this.engines.delete(sessionId)
+    this.retired.delete(sessionId)
+    this.history.delete(sessionId)
+  }
+
+  stopOrder(sessionId: string, orderId: string, text?: string) {
+    const engines = [this.loaded(sessionId), ...this.retired.get(sessionId)?.values() ?? []]
+    for (const engine of engines) if (engine?.started && !engine.readOnly) engine.stopOrder(orderId, text)
   }
 
   /** An engine already built for this group (not necessarily started). */
@@ -156,15 +250,27 @@ export class WorkspaceGroupHost {
     const archived = new Set(this.options.store.list().filter(workspaceArchived).map(space => space.id))
     const sessions = this.options.store.rosterSessions().filter(session => !archived.has(session.workspaceId))
     await Promise.all(sessions.map(async session => {
-      if (!this.inFlight(session)) return
-      try { await this.engine(session) }
+      const {active, traces} = this.options.store.traceState(session)
+      try {
+        for (const trace of traces) {
+          if (trace.id === active || !this.inFlight(session, trace.id)) continue
+          const retired = this.retired.get(session.id) ?? new Map<string, GroupEngine>()
+          if (retired.has(trace.id)) continue
+          const engine = this.build(session, trace.id)
+          retired.set(trace.id, engine)
+          this.retired.set(session.id, retired)
+          engine.retire()
+          await engine.start()
+        }
+        if (this.inFlight(session, active)) await this.engine(session)
+      }
       catch (error) { this.options.logger?.warn('群聊「%s」没能恢复：%s', session.title, String(error)) }
     }))
   }
 
-  private inFlight(session: V2Session): boolean {
+  private inFlight(session: V2Session, traceId: string): boolean {
     let dir: string
-    try { dir = this.paths(session).dir } catch { return false }
+    try { dir = this.paths(session, traceId).dir } catch { return false }
     const read = (name: string) => {
       const path = join(dir, name)
       try { return existsSync(path) && lstatSync(path).isFile() ? JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown> : undefined } catch { return undefined }
@@ -190,12 +296,16 @@ export class WorkspaceGroupHost {
       engine.dispose()
       this.engines.delete(id)
     }
+    for (const [id, engines] of this.retired) if ([...engines.values()].some(engine => engine.workspaceId === workspaceId)) this.stopSession(id)
   }
 
   dispose() {
     this.disposed = true
     for (const { engine } of this.engines.values()) engine.dispose()
     this.engines.clear()
+    for (const engines of this.retired.values()) for (const engine of engines.values()) engine.dispose()
+    this.retired.clear()
+    this.history.clear()
     this.locked.dispose()
   }
 }
@@ -229,7 +339,10 @@ export class GroupDirectoryLocks {
     return {
       async run(call: MemberCall, sink: MemberCallSink) {
         await self.enter(call.group, call.callId)
-        try { await inner.run(call, sinkFor(sink)) }
+        try {
+          if (call.group.canStart?.() === false) throw new Error('对话版本已更新')
+          await inner.run(call, sinkFor(sink))
+        }
         catch (error) { self.leave(call.callId); throw error }
       },
       async continue(callId: string, text: string) {
@@ -256,7 +369,7 @@ export class GroupDirectoryLocks {
     }
   }
 
-  private nameOf(group: GroupContext) { return group.scope + '\u0000' + group.workspaceId + '\u0000' + group.groupId }
+  private nameOf(group: GroupContext) { return [group.scope, group.workspaceId, group.groupId, group.traceId].join('\u0000') }
 
   /** Join the group's hold on its directory: at once when the group holds it or it is free, otherwise wait in line. */
   private enter(group: GroupContext, callId: string): Promise<void> {

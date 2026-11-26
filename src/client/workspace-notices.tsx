@@ -16,6 +16,7 @@ function notice(value: unknown): value is OrderResultNotice {
     typeof row.sessionId === 'string' && typeof row.title === 'string' && typeof row.workspaceName === 'string' &&
     typeof row.orderTitle === 'string' && typeof row.at === 'string' && typeof row.version === 'string' && typeof row.read === 'boolean' &&
     ['report','partial','weekly'].includes(row.kind ?? '') && Array.isArray(row.attachments) && (row.orderDone === undefined || row.orderDone === true) &&
+    [row.traceId, row.orderDeletedAt, row.sessionDeletedAt].every(value => value === undefined || typeof value === 'string') &&
     row.attachments.every(ref => !!ref && typeof ref.id === 'string' && typeof ref.label === 'string' && typeof ref.version === 'string')
 }
 function validList(value: Scoped): value is ResultNoticeList {
@@ -54,7 +55,8 @@ export function OrderResultInbox({today, goToday, openOrder, openSource}: Props)
     {rows.length > 0 && <div className="v2-card">{rows.map(row => <button type="button" key={row.id} className="v2-row"
       onClick={() => setSelected(row.id)}>
       <span className="v2-row-title"><strong>{row.title}</strong><V2Icon name="next"/></span>
-      <small>{row.orderTitle}{row.orderDone && ' · 工单已完成'} · {status[row.kind]} · {readableTime(row.at)}{history && (row.read ? ' · 已读' : ' · 未读')}</small>
+      <small>{row.orderTitle}{row.orderDeletedAt ? ' · 工单已删除' : row.orderDone && ' · 工单已完成'}
+        {row.sessionDeletedAt && ' · 会话已删除'} · {status[row.kind]} · {readableTime(row.at)}{history && (row.read ? ' · 已读' : ' · 未读')}</small>
     </button>)}</div>}
     {(offset > 0 || list?.nextOffset !== undefined && (history || list.unread > list.nextOffset)) && <div className="v2-actions">
       {offset > 0 && <button className="v2-link" onClick={() => setOffset(Math.max(0,offset-25))}>上一页</button>}
@@ -94,8 +96,10 @@ function ResultReader({id,close,changed,openOrder,openSource,fallbackFocus}: {
       <Issue text={document.error} retry={document.refresh}/>
       {document.data ? <V2AttachmentContent item={document.data.attachment}/>
         : selected && !document.error ? <p role="status">正在读取报告…</p> : <Markdown text={query.data!.text} className="v2-markdown"/>}
-      <div className="v2-actions"><button className="v2-button" onClick={() => openOrder(record)}>打开工单</button>
-        {record.messageId && <button className="v2-link" onClick={() => openSource(record)}>定位原话</button>}</div>
+      <div className="v2-actions">
+        {record.orderDeletedAt ? <span className="v2-quiet">工单已删除</span> : <button className="v2-button" onClick={() => openOrder(record)}>打开工单</button>}
+        {record.sessionDeletedAt ? <span className="v2-quiet">来源会话已删除</span>
+          : record.messageId && <button className="v2-link" onClick={() => openSource(record)}>定位原话</button>}</div>
     </>}
   </V2Dialog>
 }

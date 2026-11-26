@@ -19,7 +19,7 @@ import type { ChatInputAttachment } from '../core/chat-attachments.ts'
 import type { ExperienceRef, ExperienceSelection } from '../core/workspace-experience.ts'
 import { WORKSPACE_ARCHIVED, type V2PendingApproval } from '../core/workspace-v2.ts'
 import type { Logger } from './ports.ts'
-import { GroupLedger, LEDGER_FIRST_LOOK, type GroupAttachment, type GroupLine, type GroupLineInput, type GroupSay } from './workspace-group-ledger.ts'
+import { GroupLedger, LEDGER_FIRST_LOOK, type GroupAttachment, type GroupLedgerTrace, type GroupLine, type GroupLineInput, type GroupSay } from './workspace-group-ledger.ts'
 import { experienceHistory, GroupMemberSessions, LIAISON_MEMBER_ID, MemberInputError, type ExperienceAccess, type GroupContext, type GroupMemberKind, type GroupRosterMember, type MemberCall, type MemberCallSink, type MemberInputs, type MemberRunner, type MemberSteer } from './workspace-group-members.ts'
 import {
   GroupScheduler, HOST_ID, HOST_NAME, OWNER_ID, OWNER_NAME, type GroupCall, type GroupCallReason, type GroupCallStatus, type GroupEffect, type GroupLimits, type GroupMember, type GroupSchedulerOptions, type GroupSchedulerState, type MemberActivity,
@@ -49,6 +49,10 @@ export interface GroupEngineOptions {
   groupId: string
   /** 群的记录目录（`ops/superhub-v2-dialogues/<ws>/<group>`）。 */
   dir: string
+  trace?: GroupLedgerTrace
+  idPrefix?: string
+  canStart?: () => boolean
+  archiveFiles?: (files: GroupAttachment[], workDir: string) => GroupAttachment[]
   /** 成员干活的目录：工作区绑定的项目目录，未绑定时 SuperHub 工作目录（每次被叫时现读）。 */
   workDir: () => string
   info: () => GroupInfo
@@ -68,6 +72,8 @@ export interface GroupEngineOptions {
    * `member` 是现读的名册里的这位成员。
    */
   admit?: (call: { callId: string; member: GroupRosterMember; workOrderId?: string; by: string; reason: GroupCallReason }) => string | undefined
+  /** Check persisted calls before restoring running, queued or parked work. */
+  recoveryRefusal?: (workOrderId?: string) => string | undefined
   /** 管理员派出的工单批次落地时先交宿主验收（`wake` 效果带 `held`，宿主之后发言或 `wakeNow`）。 */
   holdOrderWakes?: boolean
   engage?: GroupSchedulerOptions['engage']
@@ -286,6 +292,8 @@ export class GroupEngine {
   private saved = ''
   private ready = false
   private disposed = false
+  private retired = false
+  private closing = false
   /** Opened with `open()`: shown as it is, never changed. */
   private viewOnly = false
   /** 重启补读时（就绪之前）运行器报来的事，就绪后按顺序处理。 */
@@ -302,7 +310,7 @@ export class GroupEngine {
   constructor(private readonly options: GroupEngineOptions) {
     this.now = options.now ?? Date.now
     mkdirSync(options.dir, { recursive: true })
-    this.ledger = new GroupLedger(options.dir, this.now)
+    this.ledger = new GroupLedger(options.dir, this.now, options.trace)
     this.sessions = new GroupMemberSessions(options.dir, this.now)
     this.statePath = join(options.dir, GROUP_SCHEDULER_FILE)
     this.deliveriesPath = join(options.dir, GROUP_DELIVERIES_FILE)
@@ -361,17 +369,24 @@ export class GroupEngine {
     if (this.scheduler) return
     this.useRoster(this.options.roster())
     const state = readState(this.statePath, this.options.logger)
+    const blocked = this.options.recoveryRefusal
+    if (state && blocked) {
+      state.calls = state.calls.filter(call => !blocked(call.workOrderId))
+      state.parked = state.parked.filter(call => !blocked(call.workOrderId))
+      state.batches = state.batches.filter(batch => !blocked(batch.workOrderId))
+    }
     // Members' lines link their files (`[名字](相对路径)`): those inside the group's working directory become attachments.
     const say: GroupSay = { say: input => this.ledger.say(this.withFiles(input)) }
-    const scheduler = new GroupScheduler({ members: this.roster.map(asMember), say, now: this.now, inputScoped: this.ledger.hasInputs, engage: this.options.engage, ...state && { state }, ...this.options.limits && { limits: this.options.limits },
+    const scheduler = new GroupScheduler({ members: this.roster.map(asMember), say, now: this.now, inputScoped: this.ledger.hasInputs, engage: this.options.engage, idPrefix: this.options.idPrefix, ...state && { state }, ...this.options.limits && { limits: this.options.limits },
       ...this.options.holdOrderWakes && { holdOrderWakes: true },
       ...this.options.experience && {canPublish:call=>this.canPublishExperience(call)} })
     this.scheduler = scheduler
+    if (this.retired) scheduler.retire()
     const alive: string[] = []
     const settled = new Set(this.ledger.all().flatMap(line => line.engagement ? [line.engagement.callId] : []))
     const group = this.context()
     for (const call of scheduler.calls) {
-      if (!RUNNING.includes(call.status) || !scheduler.currentEngagement(call) || settled.has(call.id)) continue
+      if (!RUNNING.includes(call.status) || !scheduler.currentEngagement(call) || settled.has(call.id) || blocked?.(call.workOrderId)) continue
       const member = this.roster.find(row => row.id === call.memberId)
       const runner = member && this.options.runners[member.kind]
       if (!member || !runner) continue
@@ -379,7 +394,10 @@ export class GroupEngine {
         const experience = this.selectExperience(member, call.triggerSeq, call.workOrderId)
         if (experience) this.callExperience.set(call.id, experience)
         const identity = memberIdentity(experience ? {...member, memories: undefined} : member, this.options.info(), group.workDir)
-        if (await runner.reattach({ callId: call.id, group, member, identity, experience, ...call.workOrderId && { workOrderId: call.workOrderId } }, this.sink)) alive.push(call.id)
+        if (await runner.reattach({ callId: call.id, group, member, identity, experience, ...call.workOrderId && { workOrderId: call.workOrderId } }, this.sink)) {
+          if (this.closing || blocked?.(call.workOrderId)) runner.cancel(call.id)
+          else alive.push(call.id)
+        }
       } catch (error) { this.options.logger?.warn('群成员 %s 的回合没能续上：%s', member.name, String(error)) }
     }
     for (const callId of Object.keys(this.sessions.lives())) if (!alive.includes(callId)) this.sessions.clearLive(callId)
@@ -409,6 +427,8 @@ export class GroupEngine {
   get readOnly(): boolean { return this.viewOnly }
   get workspaceId(): string { return this.options.workspaceId }
   get groupId(): string { return this.options.groupId }
+  get traceId(): string | undefined { return this.options.trace?.id }
+  get superseded(): boolean { return this.retired }
 
   /** Orders some member call (running or queued) or open batch is still for. */
   busyOrders(): Set<string> {
@@ -441,6 +461,14 @@ export class GroupEngine {
       return said.effects
     })
     return { line: line!, deliveries: this.record(line!, this.deliveries(line!, effects)) }
+  }
+
+  /** Store the edited words before committing the queued calls. Reopening either write can be retried independently. */
+  revision(text: string, requestId: string, workOrderId?: string, inputAttachments?: ChatInputAttachment[]) {
+    if (this.retired || this.options.canStart?.() === false) throw new Error('对话版本已更新，请刷新')
+    const line = this.ledger.byRequest(requestId) ?? this.schedule.recordOwner({text, requestId, workOrderId, inputAttachments})
+    this.forwardEngagementOwner('edit-' + requestId, line)
+    return line
   }
 
   /** 主人选择把接口人留下的那句话交出去：按账本里那一行叫人（同样可以送进在跑的回合）。 */
@@ -633,6 +661,22 @@ export class GroupEngine {
   /** 叫停一位成员或全部。 */
   stop(memberId?: string) { this.handle(s => s.stop(memberId)) }
 
+  retire() {
+    this.retired = true
+    this.scheduler?.retire()
+    if (this.ready) this.persist(true)
+  }
+
+  /** Deletion ends active and superseded calls, including an engine still reattaching on startup. */
+  shutdown() {
+    this.closing = true
+    try { if (this.ready && !this.viewOnly) this.stop() }
+    catch (error) {
+      for (const call of this.scheduler?.calls ?? []) this.runnerOf(call.memberId)?.cancel(call.id)
+      this.options.logger?.warn('群聊停止未能写入记录：%s', String(error))
+    } finally { this.dispose() }
+  }
+
   /** 到点的事（计时器会自己调；测试和宿主也可以直接调）。 */
   tick() { this.handle(s => s.tick()) }
 
@@ -692,7 +736,8 @@ export class GroupEngine {
     if (input.kind === 'event' || input.ref !== undefined || input.attachments?.length || !this.kinds.has(input.speakerId)) return input
     let workDir: string
     try { workDir = this.options.workDir() } catch { return input }
-    const attachments = linkedGroupFiles(input.text, workDir)
+    const links = linkedGroupFiles(input.text, workDir)
+    const attachments = this.options.archiveFiles?.(links, workDir) ?? links
     return attachments.length ? { ...input, attachments } : input
   }
 
@@ -705,7 +750,7 @@ export class GroupEngine {
     const info = this.options.info()
     return { scope: this.options.scope, workspaceId: this.options.workspaceId, groupId: this.options.groupId, workspaceName: info.workspaceName,
       title: info.title, workDir: this.options.workDir(), sessions: this.sessions, commandsPath: join(this.options.dir, GROUP_COMMANDS_FILE),
-      experience: this.options.experience }
+      experience: this.options.experience, traceId: this.traceId, canStart: this.options.canStart }
   }
 
   private selectExperience(member: GroupRosterMember, triggerSeq: number, workOrderId?: string) {
@@ -1002,6 +1047,7 @@ export class GroupEngine {
 
   /** 给被叫的成员拼话并交给运行器；送达后记下已读。名册、身份与工单额度都在这一刻现读、现核对。 */
   private begin(effect: StartEffect) {
+    if (this.retired || this.options.canStart?.() === false) { this.fail(effect.callId, '对话版本已更新'); return }
     let fresh: GroupRosterMember | undefined
     try { fresh = this.options.roster().find(row => row.id === effect.memberId) } catch (error) { this.options.logger?.warn('群名册读不出：%s', String(error)) }
     const member = fresh ?? this.roster.find(row => row.id === effect.memberId)
@@ -1040,7 +1086,7 @@ export class GroupEngine {
         : this.replayAllowed(line,experience,authorizedOnly) ? line : undefined
       const lines = (asFresh ? this.ledger.all() : this.ledger.unseen(member.id)).flatMap(line =>
         (!line.workOrderId || scheduler.sameOrder(line.workOrderId, effect.workOrderId)) && visible(line) || [])
-      if (asFresh && lines.length > LEDGER_FIRST_LOOK) lines.splice(0, lines.length - LEDGER_FIRST_LOOK)
+      if (asFresh && !this.options.trace?.prefix.length && lines.length > LEDGER_FIRST_LOOK) lines.splice(0, lines.length - LEDGER_FIRST_LOOK)
       // The line that called it is always shown, also when it carries its own name (a hand-over the host wrote for it).
       const raw = this.ledger.get(effect.triggerSeq)
       const trigger = raw && visible(raw)

@@ -18,7 +18,8 @@ export interface OrderFollowupState {
   reports: WeeklyReport[]
 }
 /** Supplied only by the host after verifying the current human liaison turn. */
-export interface FollowupOwnerEvidence { sessionId: string; messageId: string; text: string; at?: string }
+export interface FollowupOwnerEvidence { sessionId: string; messageId: string; text: string; at?: string
+  locator?: { sessionId: string; traceId: string; messageId: string } }
 type Body = Record<string, unknown>
 type Read = (session: V2Session) => Promise<V2Transcript>
 
@@ -69,18 +70,20 @@ function scopedRecord(raw: Body, messages: Map<string, V2Message>, session: V2Se
   let original: string
   if (raw.messageId === undefined && owner) {
     if (!owner.sessionId || !owner.messageId || owner.at && !Number.isFinite(Date.parse(owner.at))) return workspaceError(409, '请重新打开本轮接口人对话')
-    source = { kind: 'liaison', sessionId: owner.sessionId, messageId: owner.messageId, author: '我', at: owner.at ?? recordedAt }
+    source = { kind: 'liaison', sessionId: owner.sessionId, messageId: owner.messageId, ...owner.locator, author: '我', at: owner.at ?? recordedAt }
     original = owner.text
   } else {
     const message = messages.get(requireText(raw.messageId, '会话发言标识', 512))
     if (!message) return workspaceError(404, '这张工单的负责会话中没有这条原话')
     if (!Number.isFinite(Date.parse(message.at))) return workspaceError(409, '原话缺少可核对的时间')
-    source = { kind: 'session', sessionId: session.id, messageId: message.id, author: message.author, at: message.at }
+    source = { kind: 'session', sessionId: session.id, messageId: message.id, author: message.author, at: message.at,
+      ...(message.traceId && {traceId: message.traceId}) }
     original = message.text
   }
   if (!original.includes(quote)) return workspaceError(409, '引文与该条发言不符，请从原话中选择')
   if (person && !original.includes(person)) return workspaceError(409, '请沿用这条原话里的人物称呼，也可以留空')
-  const id = workspaceFingerprint([source.kind, source.sessionId, source.messageId, quote])
+  const id = workspaceFingerprint([source.kind, source.kind === 'liaison' && owner ? owner.sessionId : source.sessionId,
+    source.kind === 'liaison' && owner ? owner.messageId : source.messageId, quote])
   return { id, kind, quote, ...(person && {person}), ...(dueAt && {dueAt}), source, recordedAt }
 }
 
@@ -90,15 +93,24 @@ export class WorkspaceFollowup {
   constructor(private readonly store: WorkspaceV2Store, private readonly read: Read, private readonly current: () => void,
     private readonly timeZone: string, private readonly now: () => Date = () => new Date(), private readonly allowedSources?: (order:V2Delegation)=>Set<string>) {}
 
+  private sourceView(workspaceId: string, source: CommitmentSource): CommitmentSource {
+    const sessionDeletedAt = source.kind === 'session' ? this.store.reference(workspaceId, 'session', source.sessionId)?.deletedAt : undefined
+    return sessionDeletedAt ? {...source, sessionDeletedAt} : source
+  }
+
   view(workspaceId: string, orderId: string, reportId?: string): FollowupView {
     this.current()
+    const order = this.store.delegation(workspaceId, orderId)
+    const sessionDeletedAt = this.store.reference(workspaceId, 'session', order.sessionId)?.deletedAt
     const state = this.store.followupState(workspaceId, orderId)
     const at = this.now()
     const schedule = state.schedule
     return { scope: this.store.scope, workspaceId, orderId, timeZone: this.timeZone, currentWeek: localWeek(at, this.timeZone),
-      commitments: state.commitments.map(row => present(row, at, this.timeZone)),
+      ...(sessionDeletedAt && {sessionDeletedAt}),
+      commitments: state.commitments.map(row => ({...present(row, at, this.timeZone), source: this.sourceView(workspaceId, row.source)})),
       schedule: schedule ? { enabled: schedule.enabled, weekday: schedule.weekday, time: schedule.time } : null,
-      reports: [...state.reports].sort((a, b) => b.week.localeCompare(a.week)), ...(reportId && {reportId}) }
+      reports: [...state.reports].sort((a, b) => b.week.localeCompare(a.week))
+        .map(report => ({...report, sources: report.sources.map(source => this.sourceView(workspaceId, source))})), ...(reportId && {reportId}) }
   }
 
   workspaceView(workspaceId: string, offset = 0, sessionId?: string) {
@@ -107,7 +119,8 @@ export class WorkspaceFollowup {
     const at = this.now()
     const open = this.store.followupsIn(workspaceId, sessionId).flatMap(({order, commitments}) =>
       commitments.filter(row => !row.resolvedAt).map(row => ({ orderId: order.id, orderTitle: order.title,
-        orderStatus: order.status, paused: !!order.paused, sessionId: order.sessionId, commitment: present(row, at, this.timeZone) })))
+        orderStatus: order.status, paused: !!order.paused, sessionId: order.sessionId, commitment: {...present(row, at, this.timeZone),
+          source: this.sourceView(workspaceId, row.source)} })))
     const end = offset + 20
     return {scope: this.store.scope, workspaceId, timeZone: this.timeZone, items: open.slice(offset, end),
       total: open.length, ...(end < open.length && {nextOffset: end})}
@@ -137,6 +150,7 @@ export class WorkspaceFollowup {
       return workspaceError(409, '工单指示已变更，请重新打开工单')
     }
     const disable = body.action === 'schedule' && body.enabled === false
+    if (!disable) this.store.session(workspaceId, order.sessionId)
     checkOrder(order, disable)
     const at = this.now()
     if (body.action === 'draft') {

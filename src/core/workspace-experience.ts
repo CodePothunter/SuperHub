@@ -8,6 +8,7 @@ export interface ExperienceEvidence {
   id: string
   workspaceId?: string
   sessionId?: string
+  traceId?: string
   orderId?: string
   messageId?: string
   turnId?: string
@@ -16,6 +17,9 @@ export interface ExperienceEvidence {
   resultId?: string
   version?: string
   quote?: string
+  /** Read projection of the historical reference in its original workspace. */
+  orderDeletedAt?: string
+  sessionDeletedAt?: string
 }
 
 export interface ExperienceSupport {
@@ -42,7 +46,8 @@ export interface ExperienceMemory extends ExperienceRef {
   adoptedAt?: string
   source?: 'owner' | 'suggestion' | 'observation'
   orderId?: string
-  lastUsed?: { workspaceId: string; orderId: string; at: string }
+  orderDeletedAt?: string
+  lastUsed?: { workspaceId: string; orderId: string; at: string; orderDeletedAt?: string }
   lastDeliveredAt?: string
   situation?: string
   boundary?: string

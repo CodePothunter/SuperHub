@@ -5,6 +5,7 @@ export interface OrderResultNotice {
   workspaceId: string
   orderId: string
   sessionId: string
+  traceId?: string
   workspaceName: string
   orderTitle: string
   title: string
@@ -16,6 +17,9 @@ export interface OrderResultNotice {
   reportId?: string
   /** The order has been completed since (shown with the result). */
   orderDone?: true
+  /** View only: the original links were removed after this report was saved. */
+  orderDeletedAt?: string
+  sessionDeletedAt?: string
   attachments: (V2AttachmentRef & {version: string})[]
 }
 export interface ResultNoticeList {

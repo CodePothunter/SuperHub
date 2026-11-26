@@ -4,7 +4,7 @@ import { pagedReadsFromV2Read } from './paged-read-mock.ts'
 import type { V2Delegation, V2Message, V2Session, V2WorkspaceView } from '../src/core/workspace-v2.ts'
 import type { Scoped } from '../src/client/superhub-api.ts'
 import * as api from '../src/client/workspace-v2-api.ts'
-import { WorkOrderPage } from '../src/client/workspace-v2.tsx'
+import { Overview, WorkOrderPage } from '../src/client/workspace-v2.tsx'
 import { ConversationBoard } from '../src/client/workspace-v2-talk.tsx'
 import { HistoryPanel } from '../src/client/workspace-history.tsx'
 import { isSessionView } from '../src/client/workspace-v2-response.ts'
@@ -37,6 +37,33 @@ afterEach(() => vi.restoreAllMocks())
 beforeEach(() => pagedReadsFromV2Read())
 
 describe('工单页即对话', () => {
+  it('keeps an order and its agreements visible after deleting its session', () => {
+    mockReads({})
+    const orphan = {...order, sessionDeletedAt:at}
+    const remaining = {...view, sessions:[], orders:[orphan], delegations:[orphan]}
+    const overview = renderToStaticMarkup(<Overview view={remaining} openJob={vi.fn()} openSession={vi.fn()} delegate={vi.fn()} create={vi.fn()}/>)
+    expect(overview).toContain('所属会话已删除')
+    expect(overview).toContain(order.title)
+    const html = page(orphan, true, remaining)
+    expect(html).toMatch(/所属会话<\/dt><dd>已删除/)
+    expect(html).toContain('删除工单')
+    expect(html).toContain('标为完成')
+    expect(html).not.toContain('暂停工单')
+    expect(html).not.toMatch(/aria-label="发言"/)
+  })
+
+  it('allows editing only eligible owner messages on the active trace and labels deleted order references', () => {
+    const rows = [{...messages[0], canEdit:true},{...messages[3],canEdit:true,workOrderDeletedAt:at}]
+    mockReads(transcript({messages:rows,traceId:'initial',activeTraceId:'initial'}))
+    expect(page(order,true).match(/aria-label="编辑历史消息"/g)).toHaveLength(1)
+    mockReads(transcript({messages:rows,traceId:'initial',activeTraceId:'trace-2'}))
+    const html = page(order,true)
+    expect(html).toContain('编辑前的对话')
+    expect(html).toContain('返回当前对话')
+    expect(html).toContain('工单已删除')
+    expect(html).not.toMatch(/aria-label="编辑历史消息"|aria-label="发言"/)
+  })
+
   it('opens the order as its conversation, with the order\'s details in a side panel on a wide workspace', () => {
     mockReads(transcript())
     const html = page(order, true)

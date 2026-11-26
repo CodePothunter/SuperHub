@@ -4,6 +4,7 @@ import { reportFromText } from '../core/report.ts'
 import { messageWorkOrder, type V2Attachment, type V2Delegation, type V2DialogueSource, type V2Session, type V2Workspace } from '../core/workspace-v2.ts'
 import { workspaceError, workspaceFingerprint } from './superhub-goals.ts'
 import { mutationKey, type WorkspaceV2Store } from './workspace-v2-store.ts'
+import { INITIAL_WORKSPACE_TRACE } from './workspace-dialogue-trace.ts'
 
 export interface StoredResult extends Omit<OrderResultNotice, 'orderTitle' | 'workspaceName'> { text: string; requestId?: string }
 
@@ -35,6 +36,7 @@ function orderResults(scope: string, space: V2Workspace, order: V2Delegation, se
     const version = workspaceFingerprint([text,attachments])
     results.push({id:workspaceFingerprint([scope,space.id,order.id,session.id,message.id,version]),version,
       workspaceId:space.id,orderId:order.id,sessionId:session.id,
+      ...session.traceId && {traceId: session.traceId},
       messageId:message.id,requestId,title:attachments[0]?.label || (report?.partial ? '阶段回报' : '工单回报'),
       kind:report?.partial ? 'partial' : 'report',at:message.at,read:false,attachments,text})
   }
@@ -44,6 +46,7 @@ function orderResults(scope: string, space: V2Workspace, order: V2Delegation, se
 /** A member's line of a roster group for one of its orders, with the files it links as they read now. */
 export interface GroupResultLine {
   seq: number; at: string; text: string; orderId: string
+  traceId?: string
   files: (Pick<V2Attachment, 'id' | 'label' | 'format' | 'content'>)[]
 }
 
@@ -70,6 +73,7 @@ export function groupResults(scope: string, space: V2Workspace, session: V2Sessi
     const messageId = 'g-' + line.seq
     results.push({id: workspaceFingerprint([scope, space.id, line.orderId, session.id, messageId, version]), version,
       workspaceId: space.id, orderId: line.orderId, sessionId: session.id, messageId,
+      ...line.traceId && {traceId: line.traceId},
       title: attachments[0]?.label || (report?.partial ? '阶段回报' : '工单回报'),
       kind: report?.partial ? 'partial' : 'report', at: line.at, read: false, attachments, text})
   }
@@ -101,9 +105,11 @@ export class WorkspaceResultNotices {
     private readonly recorded?: (result: StoredResult) => void) {}
 
   private present({text, requestId, ...notice}: StoredResult): OrderResultNotice {
-    const order = this.store.delegation(notice.workspaceId, notice.orderId)
+    const order = this.store.reference(notice.workspaceId, 'order', notice.orderId)
+    const session = this.store.reference(notice.workspaceId, 'session', notice.sessionId)
     const workspaceName = this.store.workspace(notice.workspaceId).name
-    return {...notice, orderTitle:order.title, workspaceName, ...(order.status === 'done' && {orderDone: true as const})}
+    return {...notice, orderTitle:order?.title ?? '原工单', workspaceName, ...(order?.status === 'done' && {orderDone: true as const}),
+      ...(order?.deletedAt && {orderDeletedAt: order.deletedAt}), ...(session?.deletedAt && {sessionDeletedAt: session.deletedAt})}
   }
 
   collect(requestId?: string) {
@@ -118,7 +124,7 @@ export class WorkspaceResultNotices {
     for (const check of this.store.uncheckedResults(requestId)) {
       try {
         const {order} = check
-        const session = this.store.session(order.workspaceId, order.sessionId)
+        const session = this.store.turnTrace(this.store.session(order.workspaceId, order.sessionId), check.requestId)
         const evidence = this.source.savedResults(session, check.requestId)
         if (!evidence) continue
         if (check.state === 'unknown') this.store.confirmTurn(session, check.requestId)
@@ -146,14 +152,15 @@ export class WorkspaceResultNotices {
   detail(id: string) {
     this.current()
     const record = this.store.resultNotice(id)
-    this.store.delegation(record.workspaceId, record.orderId)
     return {notice:this.present(record),text:record.text}
   }
   attachment(id: string, fileId: string) {
     this.current()
     const notice = this.store.resultNotice(id)
-    const order = this.store.delegation(notice.workspaceId, notice.orderId)
-    const session = this.store.session(order.workspaceId, order.sessionId)
+    const origin = this.store.resultSource(notice)
+    if (!origin) return workspaceError(404,'这条提醒没有这份附件')
+    const {order} = origin
+    const session = this.store.traceBinding(origin.session, notice.traceId ?? INITIAL_WORKSPACE_TRACE)
     const ref = notice.attachments.find(file => file.id === fileId)
     if (ref && notice.sessionId === session.id && /^g-\d+$/.test(notice.messageId ?? '') && this.groups) {
       const file = this.groups.attachment(notice, fileId)
@@ -165,6 +172,6 @@ export class WorkspaceResultNotices {
     const message = snapshot?.messages.find(row => row.id === notice.messageId && messageWorkOrder(session,row) === order.id)
     const file = message?.attachments?.some(row => row.id === fileId) && snapshot?.attachments.find(row => row.id === fileId)
     if (!file || fileVersion(file) !== ref.version) return workspaceError(404,'原报告的这版附件暂不可读，可查看提交时的原话')
-    return file
+    return {...file, version: ref.version}
   }
 }

@@ -40,6 +40,14 @@ function respond(prompt) {
   const group = prompt.includes(ownerTurn) ? undefined : groupRequest(prompt)
   if (!prompt.includes(ownerTurn) && group === undefined) process.exit(2)
   const request = group !== undefined ? group : ownerWords(prompt.slice(prompt.lastIndexOf(ownerTurn) + ownerTurn.length).trim())
+  if (request === '交付七天复写稿' || request === '交付三天复写稿') {
+    const revision = request === '交付七天复写稿' ? '七天' : '三天'
+    if (revision === '三天' && (!prompt.includes('复写验收共同前文') || prompt.includes('交付七天复写稿') || prompt.includes('另一张工单继续核对'))) {
+      throw new Error('群成员收到的历史超出修订边界')
+    }
+    writeFileSync('复写稿.md', '# ' + revision + '复写稿\n')
+    return {answers: ['已交付' + revision + '版本。[复写稿](复写稿.md)']}
+  }
   const createSignup = request === '请做好「周五试点」的手机报名页，让我能填写姓名并提交。' || request === '请让 Codex 做一个手机报名页，我想自己试填一下。'
   const repairSignup = request === '修复按钮，让试点报名可以重新提交。'
   if (createSignup || repairSignup) {
