@@ -3,19 +3,21 @@ import { randomUUID } from 'node:crypto'
 import { until } from './acceptance-host.mjs'
 import { button, CODEX_STAFF, openOrderInfo, say, signIn } from './workspace-browser-fixture.mjs'
 
+const messageEditor = row => row.getByRole('form', {name:'编辑历史消息', exact:true})
+
 async function revise(page, row, text) {
   await button(row, '编辑历史消息').click()
-  const editor = page.getByRole('dialog', {name:'编辑历史消息', exact:true})
+  const editor = messageEditor(row)
   await editor.getByLabel('消息正文').fill(text)
   const posted = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname.endsWith('/edit'))
-  await button(editor, '保存并重新续写').click()
+  await button(editor, '保存并续写').click()
   const response = await posted
   const receipt = await response.json()
   assert.equal(response.status(), 200, JSON.stringify(receipt))
   return {receipt, body:response.request().postDataJSON(), path:new URL(response.url()).pathname.slice('/chief/api'.length)}
 }
 
-export async function checkConversationEdits({host, desktop, mobile, scope, workspace}) {
+export async function checkConversationEdits({host, desktop, mobile, scope, workspace, picture}) {
   const root = '/v2/workspaces/' + workspace
   const scoped = (path, query = {}) => path + '?' + new URLSearchParams({scope,...query})
   const get = (path, query) => host.api(scoped(path, query))
@@ -43,8 +45,9 @@ export async function checkConversationEdits({host, desktop, mobile, scope, work
   assert.ok(original?.canEdit)
   const anchorSelector = '[data-message-id=' + JSON.stringify(original.id) + ']'
   await desktop.goto(host.base + hash({order:first.id}))
-  await button(desktop.locator(anchorSelector),'编辑历史消息').click()
-  const staleEditor = desktop.getByRole('dialog',{name:'编辑历史消息',exact:true})
+  const desktopAnchor = desktop.locator(anchorSelector)
+  await button(desktopAnchor,'编辑历史消息').press('Enter')
+  const staleEditor = messageEditor(desktopAnchor)
   const staleDraft = '保留另一窗口的改稿'
   await staleEditor.getByLabel('消息正文').fill(staleDraft)
 
@@ -52,10 +55,21 @@ export async function checkConversationEdits({host, desktop, mobile, scope, work
   await mobile.goto(host.mobileBase + hash({order:first.id}))
   const address = mobile.url()
   const anchor = mobile.locator(anchorSelector)
-  await button(anchor, '编辑历史消息').click()
-  const editor = mobile.getByRole('dialog',{name:'编辑历史消息',exact:true})
-  assert.equal(await editor.getByLabel('消息正文').inputValue(), before)
+  const pencil = button(anchor,'编辑历史消息')
+  await pencil.waitFor()
+  const target = await pencil.boundingBox()
+  assert.ok(target.width >= 44 && target.height >= 44)
+  await pencil.click()
+  const editor = messageEditor(anchor)
+  const field = editor.getByLabel('消息正文')
+  assert.equal(await field.inputValue(), before)
+  assert.ok(await field.evaluate(el => el === document.activeElement))
+  assert.ok(await mobile.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1))
+  await field.fill('@' + CODEX_STAFF.name + ' 交付三天复写稿')
+  await picture?.(mobile,'mobile-message-edit')
   await button(editor,'取消').click()
+  await until(() => pencil.evaluate(el => el === document.activeElement), '取消后回到原消息的编辑入口')
+  await anchor.getByText('交付七天复写稿').waitFor()
   const revised = await revise(mobile, anchor, '@' + CODEX_STAFF.name + ' 交付三天复写稿')
   assert.equal(mobile.url(), address)
   assert.equal(revised.receipt.sessionId, session.id)
@@ -63,8 +77,9 @@ export async function checkConversationEdits({host, desktop, mobile, scope, work
   assert.deepEqual(await host.api(scoped(revised.path),revised.body), revised.receipt)
   await assert.rejects(post(revised.path, {...revised.body, requestId:randomUUID()}), {status:409})
   await desktop.bringToFront()
+  await rows.locator('[data-message-id=' + JSON.stringify(revised.receipt.messageId) + ']').waitFor()
   const conflict = desktop.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname.endsWith('/edit'))
-  await button(staleEditor,'保存并重新续写').click()
+  await button(staleEditor,'保存并续写').click()
   assert.equal((await conflict).status(),409)
   await staleEditor.getByRole('alert').waitFor()
   assert.equal(await staleEditor.getByLabel('消息正文').inputValue(),staleDraft)
@@ -154,7 +169,7 @@ export async function checkConversationEdits({host, desktop, mobile, scope, work
   return {sessionPath, initial, firstOrderPath, deletedOrderPath:root + '/orders/' + second.id, files}
 }
 
-export async function checkLiaisonEdit({host, page, scope}) {
+export async function checkLiaisonEdit({host, page, scope, picture}) {
   const read = query => host.api('/chat?' + new URLSearchParams({scope,...query}))
   await page.bringToFront()
   await page.goto(host.base + '/#v2?' + new URLSearchParams({scope,view:'today'}))
@@ -172,6 +187,14 @@ export async function checkLiaisonEdit({host, page, scope}) {
   const before = await read({limit:40})
   const prior = before.messages.find(row => row.role === 'you' && row.text === previous)
   const row = liaison.locator('[data-message-id="you-' + (prior.messageId ?? prior.firstSeq ?? prior.seq) + '"]')
+  const pencil = button(row,'编辑历史消息')
+  await pencil.press('Enter')
+  const field = messageEditor(row).getByLabel('消息正文')
+  await field.fill('按 Escape 取消的试稿')
+  await picture?.(page,'desktop-liaison-edit')
+  await field.press('Escape')
+  await row.getByText(previous,{exact:true}).waitFor()
+  await until(() => pencil.evaluate(el => el === document.activeElement), 'Esc 取消编辑后仍在接口人窗口')
   const {receipt} = await revise(page,row,'请先拟三天的续写验收计划')
   assert.equal(receipt.sessionId,before.sessionId)
   await liaison.getByText('已按原前文续写三天计划。',{exact:true}).waitFor()

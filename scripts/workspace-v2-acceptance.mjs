@@ -368,8 +368,8 @@ try {
     assert.ok(session)
     return '#v2?' + new URLSearchParams({...Object.fromEntries(place), panel:'execution', session})
   }
-  const group = await checkConversationEdits({host,desktop,mobile,scope,workspace:project.id})
-  const liaisonEdit = await checkLiaisonEdit({host,page:desktop,scope})
+  const group = await checkConversationEdits({host,desktop,mobile,scope,workspace:project.id,picture})
+  const liaisonEdit = await checkLiaisonEdit({host,page:desktop,scope,picture})
   await verifyConversationRestart({host,page:desktop,scope,group,liaison:liaisonEdit})
   console.log('PASS 桌面和手机编辑原对话、回读同名旧产物及来源、单项删除并在重启后核对')
   await checkWorkspaceDesign({desktop,mobile,host,scope,password,project,groupHash:await conversationOf(groupHash),codingHash:await conversationOf(codingHash),picture})
