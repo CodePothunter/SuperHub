@@ -20,7 +20,7 @@ import { GroupEngine, GROUP_SCHEDULER_FILE, type GroupEngineOptions } from './wo
 import { keepGroupFile, readGroupFile } from './workspace-group-files.ts'
 import { GROUP_LEDGER_FILE, readGroupLedger, type GroupLine } from './workspace-group-ledger.ts'
 import { INITIAL_WORKSPACE_TRACE } from './workspace-dialogue-trace.ts'
-import { GROUP_MEMBERS_FILE, type GroupContext, type GroupMemberKind, type GroupRosterMember, type MemberCall, type MemberCallSink, type MemberReattach, type MemberRunner } from './workspace-group-members.ts'
+import { GROUP_MEMBERS_FILE, GroupMemberSessions, type GroupContext, type GroupMemberKind, type GroupRosterMember, type MemberCall, type MemberCallSink, type MemberReattach, type MemberRunner } from './workspace-group-members.ts'
 import type { GroupEffect, GroupLimits } from './workspace-group-scheduler.ts'
 import { dialogueKey } from './workspace-speaker-id.ts'
 import { scopedDirectory } from './workspace-v2-dialogue.ts'
@@ -162,6 +162,15 @@ export class WorkspaceGroupHost {
     const trace = state.traces.find(trace => trace.id === traceId)
     if (!trace) throw new Error('这场会话没有这个历史版本')
     const prefix = trace.parentId && trace.beforeSeq !== undefined ? this.lines(stored, trace.parentId).filter(line => line.seq < trace.beforeSeq!) : []
+    let inheritedLegacyThrough: number | undefined
+    if (prefix.length && this.options.experience) {
+      // Retain restrictions on old history while using fresh member bindings for execution.
+      for (let parentId = trace.parentId; parentId; parentId = state.traces.find(parent => parent.id === parentId)?.parentId) {
+        if (!new GroupMemberSessions(this.paths(stored, parentId).dir).hasLegacyExperience()) continue
+        inheritedLegacyThrough = prefix.at(-1)?.seq
+        break
+      }
+    }
     const workspaceId = stored.workspaceId, groupId = stored.id
     const current = () => this.options.store.session(workspaceId, groupId)
     const canStart = () => {
@@ -172,6 +181,7 @@ export class WorkspaceGroupHost {
     engine = new GroupEngine({
       scope: this.options.scope, workspaceId, groupId, dir,
       trace: {id: traceId, prefix, nextSeq: this.allocator(stored)},
+      inheritedLegacyThrough,
       ...traceId !== INITIAL_WORKSPACE_TRACE && {idPrefix: dialogueKey(groupId, traceId).slice(0, 12) + '-'},
       canStart,
       recoveryRefusal: orderId => this.options.store.deletedReason(workspaceId, groupId, orderId),

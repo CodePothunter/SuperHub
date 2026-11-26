@@ -50,6 +50,8 @@ export interface GroupEngineOptions {
   /** 群的记录目录（`ops/superhub-v2-dialogues/<ws>/<group>`）。 */
   dir: string
   trace?: GroupLedgerTrace
+  /** End of the inherited prefix when a parent used unversioned experience. */
+  inheritedLegacyThrough?: number
   idPrefix?: string
   canStart?: () => boolean
   archiveFiles?: (files: GroupAttachment[], workDir: string) => GroupAttachment[]
@@ -790,13 +792,17 @@ export class GroupEngine {
     } catch { return false }
   }
 
+  private untrackedReplayAllowed(line: GroupLine, omitUntracked: boolean) {
+    return !omitUntracked && line.seq > (this.options.inheritedLegacyThrough ?? 0) && !this.sessions.hasLegacyExperience()
+  }
+
   /** The receiving member must also receive the versions used by any replayed member line. */
   private replayAllowed(line: GroupLine, experience: ExperienceSelection | undefined, omitUntracked = false) {
     if (!experience || line.speakerId === OWNER_ID) return true
     if (line.experienceRefs) return line.experienceRefs.every(ref =>
       experience.entries.some(entry => ref.id === entry.id && ref.version === entry.version))
     if (line.speakerId === HOST_ID || line.quote && line.ref) return true
-    return !omitUntracked && !this.sessions.hasLegacyExperience()
+    return this.untrackedReplayAllowed(line, omitUntracked)
   }
 
   /** 没有经验存储时 `undefined`（都可读）；群里没有接口人时两份都为空。 */
@@ -819,7 +825,7 @@ export class GroupEngine {
       return line.experienceRefs.every(ref => scope.own.some(entry => sameExperience(ref, entry)) || mine.some(entry => sameExperience(ref, entry)))
     }
     if (line.speakerId === HOST_ID || line.quote && line.ref) return true
-    return !omitUntracked && !this.sessions.hasLegacyExperience()
+    return this.untrackedReplayAllowed(line, omitUntracked)
   }
 
   /** 读不到的成员成果为什么读不到：该成员自己有资格用、但不是本人专属的，是他区共享或转交；否则已停用或已更新。 */

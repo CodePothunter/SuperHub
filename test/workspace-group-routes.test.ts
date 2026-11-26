@@ -1168,6 +1168,47 @@ describe('在同一工作区会话编辑主人旧消息', () => {
     expect((await f.call(outputPath.replace(workOrderId, second.delegation.id))).status).toBe(404)
   })
 
+  it('续写沿 trace 祖先保留旧经验限制，并按当前授权回放已标记的成员发言', async () => {
+    const f = fixture(), ws = await f.workspace(), group = await f.group(ws)
+    const engine = await f.host().engine(group)
+    engine.sessions.setMember('researcher', {kind: 'dsh', cwd: f.host().workDir(group), session: 'legacy-native', memories: ['旧研究经验']})
+    f.staff().apply(ws.id, {action: 'learn', staffId: 'researcher', text: '整理报告时先核对采样日期', requestId: f.id()})
+    const own = f.staff().staffOwnExperience(ws.id, 'researcher')
+    expect(own).toHaveLength(1)
+    const legacy = engine.ledger.say({kind: 'message', speakerId: 'researcher', author: '研究员', text: '来源未登记的旧经验结论'})
+    const publicLine = engine.ledger.say({kind: 'message', speakerId: 'researcher', author: '研究员', text: '团队可用的公开结论', experienceRefs: []})
+    const ownLine = engine.ledger.say({kind: 'message', speakerId: 'researcher', author: '研究员', text: '研究员的本区专属结论', experienceRefs: own})
+    for (let index = 1; index <= 13; index++) {
+      engine.ledger.say({kind: 'message', speakerId: 'owner', author: '主人', text: '报告第 ' + index + ' 项待核对'})
+    }
+    const anchor = await f.say(group, '@工程师 核对报告')
+    await vi.waitFor(() => expect(f.codex.count('engineer')).toBe(1))
+    expect(engine.projectLiaisonHistory([legacy], legacy.seq)).toEqual([])
+    f.codex.answer('engineer', '核对完毕。', false)
+
+    const url = '/' + ws.id + '/sessions/' + group.id + '/messages/'
+    const edit = (messageId: string, expectedTraceId: string, text: string) =>
+      f.call<{traceId: string; messageId: string}>(url + messageId + '/edit', {requestId: f.id(), expectedTraceId, text})
+    const first = await edit(anchor.data.messageId, 'initial', '@接口人 汇总报告')
+    expect(first.status).toBe(200)
+    await vi.waitFor(() => expect(f.dsh.count('liaison')).toBe(1))
+    const liaison = f.dsh.last('liaison').call
+    expect(liaison.prompt).toContain(publicLine.text)
+    expect(liaison.prompt).toContain(ownLine.text)
+    expect(liaison.prompt).not.toContain(legacy.text)
+    expect(liaison.group.sessions.member('researcher')).toBeUndefined()
+    expect((await f.view(group)).data.messages.some(message => message.text === legacy.text)).toBe(true)
+    f.dsh.answer('liaison', '已汇总。', false)
+
+    const second = await edit(first.data.messageId, first.data.traceId, '@工程师 评审报告')
+    expect(second.status).toBe(200)
+    await vi.waitFor(() => expect(f.codex.count('engineer')).toBe(2))
+    const engineer = f.codex.last('engineer').call
+    expect(engineer.prompt).toContain(publicLine.text)
+    expect(engineer.prompt).not.toContain(ownLine.text)
+    expect(engineer.prompt).not.toContain(legacy.text)
+  })
+
   it('旧群账本无摘要的文件不会被编辑时的同路径内容冒充', async () => {
     const f = fixture(), ws = await f.workspace(), group = await f.group(ws)
     const job = f.route().assign('unversioned-order', '由研究员交付旧报告', undefined, ws.id, group.id, {title: '旧报告', promise: '旧报告正文'}, 'researcher')
