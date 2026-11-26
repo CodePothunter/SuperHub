@@ -96,6 +96,31 @@ export interface PendingDelivery { memberId: string; outcome: Promise<GroupDeliv
 /** 空转守卫暂停了自动叫人（主人发言后恢复）：原因（账本里那一行）、何时起、被挂起等主人发言才放行的叫人数。 */
 export interface GroupPause { reason: string; since: number; parked: number; seq?: number }
 
+/**
+ * 接口人读得到哪些经验标记：自己有资格使用的版本（`own`），加上名册里每位成员本人在本区有效的专属版本（`members`，
+ * 按发言人核对）。成员之间仍按各自的选择互相隔离。
+ */
+interface LiaisonScope { own: readonly ExperienceRef[]; members: ReadonlyMap<string, readonly ExperienceRef[]>
+  /** 本轮入选的版本：接口人往自己发言上盖的标记只取这些，被派活成员按同一口径读历史，不会因此看不到任务。 */
+  stamp: readonly ExperienceRef[] }
+/** 接口人读不到原文的一条成员成果：他区共享或临时转交（`shared`）、经验已停用或已更新（`retired`）、成员已不在本群（`absent`）。 */
+export interface LiaisonGap { seq: number; speakerId: string; author: string; reason: 'shared' | 'retired' | 'absent' }
+
+const sameExperience = (left: ExperienceRef, right: ExperienceRef) => left.id === right.id && left.version === right.version
+const LIAISON_GAP_REASON: Record<LiaisonGap['reason'], string> = {
+  shared: '它依据的是他区共享或临时转交的经验',
+  retired: '它依据的经验已停用或已更新',
+  absent: '这位成员已不在本群',
+}
+/** 一条缺口的原因（给宿主说明列举用）。 */
+export const liaisonGapReason = (gap: LiaisonGap) => LIAISON_GAP_REASON[gap.reason]
+/** 缺口在接口人历史里的替身：宿主说明，不含原文、附件、原话和经验标记。 */
+export function liaisonGapText(gap: LiaisonGap): string {
+  const next = gap.reason === 'absent' ? '可以请其他成员重做这部分' : `可以请${gap.author}不依赖这条经验重新交回`
+  return `（宿主说明）${gap.author}在这里交回了结果，但${LIAISON_GAP_REASON[gap.reason]}，接口人不能读取原文。` +
+    `这不是主人能在群里授权解除的限制：不要向主人索要授权；${next}，或在汇总中注明这部分缺失。`
+}
+
 export interface GroupView {
   lines: readonly GroupLine[]
   members: GroupMemberView[]
@@ -729,18 +754,84 @@ export class GroupEngine {
     return !omitUntracked && !this.sessions.hasLegacyExperience()
   }
 
+  /** 没有经验存储时 `undefined`（都可读）；群里没有接口人时两份都为空。 */
+  private liaisonScope(triggerSeq: number, workOrderId?: string): LiaisonScope | undefined {
+    const access = this.options.experience
+    if (!access) return
+    const liaison = this.roster.find(member => member.id === LIAISON_MEMBER_ID)
+    if (!liaison) return {own: [], members: new Map(), stamp: []}
+    const selection = this.selectExperience(liaison,triggerSeq,workOrderId)
+    const own = selection?.authorized ?? [], stamp = selection?.entries ?? []
+    return {own, stamp, members: new Map(this.roster.filter(member => member.id !== LIAISON_MEMBER_ID)
+      .map(member => [member.id, access.staffOwnExperience?.(this.options.workspaceId, member.id) ?? []]))}
+  }
+
+  /** 接口人能否读这一行：每个标记都在接口人自己的范围里，或属于这行发言人本人在本区有效的专属版本。 */
+  private liaisonReadable(line: GroupLine, scope: LiaisonScope | undefined, omitUntracked = false) {
+    if (!scope || line.speakerId === OWNER_ID) return true
+    if (line.experienceRefs) {
+      const mine = scope.members.get(line.speakerId) ?? []
+      return line.experienceRefs.every(ref => scope.own.some(entry => sameExperience(ref, entry)) || mine.some(entry => sameExperience(ref, entry)))
+    }
+    if (line.speakerId === HOST_ID || line.quote && line.ref) return true
+    return !omitUntracked && !this.sessions.hasLegacyExperience()
+  }
+
+  /** 读不到的成员成果为什么读不到：该成员自己有资格用、但不是本人专属的，是他区共享或转交；否则已停用或已更新。 */
+  private liaisonGap(line: GroupLine, scope: LiaisonScope, triggerSeq: number, workOrderId?: string): LiaisonGap {
+    const member = this.roster.find(row => row.id === line.speakerId)
+    const gap = {seq: line.seq, speakerId: line.speakerId, author: line.author}
+    if (!member) return {...gap, reason: 'absent'}
+    const readable = [...scope.own, ...scope.members.get(member.id) ?? []]
+    const missing = (line.experienceRefs ?? []).filter(ref => !readable.some(entry => sameExperience(ref, entry)))
+    let authorized: readonly ExperienceRef[] = []
+    try { authorized = this.selectExperience(member,triggerSeq,workOrderId)?.authorized ?? [] } catch { /* counted as no longer valid */ }
+    return {...gap, reason: missing.length && missing.every(ref => authorized.some(entry => sameExperience(ref, entry))) ? 'shared' : 'retired'}
+  }
+
+  /** 接口人看到的这一行：可读的原样；读不到的成员发言换成宿主说明（`gaps` 收下缺口）；其余读不到的不显示。 */
+  private liaisonLine(line: GroupLine, scope: LiaisonScope | undefined, triggerSeq: number, workOrderId: string | undefined,
+    gaps?: LiaisonGap[], omitUntracked = false): GroupLine | undefined {
+    if (this.liaisonReadable(line, scope, omitUntracked)) return line
+    if (!scope || line.kind !== 'message' || !line.experienceRefs?.length || [OWNER_ID, HOST_ID, LIAISON_MEMBER_ID].includes(line.speakerId)) return
+    const gap = this.liaisonGap(line, scope, triggerSeq, workOrderId)
+    gaps?.push(gap)
+    return {seq: line.seq, at: line.at, kind: line.kind, speakerId: line.speakerId, author: line.author, text: liaisonGapText(gap), mentions: [],
+      ...line.replyTo !== undefined && {replyTo: line.replyTo}, ...line.workOrderId !== undefined && {workOrderId: line.workOrderId},
+      ...line.batchId !== undefined && {batchId: line.batchId}, ...line.engagement && {engagement: line.engagement}}
+  }
+
+  /** 接口人可读的历史（只过滤）：批次验收、回报发布及其附件用它。 */
   projectLiaisonHistory(lines: readonly GroupLine[], triggerSeq: number, workOrderId?: string) {
     const liaison = this.roster.find(member => member.id === LIAISON_MEMBER_ID)
     if (!liaison && this.options.experience) return lines.filter(line => !line.experienceRefs?.length)
-    const experience = liaison && this.selectExperience(liaison,triggerSeq,workOrderId)
-    return lines.filter(line => this.replayAllowed(line,experience))
+    const scope = this.liaisonScope(triggerSeq,workOrderId)
+    return lines.filter(line => this.liaisonReadable(line,scope))
   }
 
+  /** 接口人可读的历史，读不到原文的成员成果换成宿主说明行：交接协调用它。 */
+  projectLiaisonGaps(lines: readonly GroupLine[], triggerSeq: number, workOrderId?: string): {lines: GroupLine[]; gaps: LiaisonGap[]} {
+    const liaison = this.roster.find(member => member.id === LIAISON_MEMBER_ID)
+    if (!liaison) return {lines: this.projectLiaisonHistory(lines,triggerSeq,workOrderId), gaps: []}
+    const scope = this.liaisonScope(triggerSeq,workOrderId)
+    const gaps: LiaisonGap[] = []
+    return {lines: lines.flatMap(line => this.liaisonLine(line,scope,triggerSeq,workOrderId,gaps) ?? []), gaps}
+  }
+
+  /** 接口人读这些标记所依据的版本是否都还有效（自己的范围或发言成员本人的专属）。 */
   canUseLiaisonExperience(refs: readonly ExperienceRef[], triggerSeq: number, workOrderId?: string) {
     if (!refs.length) return true
-    const liaison = this.roster.find(member => member.id === LIAISON_MEMBER_ID)
-    const experience = liaison && this.selectExperience(liaison,triggerSeq,workOrderId)
-    return refs.every(ref => experience?.entries.some(entry => ref.id === entry.id && ref.version === entry.version))
+    const scope = this.liaisonScope(triggerSeq,workOrderId)
+    if (!scope) return true
+    const readable = [...scope.own, ...[...scope.members.values()].flat()]
+    return refs.every(ref => readable.some(entry => sameExperience(ref, entry)))
+  }
+
+  /** 接口人往自己的发言上盖的标记：只取它本轮入选的版本，不继承成员的专属标记。 */
+  liaisonExperienceRefs(lines: readonly GroupLine[], triggerSeq: number, workOrderId?: string): ExperienceRef[] {
+    const refs = [...new Map(lines.flatMap(line => line.experienceRefs ?? []).map(ref => [ref.id + '@' + ref.version, ref] as const)).values()]
+    const scope = this.liaisonScope(triggerSeq,workOrderId)
+    return scope ? refs.filter(ref => scope.stamp.some(entry => sameExperience(ref, entry))) : refs
   }
 
   /** 改调度器、执行效果、存盘、重定计时器。 */
@@ -872,12 +963,15 @@ export class GroupEngine {
       return { memberId: effect.memberId, outcome: 'queued' }
     }
     if (!runner?.steer) { this.steering.set(key, Promise.resolve(fallback())); return }
-    const lines = this.ledger.unseen(effect.memberId).filter(line => line.seq <= effect.seq && (!line.workOrderId || this.schedule.sameOrder(line.workOrderId, effect.workOrderId)))
+    let lines = this.ledger.unseen(effect.memberId).filter(line => line.seq <= effect.seq && (!line.workOrderId || this.schedule.sameOrder(line.workOrderId, effect.workOrderId)))
     const experience = this.callExperience.get(effect.callId)
     const participant = this.roster.find(row => row.id === effect.memberId)
     if (experience && participant) {
-      let current: ExperienceSelection | undefined
-      try { current = this.selectExperience(participant,effect.seq,effect.workOrderId) }
+      let current: ExperienceSelection | undefined, liaisonScope: LiaisonScope | undefined
+      try {
+        current = this.selectExperience(participant,effect.seq,effect.workOrderId)
+        if (participant.id === LIAISON_MEMBER_ID) liaisonScope = this.liaisonScope(effect.seq,effect.workOrderId)
+      }
       catch { this.steering.set(key, Promise.resolve(fallback())); return }
       const entries = experience.entries.filter(entry => current?.authorized.some(ref => ref.id === entry.id && ref.version === entry.version))
       const exposed = this.sessions.native(effect.memberId,effect.workOrderId)?.experience ?? []
@@ -886,7 +980,8 @@ export class GroupEngine {
         this.steering.set(key, Promise.resolve(fallback()))
         return
       }
-      for (let index = lines.length - 1; index >= 0; index--) if (!this.replayAllowed(lines[index]!, {...experience, entries})) lines.splice(index, 1)
+      if (liaisonScope) lines = lines.flatMap(line => this.liaisonLine(line, liaisonScope, effect.seq, effect.workOrderId) ?? [])
+      else for (let index = lines.length - 1; index >= 0; index--) if (!this.replayAllowed(lines[index]!, {...experience, entries})) lines.splice(index, 1)
     }
     if (!lines.some(line => line.seq === effect.seq)) { const own = this.ledger.get(effect.seq); if (own) lines.push(own) }
     let sent: Promise<MemberSteer>
@@ -921,8 +1016,12 @@ export class GroupEngine {
     try { refused = this.options.admit?.({ callId: effect.callId, member, by: effect.by, reason: effect.reason, ...effect.workOrderId !== undefined && { workOrderId: effect.workOrderId } }) }
     catch (error) { refused = error instanceof Error ? error.message : String(error) }
     if (refused) { this.fail(effect.callId, refused); return }
-    let group: GroupContext, experience: MemberCall['experience']
-    try { group = this.context(); experience = this.selectExperience(member, effect.triggerSeq, effect.workOrderId) }
+    let group: GroupContext, experience: MemberCall['experience'], liaisonScope: LiaisonScope | undefined
+    try {
+      group = this.context(); experience = this.selectExperience(member, effect.triggerSeq, effect.workOrderId)
+      // The liaison reads members' results built on their own staff experience; members stay isolated from each other.
+      if (experience && member.id === LIAISON_MEMBER_ID) liaisonScope = this.liaisonScope(effect.triggerSeq, effect.workOrderId)
+    }
     catch (error) { this.fail(effect.callId, error instanceof Error ? error.message : String(error)); return }
     if (experience) this.callExperience.set(effect.callId,experience)
     const info = this.options.info()
@@ -936,19 +1035,23 @@ export class GroupEngine {
       return other ? [{ name: other.name, status: row.status as GroupCallStatus, ...minutesSince(now, row.since) !== undefined && { minutes: minutesSince(now, row.since) } }] : []
     })
     const promptFor = (asFresh: boolean, authorizedOnly = false) => {
-      const lines = (asFresh ? this.ledger.all() : this.ledger.unseen(member.id)).filter(line =>
-        (!line.workOrderId || scheduler.sameOrder(line.workOrderId, effect.workOrderId)) && this.replayAllowed(line,experience,authorizedOnly))
+      const visible = (line: GroupLine) => liaisonScope
+        ? this.liaisonLine(line, liaisonScope, effect.triggerSeq, effect.workOrderId, undefined, authorizedOnly)
+        : this.replayAllowed(line,experience,authorizedOnly) ? line : undefined
+      const lines = (asFresh ? this.ledger.all() : this.ledger.unseen(member.id)).flatMap(line =>
+        (!line.workOrderId || scheduler.sameOrder(line.workOrderId, effect.workOrderId)) && visible(line) || [])
       if (asFresh && lines.length > LEDGER_FIRST_LOOK) lines.splice(0, lines.length - LEDGER_FIRST_LOOK)
       // The line that called it is always shown, also when it carries its own name (a hand-over the host wrote for it).
-      const trigger = this.ledger.get(effect.triggerSeq)
-      if (trigger && this.replayAllowed(trigger,experience,authorizedOnly) && !lines.some(line => line.seq === trigger.seq) &&
+      const raw = this.ledger.get(effect.triggerSeq)
+      const trigger = raw && visible(raw)
+      if (trigger && !lines.some(line => line.seq === trigger.seq) &&
           (asFresh || trigger.inputAttachments?.length || (this.ledger.seen(member.id) ?? 0) < trigger.seq)) {
         lines.push(trigger)
         lines.sort((a, b) => a.seq - b.seq)
       }
       const shown = new Set(lines.map(line => line.seq))
       const results = (effect.results ?? []).filter(seq => !shown.has(seq)).flatMap(seq => this.ledger.get(seq) ?? [])
-        .filter(line => line.workOrderId === effect.workOrderId && this.replayAllowed(line,experience,authorizedOnly))
+        .flatMap(line => line.workOrderId === effect.workOrderId && visible(line) || [])
       const {materials, note} = this.inputsFor(member.id, effect.workOrderId, effect.triggerSeq, [...lines, ...results])
       return {text: memberPrompt({ member, members: this.roster, info, start: effect, lines, results, busy, fresh: asFresh }) + note, inputs: materials}
     }

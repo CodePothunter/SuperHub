@@ -9,7 +9,7 @@ import { workspaceError, workspaceFingerprint } from './superhub-goals.ts'
 import { INTERJECTION_UNKNOWN, UNKNOWN_TURN, WorkspaceV2Store, commandText, mutationKey, assignmentTurn, isRosterGroup, type AcceptanceOutcome, type AssignmentStart, type EngagementJob, type GroupStart, type Mutation, type OwnerCommand } from './workspace-v2-store.ts'
 import { mentionSegments, type MentionSegment } from '../core/mentions.ts'
 import { LIAISON_MEMBER_ID } from './workspace-group-members.ts'
-import { GROUP_COMMANDS_FILE, type GroupEngine, type GroupDeliveryOutcome } from './workspace-group-engine.ts'
+import { GROUP_COMMANDS_FILE, liaisonGapReason, type GroupEngine, type GroupDeliveryOutcome } from './workspace-group-engine.ts'
 import type { WorkspaceGroupHost } from './workspace-group-host.ts'
 import { GROUP_LEDGER_FILE, memberCompletionEvidenceId, readGroupLedger, type GroupAttachment, type GroupLine } from './workspace-group-ledger.ts'
 import { HOST_ID, OWNER_ID, type GroupEffect } from './workspace-group-scheduler.ts'
@@ -880,13 +880,18 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     if (!job.decision) {
       const order = job.orderId && store.delegation(session.workspaceId, job.orderId)
       const original = order && (order.hasOriginal ? store.orderOriginal(session.workspaceId, order.id).text : order.promise)
-      const history = engine.projectLiaisonHistory(engine.ledger.all().filter(row => row.kind !== 'progress' &&
+      // Members' results built on their own staff experience are readable; what stays unreadable becomes a host note.
+      const {lines: history, gaps} = engine.projectLiaisonGaps(engine.ledger.all().filter(row => row.kind !== 'progress' &&
         (row.workOrderId === job.orderId || row.seq === job.triggerSeq)), triggerSeq, job.orderId)
       const visibleLine = history.find(row => row.seq === line.seq)
-      const source = visibleLine ?? {...line, text:'成员已交回结果，当前接口人未获准读取其中的经验来源。', attachments:undefined, quote:undefined}
-      const experienceRefs = [...new Map(history.flatMap(row => row.experienceRefs ?? [])
+      const source = visibleLine ?? {...line, text: '（宿主说明）这条发言依据的经验已停用、已更新或无法核对，接口人不能读取原文。这不是主人能在群里授权解除的限制。',
+        attachments: undefined, inputAttachments: undefined, quote: undefined}
+      // Re-checked after the model call; the liaison's own lines carry only the versions it may use itself.
+      const readableRefs = [...new Map(history.flatMap(row => row.experienceRefs ?? [])
         .map(ref=>[JSON.stringify(ref),ref] as const)).values()]
-      const evidence = new Map((order ? store.groupEvidence(order.id) : []).map(row => [row.messageId!, row]))
+      const experienceRefs = engine.liaisonExperienceRefs(history, triggerSeq, job.orderId)
+      const gapSeqs = new Set(gaps.map(gap => lineId(gap.seq)))
+      const evidence = new Map((order ? store.groupEvidence(order.id) : []).filter(row => !gapSeqs.has(row.messageId!)).map(row => [row.messageId!, row]))
       const sourceLine = engagementMessage(session, source, visibleLine ? evidence : new Map())
       const recent = history.slice(-16)
       const earlier = history.slice(0, -16).filter(row => row.seq === job.triggerSeq || order &&
@@ -913,7 +918,9 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         else decision = {kind: 'wait', reason: '接口人暂时无法核实本轮结果，请在原会话重试或调整交办。'}
       }
       if (disposed || !store.engagementActive(job.id) || (job.turn !== 'owner' && ownerSeen !== latestOwnerSeq())) return
-      if (!engine.canUseLiaisonExperience(experienceRefs, triggerSeq, job.orderId)) return
+      if (!engine.canUseLiaisonExperience(readableRefs, triggerSeq, job.orderId)) return
+      // Only the liaison's own question can repeat an unreadable-result obstacle; the host's quota and loop questions stand.
+      const modelAsk = decision.kind === 'ask' ? decision : undefined
       const selected = new Set(engine.members().map(member => member.id))
       const busy = engine.workInFlight().filter(member => member.workOrderId === job.orderId)
       const memberIds = [...new Set(decision.memberIds ?? [])].filter(id => selected.has(id) && !busy.some(member => member.id === id))
@@ -956,6 +963,22 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         !store.engagementCheckpoints(order.id, order.generation).includes('final') && !pending.length) {
         decision = {kind: 'wait', reason: '本轮已有记录，接口人尚未确定下一执行步骤或验收条件。请在原会话补充要求或继续。'}
       }
+      // The same unreadable results after the owner already answered: no owner reply can lift them, so the host says so once.
+      let gapNote: string | undefined
+      if (decision.kind === 'ask' && decision === modelAsk && gaps.length && order) {
+        const answeredSeq = Math.max(store.lastOwnerAnswerSeq(order.id, order.generation) ?? -1, answer ? line.seq : -1)
+        const fresh = history.some(row => row.seq > answeredSeq && row.kind === 'message' && !gapSeqs.has(lineId(row.seq)) &&
+          ![OWNER_ID, HOST_ID, LIAISON_MEMBER_ID].includes(row.speakerId))
+        if (answeredSeq >= 0 && !fresh) {
+          gapNote = '（宿主说明）以下成员交回的结果接口人读不到原文，主人在群里答复或授权都无法解除：\n' +
+            gaps.map(gap => '- ' + gap.author + '（群消息 #' + gap.seq + '）：' + liaisonGapReason(gap)).join('\n') +
+            '\n可以请这些成员不依赖这条经验重新交回，或先汇总可读部分并注明缺失。'
+          // An answered item still hands the reply to the liaison, which now reads the host notes in place of the results.
+          decision = answer ? {kind: 'none', resolved: [answer.id]} :
+            {kind: 'wait', reason: '部分成员成果接口人读不到原文，等待成员重新交回或先汇总可读部分。', resolved: decision.resolved}
+        }
+      }
+      if (gapNote) engine.note({speaker: 'liaison', text: gapNote, workOrderId: job.orderId, ref: job.id + '-gap', experienceRefs: []})
       // The item just answered is settled: asking it again opens a new item.
       const existingQuestion = pending.find(row => row.id !== answer?.id && (row.question === decision.text || lineSeq(row.messageId) === decision.sourceSeq))
       const sameMessage = line.speakerId === LIAISON_MEMBER_ID && decision.text && line.text.includes(decision.text)
@@ -1119,7 +1142,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     if (row.pass) tell('done', order, turnId, '「' + order.title + '」已完成，接口人验收通过。打开工单查看成果。')
     const originalRows = engine.ledger.all().filter(line => line.workOrderId === row.orderId && line.seq <= Math.max(...row.group?.results ?? []))
     const trigger = originalRows.find(line => line.seq === row.group?.results[0])?.replyTo ?? row.group?.results[0] ?? 0
-    const experienceRefs = engine.projectLiaisonHistory(originalRows, trigger, row.orderId).flatMap(line=>line.experienceRefs ?? [])
+    const experienceRefs = engine.liaisonExperienceRefs(engine.projectLiaisonHistory(originalRows, trigger, row.orderId), trigger, row.orderId)
     let line: GroupLine
     if (row.followUp === 'group') {
       engine.refreshMembers()
