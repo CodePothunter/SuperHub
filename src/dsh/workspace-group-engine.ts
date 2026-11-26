@@ -39,7 +39,7 @@ export const GROUP_REPLY = '直接写正文，不要加自己的名字前缀。�
  */
 export const GROUP_DELIVERY = '交付文件时在回复里写成 `[名字](相对路径)` 链接（相对于你干活的目录；.md、.txt、.html，单个不超过 512 KB），主人能直接打开。亲手为工单交出最终的纯文字结果时第一行写「工单回报」，只交了一部分、还有事没做完时写「阶段回报」；汇总或转述别人交回的结果不用这两个开头。'
 /** 管理员（接口人）的说明（DS-Bot groups.js:186-191 `adminNote`）。 */
-export const GROUP_ADMIN_NOTE = '你是本群管理员。主人没有 @ 人的话先交给你：能直接回答就答，需要动手的按成员在本工作区的分工 @ 对应成员派活（主人点了名的照点名）；@所有人 会叫起全员。你派出的活全部交回后，SuperHub 会再叫你一次，那时核对结果、替主人汇总；结果不够就 @ 原来的人追问。'
+export const GROUP_ADMIN_NOTE = '你是本群管理员。主人没有 @ 人的话先交给你：能直接回答就答，需要动手的按成员在本工作区的分工 @ 对应成员派活（主人点了名的照点名）；@所有人 会叫起全员。你派出的活全部交回后，SuperHub 会再叫你一次，那时核对结果、替主人汇总；结果不够就 @ 原来的人追问。主人在群里要求给本工作区加幕僚，或改幕僚的执行方式（DSH、Codex、Claude Code）、模型时，直接用 chief_staff 的 create 或 update，workspace 可不填，不用请主人去私聊。'
 
 export interface GroupInfo { workspaceName: string; goal: string; title: string }
 
@@ -540,7 +540,7 @@ export class GroupEngine {
    * 同一 `ref` / 请求号只写一次。
    */
   note(input: { speaker: 'owner' | 'liaison'; text: string; workOrderId?: string; inputAttachments?: ChatInputAttachment[]; ref?: string; requestId?: string;
-    quote?: GroupLine['quote']; engagement?: GroupLine['engagement']; experienceRefs?: GroupLine['experienceRefs'] }): GroupLine {
+    quote?: GroupLine['quote']; engagement?: GroupLine['engagement']; experienceRefs?: GroupLine['experienceRefs']; replyTo?: number }): GroupLine {
     const past = (input.ref ? this.ledger.byRef(input.ref) : undefined) ?? (input.requestId ? this.ledger.byRequest(input.requestId) : undefined)
     if (past) return past
     if (this.viewOnly) throw new Error(WORKSPACE_ARCHIVED)
@@ -548,6 +548,7 @@ export class GroupEngine {
     const speaker = input.speaker === 'owner' ? { speakerId: OWNER_ID, author: OWNER_NAME } : admin ? { speakerId: admin.id, author: admin.name } : { speakerId: HOST_ID, author: HOST_NAME }
     const line = this.ledger.say({ kind: 'message', ...speaker, text: input.text, mentions: [],
       ...input.workOrderId !== undefined && { workOrderId: input.workOrderId }, ...input.ref !== undefined && { ref: input.ref },
+      ...input.replyTo !== undefined && { replyTo: input.replyTo },
       ...input.requestId !== undefined && { requestId: input.requestId }, ...input.quote && { quote: input.quote }, inputAttachments: input.inputAttachments,
       engagement: input.engagement, experienceRefs: input.experienceRefs })
     try { this.options.onChange?.() } catch (error) { this.options.logger?.warn('群聊变动的后续处理出错：%s', String(error)) }
@@ -568,9 +569,10 @@ export class GroupEngine {
   }
 
   dispatchEngagement(request: string, members: string[], text: string, workOrderId?: string,
-    handoff?: {original?: string; inputAttachments?: ChatInputAttachment[]; experienceRefs?: GroupLine['experienceRefs']}) {
+    handoff?: {original?: string; inputAttachments?: ChatInputAttachment[]; experienceRefs?: GroupLine['experienceRefs']; replyTo?: number}) {
     if (this.viewOnly) throw new Error(WORKSPACE_ARCHIVED)
     const line = this.note({speaker: 'liaison', text, workOrderId, ref: request, inputAttachments: handoff?.inputAttachments, experienceRefs:handoff?.experienceRefs,
+      ...(handoff?.replyTo !== undefined && {replyTo: handoff.replyTo}),
       ...(handoff?.original && {quote: {label: '主人原话', text: handoff.original}})})
     this.handle(s => s.dispatchEngagement(request, members, {triggerSeq: line.seq, note: '接口人请你继续处理这一项', workOrderId}), true, true)
     return line
@@ -581,6 +583,19 @@ export class GroupEngine {
 
   /** 工单的指示变了：为它进行的工作叫停。 */
   stopOrder(workOrderId: string, text?: string) { this.handle(s => s.stopOrder(workOrderId, text)) }
+
+  /**
+   * The owner's words a running liaison call acts on, as the host recorded them: the owner line that called it, or the
+   * owner line the host handed over to it (its hand-over line replies to it). Member, wake-up and review calls have none.
+   */
+  ownerSourceOf(callId: string): GroupLine | undefined {
+    const call = this.schedule.calls.find(row => row.id === callId)
+    if (!call || call.memberId !== LIAISON_MEMBER_ID || !['speaking', 'working', 'approval'].includes(call.status)) return
+    const owner = (line?: GroupLine) => line?.speakerId === OWNER_ID && line.kind === 'message' && line.requestId ? line : undefined
+    const trigger = this.ledger.get(call.triggerSeq)
+    return call.by === OWNER_ID ? owner(trigger)
+      : call.by === HOST_ID && trigger?.speakerId === LIAISON_MEMBER_ID && trigger.replyTo !== undefined ? owner(this.ledger.get(trigger.replyTo)) : undefined
+  }
 
   workInFlight() {
     return this.schedule.calls.filter(call => this.schedule.currentEngagement(call))

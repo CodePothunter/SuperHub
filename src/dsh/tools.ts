@@ -132,7 +132,13 @@ const clipTitle = (text: string) => text.length > 40 ? text.slice(0, 39) + '…'
 /** 定时安排（src/dsh/schedules.ts）：接口人的 chief_schedule 用。 */
 export interface ScheduleAccess { store: ScheduleStore; timeZone: string; now?: () => Date }
 
-export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomExecution?: RequestRoomExecution; connectors?: Connectors; isLiaison: (id: string) => boolean; lookup: AgentLookup; worklines?: Worklines; readOnlyExecution?: (id: string) => boolean; executionBinding?: (id: string) => { ticketId: string; assignmentId: string } | undefined; schedules: ScheduleAccess; ui: UiControl; control: ChiefControl; importer: Importer; exporter: Exporter; superhub?: SuperhubIntake; inputAttachments?: ChatAttachments; groups?: Pick<WorkspaceGroupHost, 'refresh'>; modelDefaults?: () => ModelDefaults; workspaceStore: WorkspaceV2Store; staffStore?:WorkspaceStaffStore; learning?: ExperienceLearning; assign?: ReturnType<typeof workspaceV2Routes>['assign']; follow?: ReturnType<typeof workspaceV2Routes>['follow']; orderFollowup:OrderFollowupAccess; calendarWeek: (day?: string) => Promise<CalendarWeek>; personDetail: (id:string) => Promise<HistoryDetail> }): (() => void)[] {
+/**
+ * A workspace group member's DSH session as the host sees it: its group's workspace while a call runs, and the owner's
+ * words that call acts on (only for the liaison's call that an owner line started or that hands over an owner reply).
+ */
+export interface GroupTurn { workspaceId?: string; owner?: { requestId: string; text: string } }
+
+export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomExecution?: RequestRoomExecution; connectors?: Connectors; isLiaison: (id: string) => boolean; lookup: AgentLookup; worklines?: Worklines; readOnlyExecution?: (id: string) => boolean; executionBinding?: (id: string) => { ticketId: string; assignmentId: string } | undefined; schedules: ScheduleAccess; ui: UiControl; control: ChiefControl; importer: Importer; exporter: Exporter; superhub?: SuperhubIntake; inputAttachments?: ChatAttachments; groups?: Pick<WorkspaceGroupHost, 'refresh'>; groupTurn?: (agentId: string) => GroupTurn | undefined; modelDefaults?: () => ModelDefaults; workspaceStore: WorkspaceV2Store; staffStore?:WorkspaceStaffStore; learning?: ExperienceLearning; assign?: ReturnType<typeof workspaceV2Routes>['assign']; follow?: ReturnType<typeof workspaceV2Routes>['follow']; orderFollowup:OrderFollowupAccess; calendarWeek: (day?: string) => Promise<CalendarWeek>; personDetail: (id:string) => Promise<HistoryDetail> }): (() => void)[] {
   const { engine, brain, roster, inputAttachments } = deps
   const attachmentWriteGuard = (agent: Agent | undefined) => {
     if (agent && deps.isLiaison(agent.id) && nativeAttachmentOnlyTurn(agent.session?.snapshotEvents() ?? [])) {
@@ -225,7 +231,24 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
    * its page), with its own executor and model when the owner names them. The workspace must be named in the owner's
    * words; nothing is saved on any refusal. A retry of the same owner turn returns the same result.
    */
+  const groupTurnOf = (execution: ToolExecution) => {
+    const id = (execution as ToolExecution & { agent?: { id: string } }).agent?.id
+    return id ? deps.groupTurn?.(id) : undefined
+  }
   const ownerWorkspace = (args: Record<string, unknown>, execution: ToolExecution, refusal: string) => {
+    // In a workspace group only the owner's own line (or its hand-over) authorizes, and only for the group's workspace.
+    const group = groupTurnOf(execution)
+    if (group) {
+      if (!group.owner || !group.workspaceId) throw new Error('群里只有主人亲口提出、正由接口人接手的这一回合，才能给本工作区加人或改幕僚。未改动；需要时请主人在群里直接说。')
+      const space = deps.workspaceStore.workspace(group.workspaceId)
+      const named = str(args.workspace)
+      if (named && named.normalize('NFC') !== space.name.normalize('NFC')) {
+        throw new Error('在「' + space.name + '」的群里只能管本工作区的幕僚，未改动。要改「' + named + '」的幕僚，请主人在那个工作区的群里或作战台私聊提出。')
+      }
+      if (workspaceArchived(space)) throw new Error(archivedRefusal(space.name))
+      if (!deps.staffStore) throw new Error('当前宿主无法管理工作区幕僚。')
+      return { source: { requestId: group.owner.requestId, text: group.owner.text }, space, store: deps.staffStore }
+    }
     const { source, events } = ownerSource(execution, refusal)
     const named = str(args.workspace)
     if (!named) throw new Error('workspace 需要是主人点名的工作区名称；主人没提工作区时不填，改的是全局幕僚。')
@@ -1120,7 +1143,9 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
         })
         if (args.action === 'list') return { staff: list() }
         guard(execution)
-        if (args.workspace !== undefined && args.workspace !== null && args.workspace !== '') {
+        const inGroup = !!groupTurnOf(execution)
+        if (inGroup && args.action !== 'create' && args.action !== 'update') throw new Error('群里不能让全局幕僚退休或改全局角色卡，未改动。请主人在作战台私聊提出。')
+        if (inGroup || args.workspace !== undefined && args.workspace !== null && args.workspace !== '') {
           if (args.action === 'create') return createWorkspaceStaff(args, execution)
           if (args.action === 'update') return updateWorkspaceStaff(args, execution)
           throw new Error('workspace 只用于 create 和 update：给工作区加或改专属幕僚。退休专属幕僚请主人在工作区的幕僚卡操作。')

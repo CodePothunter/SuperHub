@@ -908,7 +908,13 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
       remind: (key, text, order, options) => { outbox.enqueue(key, text, new Date(), undefined, { ...order && { order }, ...options?.localOnly && { localOnly: true } }) } })
     releases.push(() => v2Routes.dispose())
     v2Routes.recover()
-    releases.push(...registerTools(ctx, { ...deps, calendarWeek: day => calendarRoutes.week(day), personDetail:historyRoutes.personDetail, isLiaison, lookup, readOnlyExecution: (id: string) => executors.readOnly(id), executionBinding: (id: string) => executors.binding(id), schedules: { store: schedules, timeZone }, ui, control: opts.control, importer, exporter, superhub, modelDefaults, workspaceStore, staffStore, learning, assign: v2Routes.assign, follow: v2Routes.follow, orderFollowup: v2Routes.followup, groups: groupHost, inputAttachments }))
+    releases.push(...registerTools(ctx, { ...deps, calendarWeek: day => calendarRoutes.week(day), personDetail:historyRoutes.personDetail, isLiaison, lookup, readOnlyExecution: (id: string) => executors.readOnly(id), executionBinding: (id: string) => executors.binding(id), schedules: { store: schedules, timeZone }, ui, control: opts.control, importer, exporter, superhub, modelDefaults, workspaceStore, staffStore, learning, assign: v2Routes.assign, follow: v2Routes.follow, orderFollowup: v2Routes.followup, groups: groupHost, inputAttachments,
+      groupTurn: agentId => {
+        if (!dshMembers.isMemberSession(agentId)) return undefined
+        const call = dshMembers.callOf(agentId)
+        const owner = call?.memberId === LIAISON_MEMBER_ID ? groupHost.ownerTurn(call.groupId, call.callId) : undefined
+        return { ...call && { workspaceId: call.workspaceId }, ...owner?.requestId && { owner: { requestId: owner.requestId, text: owner.text } } }
+      } }))
     for (const agent of ctx.agents.list?.() ?? []) rooms.attachContext(agent)
     const legacyRoutes = runtimeRoutes({ ...deps, approvals, chat, liaisonSeen, custom, exporter, superhub, inputAttachments, llm: () => ctx.get('llm') })
     const workspaceRoutes = superhubWorkspaceRoutes({ scope: brainScope, engine, brain, trace, superhub, goals, saa, rooms, commands: () => approvals.list() })

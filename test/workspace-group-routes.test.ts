@@ -1444,3 +1444,42 @@ describe('专属幕僚的执行器与模型', () => {
     expect(global).toMatchObject({status: 409, data: {error: expect.stringContaining('以全局角色卡为准')}})
   })
 })
+
+describe('群里接口人回合的主人来源', () => {
+  const waitFor = (check: () => void | Promise<void>) => vi.waitFor(check, {timeout: 3000, interval: 15})
+
+  it('只有主人发言叫起、或宿主转交主人答复的接口人回合在进行时才有主人来源', async () => {
+    const question = '六爻卦师用哪个模型？'
+    const f = fixture({coordinate: async input => {
+      if (input.turn === 'liaison' && input.source.text === question) return {kind: 'ask', text: question, sourceSeq: input.source.seq}
+      return {kind: 'none'}
+    }})
+    const ws = await f.workspace(), session = await f.group(ws)
+    const source = (callId: string) => f.host().ownerTurn(session.id, callId)
+    const said = await f.say(session, '创建一个幕僚叫六爻卦师')
+    await waitFor(() => expect(f.dsh.count('liaison')).toBe(1))
+    const first = f.dsh.last('liaison').call.callId
+    expect(source(first)).toMatchObject({speakerId: 'owner', text: '创建一个幕僚叫六爻卦师', seq: Number(said.data.messageId.slice(2))})
+    // Once the turn has ended its call carries no owner words.
+    f.dsh.answer('liaison', question, false)
+    await waitFor(() => expect(source(first)).toBeUndefined())
+
+    // A member's call, and the liaison's call a member started, have none.
+    await f.say(session, '@研究员 查一下六爻引擎')
+    await waitFor(() => expect(f.dsh.count('researcher')).toBe(1))
+    expect(source(f.dsh.last('researcher').call.callId)).toBeUndefined()
+    f.dsh.answer('researcher', '@接口人 引擎在 divination/liuyao.py，请你看看', false)
+    await waitFor(() => expect(f.dsh.count('liaison')).toBe(2))
+    expect(source(f.dsh.last('liaison').call.callId)).toBeUndefined()
+    f.dsh.answer('liaison', '收到。', false)
+
+    // The host's hand-over of the owner's answer points at the owner's own line.
+    const pending = async () => (await f.call<{items: OwnerAction[]}>('/owner-actions', undefined, true)).data.items
+    await waitFor(async () => expect(await pending()).toHaveLength(1))
+    const [action] = await pending()
+    const calls = f.dsh.count('liaison')
+    expect((await f.call('/owner-actions/' + action!.id + '/reply', {requestId: 'owner-answer', text: 'gpt 6.1 sol high'}, true)).status).toBe(200)
+    await waitFor(() => expect(f.dsh.count('liaison')).toBe(calls + 1))
+    expect(source(f.dsh.last('liaison').call.callId)).toMatchObject({speakerId: 'owner', text: 'gpt 6.1 sol high', requestId: expect.any(String)})
+  })
+})
