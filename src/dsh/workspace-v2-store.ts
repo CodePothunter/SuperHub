@@ -935,6 +935,30 @@ export class WorkspaceV2Store {
       [...row.decision.memberIds ?? []].sort().join(',') === recipients && same(evidenceAt(row.seq), evidence)).length >= 2
   }
 
+  /**
+   * Older hosts let the model overrule a reply the owner addressed to an item, which left the item pending after its
+   * reply job had closed. Each such reply counts as the answer, once, from its own message.
+   */
+  settleAnsweredReplies() {
+    this.current()
+    const actions = this.board.ownerActions ?? {}
+    const replies = Object.values(this.board.engagementJobs ?? {}).filter(row => row.done && row.turn === 'owner' && row.answerTo &&
+      actions[row.answerTo] && !actions[row.answerTo]!.resolved && actions[row.answerTo]!.sessionId === row.sessionId)
+      .sort((left, right) => left.seq - right.seq)
+    if (!replies.length) return 0
+    return this.commit(board => {
+      let settled = 0
+      for (const row of replies) {
+        const action = board.ownerActions![row.answerTo!]!
+        if (action.resolved) continue
+        action.resolved = true
+        action.answerMessageId = 'g-' + row.seq
+        settled += 1
+      }
+      return settled
+    })
+  }
+
   pendingEngagement(): EngagementJob[] {
     this.current()
     return structuredClone(Object.values(this.board.engagementJobs ?? {}).filter(row => !row.done))

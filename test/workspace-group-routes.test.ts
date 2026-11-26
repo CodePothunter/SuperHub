@@ -259,6 +259,78 @@ describe('工作交接', () => {
     expect((await f.view(session)).data.messages.filter(row => row.text === body.text)).toHaveLength(1)
   })
 
+  it('点回应的答复即解除事项并转给接口人，模型不认可或出错都不吞掉原话', async () => {
+    const first = '请确认本次调查采用哪个数据版本？', second = '请确认报告发给谁？'
+    let failing = false
+    const f = fixture({coordinate: async input => {
+      if (input.turn === 'liaison' && [first, second].includes(input.source.text)) return {kind: 'ask', text: input.source.text, sourceSeq: input.source.seq}
+      if (input.turn === 'owner' && failing) throw new Error('交接模型不可用')
+      return {kind: 'none'}
+    }})
+    const ws = await f.workspace(), session = await f.group(ws)
+    const pending = async () => (await f.call<{items: OwnerAction[]}>('/owner-actions', undefined, true)).data.items
+    await f.say(session, '请汇总这次调查')
+    for (const [question, text] of [[first, '已回应'], [second, '发给项目组']] as const) {
+      f.dsh.answer('liaison', question, false)
+      await waitFor(async () => expect(await pending()).toHaveLength(1))
+      const [action] = await pending()
+      const calls = f.dsh.count('liaison')
+      failing = question === second
+      expect((await f.call('/owner-actions/' + action!.id + '/reply', {requestId: f.id(), text}, true)).status).toBe(200)
+      await waitFor(async () => expect(await pending()).toEqual([]))
+      await waitFor(() => expect(f.dsh.count('liaison')).toBe(calls + 1))
+      expect(f.dsh.last('liaison').call.prompt).toContain(text)
+    }
+  })
+
+  it('答复后接口人仍追问同一问题时另起一项，原事项解除', async () => {
+    const question = '请确认本次调查采用哪个数据版本？'
+    const f = fixture({coordinate: async input => {
+      if (input.turn === 'liaison' && input.source.text === question) return {kind: 'ask', text: question, sourceSeq: input.source.seq}
+      if (input.turn === 'owner') return {kind: 'ask', text: question}
+      return {kind: 'none'}
+    }})
+    const ws = await f.workspace(), session = await f.group(ws)
+    const pending = async () => (await f.call<{items: OwnerAction[]}>('/owner-actions', undefined, true)).data.items
+    await f.say(session, '请汇总这次调查')
+    f.dsh.answer('liaison', question, false)
+    await waitFor(async () => expect(await pending()).toHaveLength(1))
+    const [action] = await pending()
+    expect((await f.call('/owner-actions/' + action!.id + '/reply', {requestId: f.id(), text: '随便'}, true)).status).toBe(200)
+    await waitFor(async () => expect((await pending()).map(row => row.id)).not.toContain(action!.id))
+    await waitFor(async () => expect(await pending()).toEqual([expect.objectContaining({question})]))
+  })
+
+  it('旧宿主留下的已回复但未解除的事项在重启后补记为已答复', async () => {
+    const question = '请确认本次调查采用哪个数据版本？'
+    const f = fixture({coordinate: async input => {
+      if (input.turn === 'liaison' && input.source.text === question) return {kind: 'ask', text: question, sourceSeq: input.source.seq}
+      return {kind: 'none'}
+    }})
+    const ws = await f.workspace(), session = await f.group(ws)
+    const pending = async () => (await f.call<{items: OwnerAction[]}>('/owner-actions', undefined, true)).data.items
+    await f.say(session, '请汇总这次调查')
+    f.dsh.answer('liaison', question, false)
+    await waitFor(async () => expect(await pending()).toHaveLength(1))
+    const [action] = await pending()
+    expect((await f.call('/owner-actions/' + action!.id + '/reply', {requestId: f.id(), text: '采用校对版'}, true)).status).toBe(200)
+    await waitFor(async () => expect(await pending()).toEqual([]))
+    await waitFor(() => expect(f.dsh.count('liaison')).toBe(2))
+    // What an older host left behind: the reply's job closed, the item still open.
+    const dir = join(f.root, 'ops', 'superhub-v2')
+    const file = join(dir, readdirSync(dir).find(name => name.endsWith('.json'))!)
+    const board = JSON.parse(readFileSync(file, 'utf8'))
+    const saved = board.ownerActions[action!.id]
+    const answerMessageId = saved.answerMessageId
+    delete saved.resolved
+    delete saved.answerMessageId
+    writeFileSync(file, JSON.stringify(board))
+    f.restart()
+    expect(await pending()).toEqual([])
+    expect(JSON.parse(readFileSync(file, 'utf8')).ownerActions[action!.id]).toMatchObject({resolved: true, answerMessageId})
+    expect(f.dsh.count('liaison')).toBe(2)
+  })
+
   it.each([['final', 8], ['each', 8], ['final', 21]] as const)('无工具工作按 %s 约定发布，累计 %s 项', async (reporting, expected) => {
     let retainedFirst = false
     const f = fixture({turnLimit: 40, coordinate: async input => {

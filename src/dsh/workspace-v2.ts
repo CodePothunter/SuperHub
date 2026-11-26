@@ -869,7 +869,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     const session = store.session(job.workspaceId, job.sessionId)
     const engine = await groupEngine(session)
     const line = engine.ledger.get(job.seq)
-    if (!line || (job.answerTo && !job.decision && !store.ownerAction(job.answerTo))) { store.closeEngagement(job.id); return }
+    if (!line) { store.closeEngagement(job.id); return }
     const triggerSeq = job.triggerSeq ?? job.seq
     let routed = job
     if (!job.decision) {
@@ -887,6 +887,8 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       const earlier = history.slice(0, -16).filter(row => row.seq === job.triggerSeq || order &&
         (row.engagement || row.speakerId === OWNER_ID || row.quote || evidence.has(lineId(row.seq)))).slice(-64)
       const pending = store.ownerActions(session.id, job.orderId)
+      // The owner chose this item to answer: the reply settles it, the model only picks the next step.
+      const answered = job.turn === 'owner' && job.answerTo ? pending.find(row => row.id === job.answerTo) : undefined
       const activeMembers = engine.workInFlight()
       const latestOwnerSeq = () => engine.ledger.all().findLast(row => row.speakerId === OWNER_ID && row.workOrderId === job.orderId)?.seq
       const ownerSeen = latestOwnerSeq()
@@ -901,8 +903,9 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
           members: engine.members().map(({id,name}) => ({id,name})), triggerSeq: job.triggerSeq, now: (now?.() ?? new Date()).toISOString()}, signal)
       } catch {
         if (disposed || !store.engagementActive(job.id)) return
-        if ((job.attempts ?? 0) < 2) { store.closeEngagement(job.id, undefined, new Date(+(now?.() ?? new Date()) + 10_000).toISOString()); return }
-        decision = {kind: 'wait', reason: '接口人暂时无法核实本轮结果，请在原会话重试或调整交办。'}
+        if (answered) decision = {kind: 'none'}
+        else if ((job.attempts ?? 0) < 2) { store.closeEngagement(job.id, undefined, new Date(+(now?.() ?? new Date()) + 10_000).toISOString()); return }
+        else decision = {kind: 'wait', reason: '接口人暂时无法核实本轮结果，请在原会话重试或调整交办。'}
       }
       if (disposed || !store.engagementActive(job.id) || (job.turn !== 'owner' && ownerSeen !== latestOwnerSeq())) return
       if (!engine.canUseLiaisonExperience(experienceRefs, triggerSeq, job.orderId)) return
@@ -915,9 +918,15 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         else if (!memberIds.length) decision = {kind: 'wait', reason: '当前没有可接手的成员，请检查工作区成员或重新安排。'}
         else decision = {...decision, memberIds}
       }
+      // A reply to an item that has since closed is ordinary owner speech: it settles nothing else.
       const eligible = job.turn === 'owner' ? pending.filter(row => !job.answerTo || row.id === job.answerTo) : []
       decision.resolved = [...new Set(decision.resolved ?? [])].filter(id => eligible.some(row => row.id === id))
       if (decision.resolved.length > 1) decision.resolved = []
+      if (answered) {
+        decision.resolved = [answered.id]
+        // Nothing to wait for on the owner's side once answered: the liaison takes the reply.
+        if (decision.kind === 'wait') decision = {kind: 'none', resolved: [answered.id]}
+      }
       const answer = eligible.find(row => row.id === decision.resolved?.[0])
       if (job.turn === 'owner' && !answer) decision = {kind: 'none'}
       if (answer?.orderId && decision.kind === 'none' && !store.delegation(session.workspaceId, answer.orderId).remainingTurns) {
@@ -942,7 +951,8 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         !store.engagementCheckpoints(order.id, order.generation).includes('final') && !pending.length) {
         decision = {kind: 'wait', reason: '本轮已有记录，接口人尚未确定下一执行步骤或验收条件。请在原会话补充要求或继续。'}
       }
-      const existingQuestion = pending.find(row => row.question === decision.text || lineSeq(row.messageId) === decision.sourceSeq)
+      // The item just answered is settled: asking it again opens a new item.
+      const existingQuestion = pending.find(row => row.id !== answer?.id && (row.question === decision.text || lineSeq(row.messageId) === decision.sourceSeq))
       const sameMessage = line.speakerId === LIAISON_MEMBER_ID && decision.text && line.text.includes(decision.text)
       const question = decision.kind === 'ask' && decision.text && !existingQuestion ? sameMessage ? line :
         engine.note({speaker: 'liaison', text: decision.text, workOrderId: job.orderId, ref: job.id + '-question', experienceRefs}) : undefined
@@ -991,7 +1001,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       }
     } else if (job.turn === 'owner' && decision.resolved?.length && decision.kind === 'none') {
       if (!order || order.remainingTurns) engine.dispatchEngagement(job.id, [LIAISON_MEMBER_ID], '主人已答复待回应事项：' + line.text, routed.orderId)
-    } else if (job.turn === 'owner' && !job.answerTo && decision.kind === 'none') {
+    } else if (job.turn === 'owner' && !decision.resolved?.length && decision.kind === 'none') {
       engine.forwardEngagementOwner(job.id, line)
     } else if (!routed.orderId && job.turn !== 'owner' && decision.kind === 'none' && (line.mentions.length || line.all)) {
       engine.forwardEngagementMember(job.id, line)
@@ -1006,6 +1016,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
 
   function recoverGroupLedger() {
     if ((!coordinate && !learning) || !groups || disposed) return
+    if (coordinate) store.settleAnsweredReplies()
     const delivered = learning ? [...store.groupEvidence(), ...store.resultNotices()] : []
     for (const session of store.rosterSessions()) {
       if (archived(session.workspaceId)) continue
