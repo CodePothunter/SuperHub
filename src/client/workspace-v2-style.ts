@@ -337,6 +337,11 @@ body[data-ds-dark-theme]:not([data-chief-standalone]) .wv2 { ${darkPalette} }
 .wv2 .v2-byline { display:flex; flex-wrap:wrap; align-items:baseline; gap:8px; margin:0 2px 3px; font-size:13px; }
 .wv2 .v2-byline strong { min-width:0; overflow-wrap:anywhere; }
 .wv2 .v2-byline time { color:var(--v-muted); font-size:12px; font-variant-numeric:tabular-nums; }
+.wv2 .v2-byline .v2-edit-message { color:var(--v-muted); min-height:28px; padding-inline:7px; }
+.wv2 .v2-byline .v2-edit-message:hover,.wv2 .v2-byline .v2-edit-message:focus-visible { color:var(--hub-brand-text); }
+.wv2 .v2-delete-target { color:var(--v-alert); }
+.wv2 .v2-orphaned-heading { margin:0; padding:14px 16px 9px; font-size:15px; color:var(--v-muted); }
+@media (pointer:coarse) { .wv2 .v2-byline .v2-edit-message { min-height:44px; } }
 .wv2 .v2-bubble { padding:8px 12px; border:1px solid var(--v-soft); border-radius:2px 10px 10px; background:var(--chat-back); font:400 14px/1.7 var(--v-font); }
 .wv2 .mine .v2-bubble { border-color:transparent; border-radius:10px 2px 10px 10px; background:var(--chat-own); }
 .wv2 .v2-markdown { min-width:0; overflow-wrap:anywhere; }

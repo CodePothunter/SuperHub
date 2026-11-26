@@ -13,6 +13,17 @@ import { isStaffDescendant } from '../src/dsh/tools.ts'
 const tmp = () => mkdtempSync(join(tmpdir(), 'chief-liaison-'))
 
 describe('接口人的工具限制', () => {
+  it('对话续写后，上一版迟到的工具调用不能按旧原话继续派工', () => {
+    let active = 'hq'
+    const traces = new Set(['hq', 'revised'])
+    const guard = liaisonGuard(id => traces.has(id), undefined, id => id !== active)
+    const assignment = { name:'chief_workspace', agent:{id:'hq'} }
+    expect(guard(assignment)).toBeUndefined()
+    active = 'revised'
+    expect(guard(assignment)).toContain('编辑前的对话')
+    expect(guard({...assignment, agent:{id:active}})).toBeUndefined()
+    expect(guard({...assignment, name:'bash', agent:{id:active}})).toContain('不能用 bash')
+  })
   it('只限制本机存在的工具：不认识的名字会让 DSH 整体拒绝', () => {
     const registered = new Set(['bash', 'write', 'edit', 'ask_user_question'])
     expect(knownDeny(n => registered.has(n), ['bash', 'subagent_claude_code', 'write', 'workflow'])).toEqual(['bash', 'write'])

@@ -30,6 +30,7 @@ export interface WorkspaceApprovalBinding {
   scope: string
   workspaceId: string
   sessionId: string
+  traceId?: string
   orderId?: string
   turnId: string
   /** `dsh`: a DSH group member's command, asked in-process from `tools/pre-execute`. */

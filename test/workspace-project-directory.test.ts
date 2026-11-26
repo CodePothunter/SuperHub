@@ -15,6 +15,7 @@ import { createV2DialogueSource, nativeSessionName } from '../src/dsh/workspace-
 import { dialogueKey } from '../src/dsh/workspace-v2-group.ts'
 import { WorkspaceV2Store, mutationKey } from '../src/dsh/workspace-v2-store.ts'
 import { workspaceV2Routes } from '../src/dsh/workspace-v2.ts'
+import { fileVersion } from '../src/dsh/workspace-notices.ts'
 import { cliHost } from './coding-cli-fake.ts'
 
 const roots: string[] = []
@@ -619,6 +620,37 @@ const journalOf = (root: string) => {
 const signal = () => new AbortController().signal
 
 describe('coding turns in the owner\'s project directory', () => {
+  it('a revision starts a fresh native thread with the retained owner prefix and keeps the original linked bytes', async () => {
+    const root = temp(), project = temp()
+    const h = cliHost((spec, prompt, {say}) => {
+      const version = prompt.includes('新排版') ? '新版' : '旧版'
+      writeFileSync(join(spec.cwd!, '首页.txt'), version)
+      say({type: 'item.completed', item: {id: 'm', type: 'agent_message', text: '交付 [首页](首页.txt)'}})
+      say({type: 'turn.completed'})
+      return 0
+    })
+    const source = createV2DialogueSource({ctx: h.ctx, root, scope: 'brain', codex: {executable: process.execPath}})
+    const parent = {...codingSession, traceId: 'initial'}, child = {...parent, traceId: 'trace-new'}
+    await source.send(parent, input('prefix', '保留项目的标识', project), signal())
+    await source.send(parent, input('edited', '用旧排版', project), signal())
+    await source.send(parent, input('suffix', '只在旧版使用这条指示', project), signal())
+    const previous = (await source.read(parent)).messages
+    const anchor = previous.findIndex(message => message.text === '用旧排版')
+    expect(source.canEdit!(parent, previous[anchor]!)).toBe(true)
+    source.prepareEdit!(parent, child, previous, anchor)
+    await source.send(child, input('revised', '用新排版', project), signal())
+    const run = h.calls.at(-1)!
+    expect(run.resume).toBeUndefined()
+    expect(run.prompt).toContain('保留项目的标识')
+    expect(run.prompt).toContain('用新排版')
+    expect(run.prompt).not.toMatch(/用旧排版|只在旧版使用这条指示/)
+    const oldDocument = source.readSnapshot!(parent).messages.at(-1)!.attachments![0]!
+    const newDocument = (await source.read(child)).messages.at(-1)!.attachments![0]!
+    expect(await source.attachment(parent, oldDocument.id)).toMatchObject({content: '旧版'})
+    expect(await source.attachment(child, newDocument.id)).toMatchObject({content: '新版'})
+    source.dispose()
+  })
+
   it('runs there without SuperHub files, names the thread, and reads linked files as attachments', async () => {
     const root = temp(), project = temp()
     writeFileSync(join(project, 'README.md'), '# 项目\n')
@@ -642,7 +674,9 @@ describe('coding turns in the owner\'s project directory', () => {
     expect(readdirSync(project).sort()).toEqual(['README.md', 'index.html'])
     const transcript = await source.read(codingSession)
     const reply = transcript.messages.find(m => m.role === 'agent')!
-    expect(reply.attachments).toEqual([{id: expect.any(String), label: '首页'}])
+    const file = await source.attachment(codingSession, reply.attachments![0]!.id)
+    expect(file?.content).toBe(readFileSync(join(project, 'index.html'), 'utf8'))
+    expect(reply.attachments).toEqual([{id: file?.id, label: '首页', version: fileVersion(file!)}])
     expect(source.execution!(codingSession, 'd1').runs).toMatchObject([{state: 'done', nativeSessionId: 'thread-P', cwd: project}])
     expect(journalOf(root).native).toEqual({[project]: expect.objectContaining({sessionId: 'thread-P'})})
     source.dispose()

@@ -138,7 +138,8 @@ export interface ScheduleAccess { store: ScheduleStore; timeZone: string; now?: 
  */
 export interface GroupTurn { workspaceId?: string; owner?: { requestId: string; text: string } }
 
-export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomExecution?: RequestRoomExecution; connectors?: Connectors; isLiaison: (id: string) => boolean; lookup: AgentLookup; worklines?: Worklines; readOnlyExecution?: (id: string) => boolean; executionBinding?: (id: string) => { ticketId: string; assignmentId: string } | undefined; schedules: ScheduleAccess; ui: UiControl; control: ChiefControl; importer: Importer; exporter: Exporter; superhub?: SuperhubIntake; inputAttachments?: ChatAttachments; groups?: Pick<WorkspaceGroupHost, 'refresh'>; groupTurn?: (agentId: string) => GroupTurn | undefined; modelDefaults?: () => ModelDefaults; workspaceStore: WorkspaceV2Store; staffStore?:WorkspaceStaffStore; learning?: ExperienceLearning; assign?: ReturnType<typeof workspaceV2Routes>['assign']; follow?: ReturnType<typeof workspaceV2Routes>['follow']; orderFollowup:OrderFollowupAccess; calendarWeek: (day?: string) => Promise<CalendarWeek>; personDetail: (id:string) => Promise<HistoryDetail> }): (() => void)[] {
+export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomExecution?: RequestRoomExecution; connectors?: Connectors; isLiaison: (id: string) => boolean; lookup: AgentLookup; worklines?: Worklines; readOnlyExecution?: (id: string) => boolean; executionBinding?: (id: string) => { ticketId: string; assignmentId: string } | undefined; schedules: ScheduleAccess; ui: UiControl; control: ChiefControl; importer: Importer; exporter: Exporter; superhub?: SuperhubIntake; inputAttachments?: ChatAttachments; groups?: Pick<WorkspaceGroupHost, 'refresh'>; groupTurn?: (agentId: string) => GroupTurn | undefined; modelDefaults?: () => ModelDefaults; workspaceStore: WorkspaceV2Store; staffStore?:WorkspaceStaffStore; learning?: ExperienceLearning; assign?: ReturnType<typeof workspaceV2Routes>['assign']; follow?: ReturnType<typeof workspaceV2Routes>['follow']; orderFollowup:OrderFollowupAccess; calendarWeek: (day?: string) => Promise<CalendarWeek>; personDetail: (id:string) => Promise<HistoryDetail>;
+  liaisonSource?: NonNullable<Parameters<typeof liaisonOrderFollowup>[5]> }): (() => void)[] {
   const { engine, brain, roster, inputAttachments } = deps
   const attachmentWriteGuard = (agent: Agent | undefined) => {
     if (agent && deps.isLiaison(agent.id) && nativeAttachmentOnlyTurn(agent.session?.snapshotEvents() ?? [])) {
@@ -358,7 +359,7 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
       ...ORDER_FOLLOWUP_TOOL, parameters:followupParameters, output:workspaceOutput,
       execute: async (args, execution) => {
         const turn = ownerSource(execution)
-        return liaisonOrderFollowup(deps.workspaceStore,deps.orderFollowup,args,turn,deps.superhub?.ownerTurnOrigin(turn.source))
+        return liaisonOrderFollowup(deps.workspaceStore,deps.orderFollowup,args,turn,deps.superhub?.ownerTurnOrigin(turn.source),deps.liaisonSource)
       },
     }, privateLiaison),
     register({

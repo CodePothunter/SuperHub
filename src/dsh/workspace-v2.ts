@@ -6,26 +6,28 @@ import type { V2Attachment } from '../core/workspace-v2.ts'
 import { LIAISON_AUTHOR, WORKSPACE_ARCHIVED, awaitingChoice, messageWorkOrder, pinnedOutside, orderEnded, workspaceArchived, type V2CodingPermission, type V2Delegation, type V2Delivery, type V2DialogueSource, type V2DirectoryWait, type V2Executor, type V2Interjection, type V2Message, type V2PendingApproval, type V2PermissionChange, type V2Session, type V2SteerOutcome, type V2Transcript, type V2WorkDirectory } from '../core/workspace-v2.ts'
 import { json, type Route } from './http.ts'
 import { workspaceError, workspaceFingerprint } from './superhub-goals.ts'
-import { INTERJECTION_UNKNOWN, UNKNOWN_TURN, WorkspaceV2Store, commandText, mutationKey, assignmentTurn, isRosterGroup, type AcceptanceOutcome, type AssignmentStart, type EngagementJob, type GroupStart, type Mutation, type OwnerCommand } from './workspace-v2-store.ts'
+import { INTERJECTION_UNKNOWN, UNKNOWN_TURN, WorkspaceV2Store, commandText, mutationKey, assignmentTurn, isRosterGroup, type AcceptanceOutcome, type AssignmentStart, type EngagementJob, type GroupStart, type Mutation, type OwnerCommand, type WorkspaceTarget } from './workspace-v2-store.ts'
 import { mentionSegments, type MentionSegment } from '../core/mentions.ts'
 import { LIAISON_MEMBER_ID } from './workspace-group-members.ts'
 import { GROUP_COMMANDS_FILE, liaisonGapReason, type GroupEngine, type GroupDeliveryOutcome } from './workspace-group-engine.ts'
 import type { WorkspaceGroupHost } from './workspace-group-host.ts'
-import { GROUP_LEDGER_FILE, memberCompletionEvidenceId, readGroupLedger, type GroupAttachment, type GroupLine } from './workspace-group-ledger.ts'
+import { memberCompletionEvidenceId, type GroupAttachment, type GroupLine } from './workspace-group-ledger.ts'
+import { GROUP_RESULTS_DIR, keepGroupFile, readGroupFile, readKeptGroupFile } from './workspace-group-files.ts'
+import { INITIAL_WORKSPACE_TRACE, type WorkspaceDialogueEdit } from './workspace-dialogue-trace.ts'
 import { HOST_ID, OWNER_ID, type GroupEffect } from './workspace-group-scheduler.ts'
 import { dialogueKey, groupLeadId, liaisonSpeakerId, workspaceSpeakerId } from './workspace-speaker-id.ts'
 import { appendCommandLog, readCommandLog } from './workspace-command-log.ts'
 import { ORIGINAL_LABEL } from './workspace-v2-dialogue.ts'
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { extname, join, sep } from 'node:path'
+import { join } from 'node:path'
 import { slotKey, zonedInstant } from '../core/clock.ts'
 import { completionCandidate, judgeCommand, type CommandJudge } from './workspace-order-command.ts'
 import { ACCEPTANCE_TIMEOUT_MS, ORIGINAL_LIMIT, RESULTS_LIMIT, type AcceptanceReviewer } from './workspace-acceptance.ts'
 import { publishedOutputs, workspaceOutputs, type OutputSource } from './workspace-outputs.ts'
 import type { OrderBrief } from './workspace-order-brief.ts'
 import type { WorkspaceStaffStore } from './workspace-staff-store.ts'
-import type { ExperienceEvidence } from '../core/workspace-experience.ts'
+import type { ExperienceEvidence, ExperienceMemory } from '../core/workspace-experience.ts'
 import type { ExperienceLearning, VerifiedExperienceOriginal } from './workspace-experience-learning.ts'
 import { WorkspaceFollowup } from './workspace-followup.ts'
 import { fileVersion, groupResults, WorkspaceResultNotices, type GroupResultLine, type StoredResult } from './workspace-notices.ts'
@@ -106,9 +108,7 @@ export interface GroupMemberState {
 export interface GroupPauseState { reason: string; since: string; parked: number; messageId?: string }
 /** How long the owner's answer waits for words being steered into a running member call before saying `pending`. */
 export const STEER_REPLY_WAIT_MS = 2_000
-const GROUP_FILE_LIMIT = 512 * 1024
-/** Copies of the files group results delivered, by version, in the group's record directory. */
-export const GROUP_RESULTS_DIR = 'results'
+export { GROUP_RESULTS_DIR }
 /** Lines of a group never checked for results count from this long ago (as the first backfill of other conversations). */
 const GROUP_RESULTS_SINCE_MS = 86_400_000
 interface InFlight {
@@ -126,7 +126,7 @@ interface InFlight {
 }
 /** Extra input of one turn: the project directory it holds and owner words said while it waited. */
 interface TurnExtra { directory?: string; merged?: { id: string; text: string }[] }
-interface SendMode { owner?: boolean; wait?: boolean; discussion?: boolean; merged?: { id: string; text: string }[] }
+interface SendMode { owner?: boolean; wait?: boolean; discussion?: boolean; revision?: boolean; merged?: { id: string; text: string }[] }
 
 /** The executor's answers of a turn and what its files hold, as the liaison reads them for its review. */
 export function resultSummary(evidence: SavedOrderResults, limit = RESULTS_LIMIT) {
@@ -174,7 +174,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   const current = () => { if (disposed) workspaceError(409, '工作区运行环境已切换，请重新打开') }
   const followup = new WorkspaceFollowup(store, read, current, timeZone, now, order => {
     const token = activeMember(order.workspaceId,order.staffId).token
-    return source.staffSources?.(store.session(order.workspaceId,order.sessionId),order.id,token) ?? new Set<string>()
+    return source.staffSources?.(store.traceBinding(store.session(order.workspaceId,order.sessionId)),order.id,token) ?? new Set<string>()
   })
   const notices = new WorkspaceResultNotices(store, source, current, now, () => runAcceptances(),
     groups && {collect: () => collectGroupResults(), attachment: (notice, fileId) => groupResultFile(notice, fileId)},
@@ -189,15 +189,16 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   }
 
   function learnResult(result: StoredResult, deferred = false) {
-    if (!learning || result.at < learning.startedAt || !result.text.trim() || result.kind === 'weekly') return
+    if (!learning || result.at < learning.startedAt || !result.text.trim() || result.kind === 'weekly' ||
+      store.deletedReason(result.workspaceId, result.sessionId, result.orderId)) return
     const evidence: ExperienceEvidence = {kind: 'delivery', id: result.id, workspaceId: result.workspaceId,
-      sessionId: result.sessionId, orderId: result.orderId, messageId: result.messageId, version: result.version}
+      sessionId: result.sessionId, traceId: result.traceId, orderId: result.orderId, messageId: result.messageId, version: result.version}
     const signal = {id: 'delivery:' + result.id, workspaceId: result.workspaceId, sessionId: result.sessionId,
       orderId: result.orderId, kind: 'delivery' as const, summary: result.text, evidence: [evidence]}
     submitLearning(signal, deferred)
     if (!result.attachments.length) return
     try {
-      const session = store.session(result.workspaceId, result.sessionId)
+      const session = store.traceBinding(store.session(result.workspaceId, result.sessionId), result.traceId ?? INITIAL_WORKSPACE_TRACE)
       const original = !roster(session) && result.requestId ? source.experienceSource?.(session, result.requestId) : undefined
       learnArtifacts(result, deferred, original?.staffId)
     } catch (error) { learningProblem?.(error) }
@@ -214,7 +215,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     if (replaced.size && staff) staff.holdReplacedExperience(result.workspaceId, staffId,
       staff.experienceMemories(result.workspaceId).filter(memory => memory.staffId === staffId && memory.premise
         && replaced.has(artifactSource(memory.premise))))
-    const session = store.session(result.workspaceId, result.sessionId)
+    const session = store.traceBinding(store.session(result.workspaceId, result.sessionId), result.traceId ?? INITIAL_WORKSPACE_TRACE)
     const evidence = proofs.map(proof => proof.evidence)
     const lines = roster(session) ? learningGroupLines(session).filter(line => evidence.some(proof => proof.messageId === lineId(line.seq))
       || result.messageId === lineId(line.seq)) : []
@@ -241,12 +242,12 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   function learnOwnerWords(session: V2Session, line: GroupLine) {
     if (!learning || line.at < learning.startedAt || !line.text.trim()) return
     void learning.interpretOwner({id: 'group:' + session.id + ':' + line.seq, text: line.text, workspaceId: session.workspaceId,
-      sessionId: session.id, orderId: line.workOrderId, messageId: lineId(line.seq)}).catch(error => learningProblem?.(error))
+      sessionId: session.id, traceId: line.traceId, orderId: line.workOrderId, messageId: lineId(line.seq)}).catch(error => learningProblem?.(error))
   }
-  function learnReview(row: {workspaceId: string; sessionId: string; orderId: string; turnId: string}, outcome: AcceptanceOutcome) {
-    if (!learning || outcome.kind !== 'verdict') return
+  function learnReview(row: {workspaceId: string; sessionId: string; orderId: string; turnId: string; traceId?: string}, outcome: AcceptanceOutcome) {
+    if (!learning || outcome.kind !== 'verdict' || store.deletedReason(row.workspaceId, row.sessionId, row.orderId)) return
     const {workspaceId, sessionId, orderId, turnId} = row
-    const evidence: ExperienceEvidence = {kind:'model-review', id:turnId, workspaceId, sessionId, orderId}
+    const evidence: ExperienceEvidence = {kind:'model-review', id:turnId, workspaceId, sessionId, orderId, traceId:row.traceId}
     try {
       learning.observe({id:'model-review:' + turnId, kind:'review', workspaceId, sessionId, orderId,
         summary:outcome.verdict === 'pass' ? '模型评议认为交付满足本轮约定。' : '模型评议发现尚未满足的交付要求。', evidence:[evidence]})
@@ -265,11 +266,17 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   function stalled(workspaceId: string, orderId: string, turnId: string, what: string) {
     let order: V2Delegation
     try { order = store.delegation(workspaceId, orderId) } catch { return }
-    if (orderEnded(order)) return
+    if (orderEnded(order) || store.deletedReason(workspaceId, order.sessionId)) return
     tell('stalled', order, turnId, '「' + order.title + '」' + what)
   }
 
   const archived = (workspaceId: string) => store.list().some(space => space.id === workspaceId && workspaceArchived(space))
+  function currentApproval(row: V2PendingApproval) {
+    if (archived(row.workspaceId) || store.deletedReason(row.workspaceId, row.sessionId, row.workOrderId ?? undefined)) return false
+    try { store.assertActiveTrace({workspaceId: row.workspaceId, id: row.sessionId}, row.traceId ?? INITIAL_WORKSPACE_TRACE) }
+    catch { return false }
+    return true
+  }
   /** Work in flight in a workspace: a coding turn (running or waiting for its directory) or a group member not idle. */
   function busy(workspaceId: string) {
     for (const flight of flights.values()) if (flight.session.workspaceId === workspaceId) return true
@@ -292,6 +299,54 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     return result
   }
 
+  function remove(mutation: Mutation, workspaceId: string, target: WorkspaceTarget, id: string) {
+    const sessionId = target === 'session' ? id : store.reference(workspaceId, 'order', id)?.sessionId
+    const pending = target === 'order' && sessionId ? store.pendingStarts(sessionId).filter(row => row.workspaceId === workspaceId && row.delegationId === id) : []
+    const result = store.deleteTarget(mutation, workspaceId, target, id, now?.())
+    for (const row of approvals?.pending({workspaceId, ...(target === 'session' ? {sessionId: id} : {orderId: id})}) ?? []) {
+      try { approvals!.answer(row.id, false, {workspaceId, sessionId: row.sessionId, orderId: row.workOrderId}) } catch { /* a completed command has no pending reply */ }
+    }
+    for (const flight of flights.values()) {
+      if (flight.session.workspaceId === workspaceId && (target === 'session' ? flight.session.id === id : flight.workOrderId === id)) flight.controller.abort()
+    }
+    if (target === 'session') {
+      groups?.stopSession(id)
+    } else if (sessionId) {
+      groups?.stopOrder(sessionId, id, '这张工单已删除，为它进行的工作已叫停。')
+      for (const start of pending) {
+        const words = [...start.kind === 'interject' ? [{id: start.requestId, text: start.text}] : [], ...start.merged ?? []]
+        for (const row of words) {
+          try { source.markInterjection?.(store.traceBinding(store.session(workspaceId, sessionId)), {...row, workOrderId: id}, 'unsent') }
+          catch { /* The stopped receipt remains the record. */ }
+        }
+      }
+    }
+    return result
+  }
+
+  function experienceReferences<T extends Pick<ExperienceMemory, 'workspaceId' | 'orderId' | 'lastUsed' | 'evidence' | 'conflict' | 'premise' | 'feedback'>>(memory: T): T {
+    const orderDeletion = (workspaceId?: string, orderId?: string) => workspaceId && orderId ? store.reference(workspaceId, 'order', orderId)?.deletedAt : undefined
+    const evidence = (source: ExperienceEvidence): ExperienceEvidence => {
+      const workspaceId = source.workspaceId ?? memory.workspaceId
+      const orderDeletedAt = orderDeletion(workspaceId, source.orderId)
+      const sessionDeletedAt = workspaceId && source.sessionId ? store.reference(workspaceId, 'session', source.sessionId)?.deletedAt : undefined
+      return {...source, ...(orderDeletedAt && {orderDeletedAt}), ...(sessionDeletedAt && {sessionDeletedAt})}
+    }
+    const orderDeletedAt = orderDeletion(memory.workspaceId, memory.orderId)
+    const lastUsedDeletedAt = orderDeletion(memory.lastUsed?.workspaceId, memory.lastUsed?.orderId)
+    return {...memory, ...(orderDeletedAt && {orderDeletedAt}),
+      ...(memory.lastUsed && lastUsedDeletedAt && {lastUsed: {...memory.lastUsed, orderDeletedAt: lastUsedDeletedAt}}),
+      ...(memory.evidence && {evidence: memory.evidence.map(evidence)}), ...(memory.conflict && {conflict: memory.conflict.map(evidence)}),
+      ...(memory.premise && {premise: evidence(memory.premise)}),
+      ...(memory.feedback && {feedback: memory.feedback.map(row => ({...row, evidence: evidence(row.evidence)}))})}
+  }
+
+  function staffReferences(view: ReturnType<WorkspaceStaffStore['view']>) {
+    return {...view, memories: view.memories.map(experienceReferences),
+      ...(view.retiredMemories && {retiredMemories: view.retiredMemories.map(experienceReferences)}),
+      ...(view.sharedExperiences && {sharedExperiences: view.sharedExperiences.map(experienceReferences)})}
+  }
+
   function activeMember(workspaceId:string,staffId:unknown) {
     if (typeof staffId !== 'string' || !staffId || !staff) return workspaceError(400,'请选择本区可接单的幕僚')
     const {name,token} = staff.context(workspaceId,staffId)
@@ -305,7 +360,10 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   async function groupEngine(session: V2Session): Promise<GroupEngine> {
     if (!groups) return workspaceError(503, '群聊暂不可用，请稍后重试')
     try { return await groups.engine(session) }
-    catch (error) { return workspaceError(503, '群聊暂不可用：' + (error instanceof Error ? error.message : String(error)).slice(0, 160)) }
+    catch (error) {
+      if (error && typeof error === 'object' && 'status' in error) throw error
+      return workspaceError(503, '群聊暂不可用：' + (error instanceof Error ? error.message : String(error)).slice(0, 160))
+    }
     finally { current() }
   }
   /** The acceptance record of one order batch of a group. */
@@ -319,41 +377,73 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     if (memberId === LIAISON_MEMBER_ID) return liaisonSpeakerId(lead)
     return workspaceSpeakerId(lead, 'staff', memberId)
   }
-  function groupMessages(session: V2Session, engine: GroupEngine, lines: readonly GroupLine[] = engine.ledger.all()): GroupMessage[] {
+  function groupMessages(session: V2Session, engine: GroupEngine, lines: readonly GroupLine[] = engine.ledger.all(), editable = false): GroupMessage[] {
     const members = engine.members().map(({id, name}) => ({id, name}))
-    return lines.map(line => {
+    let oldVersions: Map<string, string> | undefined
+    const versionOf = (file: GroupAttachment, id: string) => file.version ?? (oldVersions ??= groupVersions(session)).get(id)
+    return store.messageReferences(session, lines.map(line => {
       const mentions = line.kind !== 'event' && (line.mentions.length || line.all) ? mentionSegments(line.text, members) : undefined
       const deliveries = line.speakerId === OWNER_ID || line.inputAttachments?.length ? engine.deliveryOf(line.seq) : undefined
       return {
-        id: lineId(line.seq), seq: line.seq, kind: line.kind, role: line.speakerId === OWNER_ID ? 'user' as const : 'agent' as const,
+        id: lineId(line.seq), traceId: line.traceId ?? INITIAL_WORKSPACE_TRACE, seq: line.seq, kind: line.kind, role: line.speakerId === OWNER_ID ? 'user' as const : 'agent' as const,
         author: line.speakerId === OWNER_ID ? '你' : line.author, ...line.speakerId !== HOST_ID && {speakerId: groupSpeaker(session, line.speakerId)}, at: line.at, text: line.text,
         ...deliveries?.length && {deliveries: deliveries.map(row => ({...row}))},
         ...line.workOrderId !== undefined && {workOrderId: line.workOrderId}, ...line.replyTo !== undefined && {replyTo: lineId(line.replyTo)},
-        ...line.attachments?.length && {attachments: line.attachments.map((file, index) => ({id: lineId(line.seq) + '-' + index, label: file.name}))},
+        ...line.attachments?.length && {attachments: line.attachments.map((file, index) => {
+          const id = lineId(line.seq) + '-' + index, version = versionOf(file, id)
+          return {id, label: file.name, ...version && {version}}
+        })},
         ...line.inputAttachments?.length && {inputAttachments: line.inputAttachments.map(file => ({...file}))},
         ...line.quote && {quote: {...line.quote}}, ...line.event !== undefined && {event: line.event},
         ...mentions?.some(part => 'memberId' in part || 'all' in part) && {mentions},
+        ...editable && editableGroupLine(session, line) && {canEdit: true},
       }
-    })
+    }))
   }
-  /** The file behind a group attachment (`g-<seq>-<index>`): group attachments are read live from their path. */
-  const groupFileOf = (engine: GroupEngine) => (id: string) => {
+  const groupFileOf = (lines: readonly GroupLine[]) => (id: string) => {
     const [, seq, index] = /^g-(\d+)-(\d+)$/.exec(id) ?? []
-    return seq ? engine.ledger.get(Number(seq))?.attachments?.[Number(index)]?.path : undefined
+    return seq ? lines.find(line => line.seq === Number(seq))?.attachments?.[Number(index)]?.path : undefined
+  }
+  function groupVersions(session: V2Session) {
+    return new Map([...store.groupEvidence(), ...store.resultNotices()].filter(result => result.workspaceId === session.workspaceId && result.sessionId === session.id)
+      .flatMap(result => result.attachments.map(file => [file.id, file.version] as const)))
+  }
+  function editableGroupLine(session: V2Session, line: GroupLine) {
+    return line.kind === 'message' && line.speakerId === OWNER_ID && !!line.requestId && !line.ref
+      && !store.deletedReason(session.workspaceId, session.id, line.workOrderId)
   }
   /** The group's transcript with the board's held words and choices, like the other conversations. */
-  async function groupTranscript(session: V2Session, paging?: PageQuery): Promise<{transcript: V2Transcript & {messages: GroupMessage[]}; engine: GroupEngine}> {
-    const engine = await groupEngine(session)
+  async function groupTranscript(session: V2Session, paging?: PageQuery, traceId?: string, includeLate = false): Promise<{transcript: V2Transcript & {messages: GroupMessage[]}; engine: GroupEngine}> {
+    if (!groups) return workspaceError(503, '群聊暂不可用，请稍后重试')
+    const state = store.traceState(session)
+    if (traceId === undefined && paging?.around && state.traces.length > 1) {
+      const anchor = lineSeq(paging.around)
+      if (anchor !== undefined) {
+        for (const trace of state.traces.toReversed()) {
+          const line = groups.lines(session, trace.id).find(line => line.seq === anchor)
+          if (line) { traceId = line.traceId ?? INITIAL_WORKSPACE_TRACE; break }
+        }
+      }
+    }
+    const selected = store.traceBinding(session, traceId).traceId!
+    const historical = selected !== state.active || !!session.deletedAt
+    const engine = historical ? await groups.historical(session, selected) : await groupEngine(session)
+    if (!historical && selected !== store.assertActiveTrace(session)) return groupTranscript(session, paging, traceId, includeLate)
     // A group opened read-only (archived workspace) gets nothing new; what was not posted goes in once it is restored.
-    if (!engine.readOnly) for (const row of store.unpostedCommands()) if (row.workspaceId === session.workspaceId && row.sessionId === session.id) postGroupCommand(session, engine, row.requestId)
+    if (!historical && !engine.readOnly) for (const row of store.unpostedCommands()) if (row.workspaceId === session.workspaceId && row.sessionId === session.id) postGroupCommand(session, engine, row.requestId)
     // A paged read projects only the lines of its window (the ledger is already in memory).
-    const window = paging && pageWindow(engine.ledger.all(), line => lineId(line.seq), paging)
-    const choices = store.conversationChoices(session)
+    const all = historical ? groups.lines(session, selected) : engine.ledger.all()
+    const frozenThrough = state.traces.find(trace => trace.id === selected)?.frozenThrough
+    const cursor = lineSeq(paging?.around ?? paging?.before ?? paging?.after)
+    const lines = historical && !includeLate && frozenThrough !== undefined && (cursor === undefined || cursor <= frozenThrough)
+      ? all.filter(line => line.seq <= frozenThrough) : all
+    const window = paging && pageWindow(lines, line => lineId(line.seq), paging)
+    const choices = historical ? {held: {}, actions: {}} as ReturnType<typeof store.conversationChoices> : store.conversationChoices(session)
     const chosen = (messages: GroupMessage[]) => Object.keys(choices.held).length || Object.keys(choices.actions).length ? messages.map(message => {
       const held = choices.held[message.id], actions = message.role === 'agent' ? choices.actions[message.id] : undefined
       return held || actions ? {...message, ...(held && {held}), ...(actions && {actions})} : message
     }) : messages
-    const messages = chosen(groupMessages(session, engine, window?.items))
+    const messages = chosen(groupMessages(session, engine, window?.items ?? lines, !historical && !engine.readOnly && !session.closed))
     // Choices still waiting for the owner on lines outside the window come along, so paging never hides them.
     const shown = new Set(messages.map(message => message.id))
     const waiting = window ? Object.entries(choices.actions).flatMap(([id, actions]) => {
@@ -361,7 +451,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       return line ? [line] : []
     }) : []
     const pinned = waiting.length ? chosen(groupMessages(session, engine, waiting)).filter(message => awaitingChoice(message.actions)) : []
-    return {transcript: {messages, ...(window && {page: window.page}), ...(pinned.length && {pinned})}, engine}
+    return {transcript: {messages, traceId: selected, activeTraceId: state.active, ...(window && {page: window.page}), ...(pinned.length && {pinned})}, engine}
   }
   function groupView(session: V2Session, engine: GroupEngine) {
     const view = engine.view()
@@ -373,7 +463,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       ...row.progress && {progress: {text: row.progress.text, at: iso(row.progress.at)}}}))
     const paused: GroupPauseState | undefined = view.paused && {reason: view.paused.reason, since: iso(view.paused.since), parked: view.paused.parked,
       ...view.paused.seq !== undefined && {messageId: lineId(view.paused.seq)}}
-    return {members, ...paused && {paused}, approvals: view.approvals}
+    return {members, ...paused && {paused}, approvals: view.approvals.filter(currentApproval)}
   }
   /** Owner words in a group: one line (once per request), steered into the members already working on them. */
   function grantGroupFiles(session: V2Session, workOrderId: string | undefined, refs?: ChatInputAttachment[]) {
@@ -383,9 +473,11 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   }
   async function groupSay(session: V2Session, mutation: Mutation, text: unknown, workOrderId: string | undefined, refs?: ChatInputAttachment[], answerTo?: string) {
     if (typeof text !== 'string' || (!text.trim() && !refs?.length) || text.length > 64_000) return workspaceError(400, '请填写有效的发言或选择附件，正文最多 64000 字')
+    const expected = store.assertActiveTrace(session, session.traceId)
     const engine = await groupEngine(session)
+    store.assertActiveTrace(session, expected)
     const replay = !!store.receipt(mutation)
-    store.recordGroupSay(mutation, session, workOrderId)
+    store.recordGroupSay(mutation, {...session, traceId: expected}, workOrderId)
     grantGroupFiles(session, workOrderId, refs)
     // The owner's words come first: a review in flight does not follow up, a waiting decision is answered.
     if (!replay) store.ownerSpoke(session.id, workOrderId)
@@ -415,6 +507,8 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
    */
   function admitCall(session: V2Session, call: {member: {id: string; name: string; token?: string}; workOrderId?: string}): string | undefined {
     if (disposed) return '工作区运行环境已切换'
+    const deleted = store.deletedReason(session.workspaceId, session.id, call.workOrderId)
+    if (deleted) return deleted
     // An archived workspace takes no new work, also from calls that belong to no order.
     if (archived(session.workspaceId)) return WORKSPACE_ARCHIVED
     if (call.member.id !== LIAISON_MEMBER_ID && staff) {
@@ -426,9 +520,10 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   }
   /** What a group's scheduler did: hold the liaison's order batches for review; tell the owner about calls that stopped short. */
   function groupEffects(session: V2Session, effects: readonly GroupEffect[], engine: GroupEngine) {
-    if (disposed) return
+    if (disposed || store.deletedReason(session.workspaceId, session.id)) return
     for (const effect of effects) {
       if (effect.type === 'wake' && effect.held) {
+        if (store.deletedReason(session.workspaceId, session.id, effect.workOrderId)) continue
         let record
         try {
           // The batch's result notices and its review are registered in one write.
@@ -436,7 +531,10 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
             orderId: effect.workOrderId, batchId: effect.batchId, done: effect.done, results: effect.results} : undefined)
         } catch { record = undefined }
         // Nothing to review (no reviewer, the order changed): the liaison is woken as usual to sum up.
-        if (!record) queueMicrotask(() => { try { engine.wakeNow(effect) } catch { /* the group moved on */ } })
+        if (!record) queueMicrotask(() => {
+          if (disposed || store.deletedReason(session.workspaceId, session.id, effect.workOrderId)) return
+          try { engine.wakeNow(effect) } catch { /* the group moved on */ }
+        })
         else queueMicrotask(() => runAcceptances())
       }
       if (effect.type === 'event' && (effect.event === 'failed' || effect.event === 'interrupted') && effect.workOrderId) {
@@ -450,7 +548,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   }
   /** Orders whose members all handed back are waiting again (shown on the order). */
   function groupChanged(session: V2Session, engine: GroupEngine) {
-    if (disposed) return
+    if (disposed || store.deletedReason(session.workspaceId, session.id)) return
     try { store.settleGroupOrders(session.workspaceId, session.id, engine.busyOrders()) } catch { /* shown again after the next change */ }
     try { publishGroup(session, engine.ledger.all()) } catch { /* published on the next change or collect */ }
     if (coordinate && !session.closed) {
@@ -487,7 +585,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       for (const {line, id, callId} of outcomes) {
         if (!members.has(line.speakerId) || line.workOrderId && !orders.has(line.workOrderId)) continue
         const evidence: ExperienceEvidence = {kind: 'group', id, workspaceId, sessionId, orderId: line.workOrderId,
-          messageId: lineId(line.seq), quote: line.text.slice(0, 3000)}
+          traceId: line.traceId, messageId: lineId(line.seq), quote: line.text.slice(0, 3000)}
         const signal = {id, kind: 'delivery' as const, workspaceId, sessionId, orderId: line.workOrderId, staffId: line.speakerId,
           summary: line.text, sourceTurnIds: [callId], sourceExperienceRefs: line.experienceRefs, evidence: [evidence]}
         // Advance the scan only after the source has a durable learning receipt or a pending record.
@@ -498,10 +596,10 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
           try { learnArtifacts(result, deferred, line.speakerId) } catch (error) { learningProblem?.(error) }
         }
         if (groups && line.memberCompleted) {
-          const commands = readCommandLog(join(groups.paths(session).dir, GROUP_COMMANDS_FILE), line.workOrderId ?? null).commands
+          const commands = readCommandLog(join(groups.paths(session, line.traceId).dir, GROUP_COMMANDS_FILE), line.workOrderId ?? null).commands
           const proofs = commands.flatMap(command => command.memberId === line.speakerId && command.turnId.startsWith(callId + '.')
             && command.endedAt && !command.unmatched && !command.unfinished && typeof command.exitCode === 'number'
-            ? [commandExperienceEvidence({workspaceId, sessionId, orderId: line.workOrderId,
+            ? [commandExperienceEvidence({workspaceId, sessionId, traceId: line.traceId, orderId: line.workOrderId,
               turnId: command.turnId, staffId: line.speakerId}, command.id, {...command, exitCode: command.exitCode})] : []).slice(-8)
           if (proofs.length) submitLearning({...signal, id: 'group-command:' + id, evidence: proofs}, deferred)
         }
@@ -530,20 +628,20 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       const engine = groups.loaded(session.id)
       if (!engine?.started && groupsCollected) continue
       try {
-        const lines = engine?.started ? engine.ledger.all() : readGroupLedger(join(groups.paths(session).dir, GROUP_LEDGER_FILE))
+        const lines = engine?.started ? engine.ledger.all() : groups.lines(session)
         publishGroup(session, lines)
       } catch (error) { failures.push(error) }
     }
     groupsCollected = true
     if (failures.length) throw failures[0]
   }
-  /** A file a group line links, as a result reads it now: inside the group's working directory, a document or page. */
-  function readGroupFile(base: string, file: GroupAttachment): Pick<V2Attachment, 'format' | 'content'> | undefined {
-    try {
-      const path = realpathSync(file.path)
-      if (!path.startsWith(base + sep) || !lstatSync(path).isFile() || lstatSync(path).size > GROUP_FILE_LIMIT || !['.md', '.txt', '.html', '.htm'].includes(extname(path).toLowerCase())) return
-      return {format: /\.html?$/i.test(path) ? 'html' : /\.md$/i.test(path) ? 'markdown' : 'text', content: readFileSync(path, 'utf8')}
-    } catch { return undefined }
+  function publishedGroupFile(session: V2Session, file: GroupAttachment, version?: string, base?: string) {
+    if (version) {
+      const kept = readKeptGroupFile(groups!.paths(session).dir, version)
+      if (kept) return kept
+    }
+    const current = base && readGroupFile(base, file)
+    return current && (!version || fileVersion(current) === version) ? current : undefined
   }
   /**
    * The results of a group's member lines not checked yet (each line once), and the review of an order batch that landed,
@@ -560,27 +658,26 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     }
     const since = saved === undefined && scanned === undefined ? (now?.() ?? new Date()).getTime() - GROUP_RESULTS_SINCE_MS : undefined
     const orders = new Set(store.view(session.workspaceId).orders.filter(order => order.sessionId === session.id).map(order => order.id))
+    let oldVersions: Map<string, string> | undefined
     let base: string | undefined
     try { base = realpathSync(groups!.workDir(session)) } catch { base = undefined }
     const rows: GroupResultLine[] = lines.flatMap(line => line.seq > from && (since === undefined || Date.parse(line.at) >= since)
       && (line.kind === 'message' || line.kind === 'progress') && line.ref === undefined && line.speakerId !== OWNER_ID && line.speakerId !== HOST_ID
-      && line.workOrderId !== undefined && orders.has(line.workOrderId) ? [{seq: line.seq, at: line.at, text: line.text, orderId: line.workOrderId,
+      && line.workOrderId !== undefined && orders.has(line.workOrderId) ? [{seq: line.seq, at: line.at, text: line.text, orderId: line.workOrderId, traceId: line.traceId,
         files: (line.attachments ?? []).flatMap((file, index) => {
-          const read = base ? readGroupFile(base, file) : undefined
-          return read ? [{id: lineId(line.seq) + '-' + index, label: file.name, ...read}] : []
+          const id = lineId(line.seq) + '-' + index
+          const version = file.version ?? (oldVersions ??= groupVersions(session)).get(id)
+          const content = version && publishedGroupFile(session, file, version, base)
+          return content ? [{id, label: file.name, ...content}] : []
         })}] : [])
     const seen = new Set([...store.resultNotices(), ...store.groupEvidence()].flatMap(row => row.attachments.map(file => row.orderId + ':' + file.version)))
     const results = groupResults(scope, store.workspace(session.workspaceId), session, rows, seen)
     if (results.length) {
       const files = new Map(rows.flatMap(row => row.files.map(file => [fileVersion(file), file] as const)))
-      const dir = join(groups!.paths(session).dir, GROUP_RESULTS_DIR)
-      mkdirSync(dir, {recursive: true, mode: 0o700})
+      const dir = groups!.paths(session).dir
       for (const ref of results.flatMap(row => row.attachments)) {
-        const file = files.get(ref.version), path = join(dir, ref.version + '.json')
-        if (!file || existsSync(path)) continue
-        const temporary = path + '.' + randomUUID() + '.tmp'
-        try { writeFileSync(temporary, JSON.stringify({format: file.format, content: file.content}), {mode: 0o600, flag: 'wx'}); renameSync(temporary, path) }
-        finally { rmSync(temporary, {force: true}) }
+        const file = files.get(ref.version)
+        if (file) keepGroupFile(dir, file)
       }
     }
     // Only lines that could deliver (files or reports) move the board's mark; plain talk is just remembered here.
@@ -596,28 +693,26 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   function groupResultFile(notice: StoredResult, fileId: string): V2Attachment | undefined {
     const ref = notice.attachments.find(file => file.id === fileId)
     if (!ref || !/^[a-f0-9]{64}$/.test(ref.version) || !groups) return
-    const session = store.session(notice.workspaceId, notice.sessionId)
-    if (!roster(session)) return
+    const session = store.resultSource(notice)?.session
+    if (!session || !roster(session)) return
     const {dir} = groups.paths(session)
-    try {
-      const kept = JSON.parse(readFileSync(join(dir, GROUP_RESULTS_DIR, ref.version + '.json'), 'utf8')) as {format?: unknown; content?: unknown}
-      if ((kept.format === 'html' || kept.format === 'markdown' || kept.format === 'text') && typeof kept.content === 'string'
-        && fileVersion({format: kept.format, content: kept.content}) === ref.version) return {id: ref.id, label: ref.label, format: kept.format, content: kept.content}
-    } catch { /* read from the line's file instead */ }
+    const kept = readKeptGroupFile(dir, ref.version)
+    if (kept) return {id: ref.id, label: ref.label, version: ref.version, ...kept}
     const [, seq, index] = /^g-(\d+)-(\d+)$/.exec(fileId) ?? []
     if (!seq || notice.messageId !== lineId(Number(seq))) return
     let line: GroupLine | undefined
-    try { line = (groups.loaded(session.id)?.ledger.all() ?? readGroupLedger(join(dir, GROUP_LEDGER_FILE))).find(row => row.seq === Number(seq)) } catch { return }
+    try { line = groups.lines(session, notice.traceId ?? INITIAL_WORKSPACE_TRACE).find(row => row.seq === Number(seq)) } catch { return }
     const file = line?.attachments?.[Number(index)]
     let base: string
     try { base = realpathSync(groups.workDir(session)) } catch { return }
     const read = file && readGroupFile(base, file)
-    return read && fileVersion(read) === ref.version ? {id: ref.id, label: ref.label, ...read} : undefined
+    return read && fileVersion(read) === ref.version ? {id: ref.id, label: ref.label, version: ref.version, ...read} : undefined
   }
 
   function learningGroupLines(session: V2Session) {
     if (!groups) return []
-    return groups.loaded(session.id)?.ledger.all() ?? readGroupLedger(join(groups.paths(session).dir, GROUP_LEDGER_FILE))
+    const ids = new Map(store.traceState(session).traces.flatMap(trace => groups.lines(session, trace.id)).map(line => [line.seq, line]))
+    return [...ids.values()].sort((a, b) => a.seq - b.seq)
   }
 
   function learningRefsAllowed(workspaceId: string, refs: readonly {id: string; version: number}[] | undefined, staffId?: string, replacementOf?: string) {
@@ -654,9 +749,17 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     const quote = file.content.slice(0, 3000).trim()
     if (!quote) return
     const messageId = /^g-\d+-\d+$/.test(ref.id) ? ref.id.slice(0, ref.id.lastIndexOf('-')) : result.messageId
+    let traceId = result.traceId
+    if (groups && messageId && messageId !== result.messageId) {
+      const session = store.resultSource(result)?.session
+      if (session && roster(session)) {
+        const line = groups.lines(session, traceId ?? INITIAL_WORKSPACE_TRACE).find(row => row.seq === lineSeq(messageId))
+        if (line) traceId = line.traceId ?? INITIAL_WORKSPACE_TRACE
+      }
+    }
     return {kind: 'artifact', id: workspaceFingerprint([result.id, ref.id, ref.version]), resultId: result.id,
       fileId: ref.id, version: ref.version, workspaceId: result.workspaceId, sessionId: result.sessionId,
-      orderId: result.orderId, messageId, staffId, quote}
+      orderId: result.orderId, messageId, staffId, traceId, quote}
   }
 
   function artifactLine(lines: readonly GroupLine[], result: StoredResult, fileId: string) {
@@ -673,7 +776,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   }
 
   function resolveLearningOriginals(evidence: ExperienceEvidence, audience: {staffId?: string}): ExperienceEvidence[] {
-    const {workspaceId, sessionId, orderId, messageId, staffId} = evidence
+    const {workspaceId, sessionId, orderId, messageId, staffId, traceId} = evidence
     if (!workspaceId || !sessionId || !orderId || !messageId || staffId && staffId !== audience.staffId) return []
     const groupMember = audience.staffId && evidence.kind === 'group'
       && evidence.id === 'group-member:' + sessionId + ':' + lineSeq(messageId) + ':' + audience.staffId
@@ -681,6 +784,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     const published = store.resultNotices()
     const rows = groupMember ? [...store.groupEvidence(orderId), ...published] : published
     const record = rows.find(row => row.workspaceId === workspaceId && row.sessionId === sessionId && row.orderId === orderId
+      && (row.traceId ?? INITIAL_WORKSPACE_TRACE) === (traceId ?? INITIAL_WORKSPACE_TRACE)
       && row.messageId === messageId && (groupMember || (row.id === evidence.id && row.version === evidence.version)))
     if (!record) return []
     return record.attachments.slice(0, 8).flatMap(file => artifactEvidence(record, file, audience.staffId) ?? [])
@@ -688,9 +792,9 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
 
   // Only the owning workspace can certify an archived source. Identical file versions count once even when forwarded.
   function verifyLearningOriginal(evidence: ExperienceEvidence, audience: {staffId?: string}): VerifiedExperienceOriginal | undefined {
-    const {workspaceId, sessionId, orderId, staffId, fileId} = evidence
-    if (!workspaceId || !sessionId || staffId !== audience.staffId || archived(workspaceId)) return
-    const session = store.session(workspaceId, sessionId)
+    const {workspaceId, sessionId, orderId, staffId, fileId, traceId} = evidence
+    if (!workspaceId || !sessionId || staffId !== audience.staffId || archived(workspaceId) || store.deletedReason(workspaceId, sessionId, orderId)) return
+    const session = store.traceBinding(store.session(workspaceId, sessionId), traceId ?? INITIAL_WORKSPACE_TRACE)
     if (orderId && store.delegation(workspaceId, orderId).sessionId !== sessionId) return
     if (evidence.kind === 'tool' || evidence.kind === 'test') {
       if (!roster(session)) {
@@ -702,9 +806,10 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       }
       if (!groups || !staffId || !evidence.turnId) return
       const line = learningGroupLines(session).find(item => item.speakerId === staffId && item.workOrderId === orderId
+        && (item.traceId ?? INITIAL_WORKSPACE_TRACE) === session.traceId
         && item.memberCallId && evidence.turnId!.startsWith(item.memberCallId + '.') && item.memberCompleted)
       if (!line || !learningRefsAllowed(workspaceId, line.experienceRefs, staffId)) return
-      return verifyCommandExperience(evidence, readCommandLog(join(groups.paths(session).dir,GROUP_COMMANDS_FILE), orderId ?? null).commands, staffId)
+      return verifyCommandExperience(evidence, readCommandLog(join(groups.paths(session, session.traceId).dir,GROUP_COMMANDS_FILE), orderId ?? null).commands, staffId)
     }
     if (evidence.kind !== 'artifact' || !orderId || !fileId) return
     const published = store.resultNotices().filter(entry => entry.orderId === orderId && entry.sessionId === sessionId && entry.workspaceId === workspaceId)
@@ -716,10 +821,11 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     const file = fileFromResult(result, fileId)
     if (!file) return
     const verified = artifactEvidence(result, ref, staffId, file)
-    if (!verified || evidence.id !== verified.id || evidence.quote !== verified.quote || evidence.messageId !== verified.messageId) return
+    if (!verified || evidence.id !== verified.id || evidence.quote !== verified.quote || evidence.messageId !== verified.messageId ||
+      (traceId ?? INITIAL_WORKSPACE_TRACE) !== (verified.traceId ?? INITIAL_WORKSPACE_TRACE)) return
     const origin = workspaceFingerprint(['artifact', file.content.replace(/\r\n/g, '\n').trim()])
     if (!roster(session)) {
-      const original = result.requestId && source.experienceSource?.(session, result.requestId)
+      const original = result.requestId && source.experienceSource?.(store.turnTrace(session, result.requestId), result.requestId)
       if (!original || original.staffId !== staffId) return
       const location = source.resultFileIdentity?.(session, fileId)
       const authoritative = result.kind === 'report' && !!location
@@ -778,6 +884,8 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   async function postGroupStart(start: GroupStart) {
     const session = store.session(start.workspaceId, start.sessionId)
     const engine = await groupEngine(session)
+    store.session(start.workspaceId, start.sessionId)
+    if (engine.traceId !== store.assertActiveTrace(session) || !store.pendingGroupStarts(session.id).some(row => row.requestId === start.requestId)) return
     const order = store.delegation(start.workspaceId, start.orderId)
     const coordinated = !!coordinate && !!order.reporting
     if ((coordinated || !engine.ledger.byRef(start.requestId)) && !orderEnded(order) && !order.paused &&
@@ -823,11 +931,12 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     const from = engagementScanned.get(session.id) ?? 0
     const last = lines.at(-1)?.seq ?? from
     if (last <= from) return
+    const active = store.traceState(session).active
     const jobs = lines.flatMap((line): EngagementJob[] => {
-      if (line.seq <= from || !line.engagement) return []
+      if (line.seq <= from || !line.engagement || (line.traceId ?? INITIAL_WORKSPACE_TRACE) !== active) return []
       const source = line.engagement
       return [{id: 'handoff-' + workspaceFingerprint([session.id,line.seq]).slice(0, 40), workspaceId: session.workspaceId,
-        sessionId: session.id, seq: line.seq, orderId: line.workOrderId, generation: source.generation,
+        sessionId: session.id, traceId: active, seq: line.seq, orderId: line.workOrderId, generation: source.generation,
         triggerSeq: source.triggerSeq, turn: line.speakerId === OWNER_ID ? 'owner' : line.speakerId === LIAISON_MEMBER_ID ? 'liaison' : 'member',
         answerTo: source.answerTo, memberId: source.memberId}]
     })
@@ -873,6 +982,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     if (!store.engagementActive(job.id)) { store.closeEngagement(job.id); return }
     const session = store.session(job.workspaceId, job.sessionId)
     const engine = await groupEngine(session)
+    if (!store.engagementActive(job.id)) { store.closeEngagement(job.id); return }
     const line = engine.ledger.get(job.seq)
     if (!line) { store.closeEngagement(job.id); return }
     const triggerSeq = job.triggerSeq ?? job.seq
@@ -909,7 +1019,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
           messages: [...earlier.map(row => engagementMessage(session, row, evidence, false)), ...recent.map(row => engagementMessage(session, row, evidence))],
           ...(order && {order: {id: order.id, title: order.title, promise: order.promise, original: original || order.promise, reporting: order.reporting,
             generation: order.generation, remainingTurns: order.remainingTurns}}),
-          pending, activeMembers, ...(order && {deliveredCheckpoints: store.engagementCheckpoints(order.id, order.generation)}),
+          pending, activeMembers, ...(order && {deliveredCheckpoints: store.engagementCheckpoints(order.id, order.generation, job.traceId)}),
           members: engine.members().map(({id,name}) => ({id,name})), triggerSeq: job.triggerSeq, now: (now?.() ?? new Date()).toISOString()}, signal)
       } catch {
         if (disposed || !store.engagementActive(job.id)) return
@@ -953,20 +1063,21 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
           promise: decision.promise.slice(0, 8000), reporting: decision.reporting ?? 'final' as const} : undefined
       if (decision.kind === 'continue' && !order && !intake && !answer) decision = {kind: 'none'}
       if (decision.kind === 'continue' && order && decision.text &&
-        store.repeatedEngagement(order.id, order.generation, decision, line.text, seq => engine.ledger.get(seq)?.text)) {
+        store.repeatedEngagement(order.id, order.generation, decision, line.text, seq => engine.ledger.get(seq)?.text, job.traceId)) {
         decision = {kind: 'ask', text: '已按同一步骤复核两次，仍缺少新的依据。是否调整交付范围，或先查看现有结果？', resolved: decision.resolved}
       }
       if (decision.kind === 'deliver' && decision.final !== false && order && (busy.length || pending.some(row => row.id !== answer?.id))) {
         decision = {kind: 'wait', reason: '等待仍在处理的成员或待回应事项完成。', resolved: decision.resolved}
       }
       if (decision.kind === 'none' && order && job.turn !== 'owner' && !busy.length &&
-        !store.engagementCheckpoints(order.id, order.generation).includes('final') && !pending.length) {
+        !store.engagementCheckpoints(order.id, order.generation, job.traceId).includes('final') && !pending.length) {
         decision = {kind: 'wait', reason: '本轮已有记录，接口人尚未确定下一执行步骤或验收条件。请在原会话补充要求或继续。'}
       }
       // The same unreadable results after the owner already answered: no owner reply can lift them, so the host says so once.
       let gapNote: string | undefined
       if (decision.kind === 'ask' && decision === modelAsk && gaps.length && order) {
-        const answeredSeq = Math.max(store.lastOwnerAnswerSeq(order.id, order.generation) ?? -1, answer ? line.seq : -1)
+        const previousAnswer = store.lastOwnerAnswerSeq(order.id, order.generation, seq => engine.ledger.get(seq)?.speakerId === OWNER_ID)
+        const answeredSeq = Math.max(previousAnswer ?? -1, answer ? line.seq : -1)
         const fresh = history.some(row => row.seq > answeredSeq && row.kind === 'message' && !gapSeqs.has(lineId(row.seq)) &&
           ![OWNER_ID, HOST_ID, LIAISON_MEMBER_ID].includes(row.speakerId))
         if (answeredSeq >= 0 && !fresh) {
@@ -1003,7 +1114,8 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     const publication = order && report && checkpoint && (final || order.reporting !== 'final')
     let result: StoredResult | undefined
     if (publication) {
-      const id = workspaceFingerprint([scope, session.id, order.id, order.generation, checkpoint])
+      const traceId = engine.traceId ?? INITIAL_WORKSPACE_TRACE
+      const id = workspaceFingerprint([scope, session.id, order.id, order.generation, checkpoint, ...traceId === INITIAL_WORKSPACE_TRACE ? [] : [traceId]])
       const cited = new Set(decision.evidenceSeqs ?? [])
       const visible = engine.projectLiaisonHistory(engine.ledger.all(), triggerSeq, order.id)
       const refs = visible.filter(item => item.workOrderId === order.id && item.kind === 'message' && !item.ref &&
@@ -1014,7 +1126,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       const allowed = new Set(visible.map(item=>lineId(item.seq)))
       const attachments = [...new Map(store.groupEvidence(order.id).filter(row => row.messageId && allowed.has(row.messageId) &&
         (!cited.size || cited.has(lineSeq(row.messageId) ?? 0))).flatMap(row => row.attachments).map(file => [file.version,file])).values()]
-      result = {id, workspaceId: session.workspaceId, sessionId: session.id, orderId: order.id, messageId: lineId(delivered.seq),
+      result = {id, workspaceId: session.workspaceId, sessionId: session.id, traceId, orderId: order.id, messageId: lineId(delivered.seq),
         title: final ? '工单回报' : '阶段回报', at: delivered.at, read: false, kind: final ? 'report' : 'partial',
         requestId: 'checkpoint:' + order.generation + ':' + checkpoint, version: workspaceFingerprint([text,attachments]), text, attachments}
     }
@@ -1050,7 +1162,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       if (archived(session.workspaceId)) continue
       try {
         const loaded = groups.loaded(session.id)
-        const lines = loaded?.started ? loaded.ledger.all() : readGroupLedger(join(groups.paths(session).dir, GROUP_LEDGER_FILE))
+        const lines = loaded?.started ? loaded.ledger.all() : groups.lines(session)
         groupMemberLearning(session, lines, true, delivered.filter(result => result.sessionId === session.id))
         if (coordinate && !session.closed) queueEngagement(session, lines)
       } catch { /* the ledger remains available to inspect and retry */ }
@@ -1061,13 +1173,10 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   /** Files a group line links (inside the group's working directory), as the liaison reads them for its review. */
   function groupFiles(session: V2Session, lines: readonly GroupLine[]) {
     let base: string | undefined
-    try { base = realpathSync(groups!.workDir(session)) } catch { return [] }
+    try { base = realpathSync(groups!.workDir(session)) } catch { /* archived file versions can still be read */ }
     return lines.flatMap(line => (line.attachments ?? []).flatMap(file => {
-      try {
-        const path = realpathSync(file.path)
-        if (!path.startsWith(base + sep) || !lstatSync(path).isFile() || lstatSync(path).size > GROUP_FILE_LIMIT || !['.md', '.txt', '.html', '.htm', ''].includes(extname(path))) return []
-        return [{id: file.name, label: file.name, format: 'text' as const, content: readFileSync(path, 'utf8')}]
-      } catch { return [] }
+      const contents = publishedGroupFile(session, file, file.version, base)
+      return contents ? [{id: file.name, label: file.name, ...contents}] : []
     }))
   }
   /** The liaison reviews one order batch of a group: the members' lines of that batch (and their files) against the order. */
@@ -1119,7 +1228,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         }
       } catch { /* the order is gone */ }
       // No verdict to post: the liaison is woken as usual to sum the batch up for the owner.
-      if (engine && row.group) {
+      if (engine && row.group && !store.deletedReason(row.workspaceId, row.sessionId, row.orderId)) {
         const group = row.group
         try { engine.wakeNow({type: 'wake', memberId: LIAISON_MEMBER_ID, batchId: group.batchId, done: group.done, results: group.results, workOrderId: row.orderId, triggerSeq: group.results.at(-1) ?? 0}) }
         catch { /* the group moved on */ }
@@ -1134,6 +1243,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     const order = store.delegation(row.workspaceId, row.orderId)
     const session = store.session(row.workspaceId, row.sessionId)
     const engine = await groupEngine(session)
+    if (store.deletedReason(row.workspaceId, row.sessionId, row.orderId) || store.acceptance(turnId)?.posted || engine.traceId !== store.assertActiveTrace(session)) return
     if (order.acceptance?.awaitingOwner && order.acceptance.turnId === turnId) {
       try { remind?.('workspace-acceptance:' + order.id + ':' + turnId, '接口人验收待你决定：「' + order.title + '」仍有缺口。请在 SuperHub 打开这张工单决定下一步。',
         {workspaceId: order.workspaceId, orderId: order.id}) }
@@ -1154,6 +1264,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   /** Held words the owner hands on in a group: the line already in the group calls whom it addresses (once, by request). */
   async function forwardGroup(session: V2Session, requestId: string, command: OwnerCommand) {
     const engine = await groupEngine(session)
+    store.assertActiveTrace(session, command.traceId ?? INITIAL_WORKSPACE_TRACE)
     const seq = lineSeq(command.ownerMessageId)
     if (seq === undefined) return workspaceError(409, '这句话还没进群，请稍后再试')
     if (store.receipt({id: requestId, key: 'req-' + requestId, hash: command.hash})) return
@@ -1164,15 +1275,20 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   function groupExecution(session: V2Session, orderId?: string) {
     let commands: ReturnType<typeof readCommandLog> = {commands: [], permissions: []}
     try {
-      const path = join(groups!.paths(session).dir, GROUP_COMMANDS_FILE)
-      if (existsSync(path)) commands = readCommandLog(path, orderId ?? null)
+      for (const trace of store.traceState(session).traces) {
+        const path = join(groups!.paths(session, trace.id).dir, GROUP_COMMANDS_FILE)
+        if (!existsSync(path)) continue
+        const part = readCommandLog(path, orderId ?? null)
+        commands.commands.push(...part.commands)
+        commands.permissions.push(...part.permissions)
+      }
     } catch { return workspaceError(503, '暂时无法读取执行记录，请稍后重试') }
-    const pending = approvals?.pending({workspaceId: session.workspaceId, sessionId: session.id, ...(orderId !== undefined && {orderId})}) ?? []
+    const pending = approvals?.pending({workspaceId: session.workspaceId, sessionId: session.id, ...(orderId !== undefined && {orderId})}).filter(currentApproval) ?? []
     return {...commands, runs: [], pending, directory: groupDirectory(session)}
   }
   /** The owner changed the tier of a group's order: one line in the group's execution record. */
   function appendGroupPermission(session: V2Session, orderId: string, change: V2PermissionChange) {
-    appendCommandLog(join(groups!.paths(session).dir, GROUP_COMMANDS_FILE), {kind: 'permission', id: 'p-' + dialogueKey(orderId, change.at).slice(0, 24), workOrderId: orderId,
+    appendCommandLog(join(groups!.paths(session, store.assertActiveTrace(session)).dir, GROUP_COMMANDS_FILE), {kind: 'permission', id: 'p-' + dialogueKey(orderId, change.at).slice(0, 24), workOrderId: orderId,
       at: change.at, from: change.from, to: change.to, by: 'owner'})
   }
   /** Where a group's members work: the group's own directory, the workspace's, or SuperHub's. */
@@ -1190,6 +1306,11 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     let outcome: 'sent' | 'unsent' | 'unknown' = 'unsent'
     if (!signal.aborted) {
       try {
+        const canStart = () => {
+          try { store.assertActiveTrace(session, session.traceId); return !store.deletedReason(session.workspaceId, session.id, workOrderId) }
+          catch { return false }
+        }
+        if (!canStart()) throw Object.assign(new Error('对话版本已更新'), {dispatched: false})
         const context = store.context(session, workOrderId)
         if (staffToken) {
           let valid = false
@@ -1200,7 +1321,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         const liaison = store.liaisonTurn(mutation.id)
         await source.send(structuredClone(session), { id: mutation.id, text, context: structuredClone(context), ...(liaison && {liaison}),
           ...(workOrderId ? {workOrderId} : {}), ...(extra.directory && {directory: extra.directory}), ...(extra.merged?.length && {merged: structuredClone(extra.merged)}),
-          ...(acceptedStart ? {acceptedStart:true} : {}) }, signal, {dispatched})
+          ...(acceptedStart ? {acceptedStart:true} : {}) }, signal, {dispatched, canStart})
         outcome = 'sent'
       } catch (error) {
         failure = error
@@ -1211,8 +1332,10 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     }
     current()
     store.finishTurn(mutation, outcome, outcome === 'unsent' && failure instanceof Error ? failure.message.slice(0, 240) : undefined)
+    const deleted = store.deletedReason(session.workspaceId, session.id, workOrderId)
+    if (deleted) return workspaceError(410, deleted)
     // The owner waiting on a direct message reads the failure in the reply; work that started on its own is reported here.
-    if (workOrderId && !signal.aborted && (outcome === 'unknown' || outcome === 'unsent' && acceptedStart)) {
+    if (workOrderId && !signal.aborted && session.traceId === store.assertActiveTrace(session) && (outcome === 'unknown' || outcome === 'unsent' && acceptedStart)) {
       const detail = failure instanceof Error && failure.message ? clipped(failure.message) : ''
       stalled(session.workspaceId, workOrderId, mutation.id, outcome === 'unknown'
         ? '这一轮执行中断了' + (detail ? '：' + detail : '') + '。打开工单让执行者汇报或继续。'
@@ -1256,6 +1379,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     if (parent && source.interject) {
       try { outcome = await source.interject(structuredClone(session), parent, words) } catch { outcome = 'rejected' }
       current()
+      store.assertActiveTrace(session, session.traceId)
     }
     if (outcome === 'steered') store.steered(mutation.id)
     if (outcome === 'rejected') {
@@ -1339,7 +1463,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       delivery = 'queued'
     } else {
       // Repairs and retries are derived again after a restart; they wait in memory only.
-      resume = () => send(session, mutation, value, requested, startGeneration, staffToken, mode)
+      resume = () => mode.revision ? resumeActiveEdit(session) : send(session, mutation, value, requested, startGeneration, staffToken, mode)
     }
     const controller = new AbortController()
     const settled = Promise.withResolvers<void>()
@@ -1380,6 +1504,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       if (flight.session.workspaceId === workspaceId && flight.workOrderId === orderId) flight.controller.abort()
     }
     const order = store.delegation(workspaceId, orderId)
+    if (store.deletedReason(workspaceId, order.sessionId)) return
     if (roster(store.session(workspaceId, order.sessionId))) {
       // The group's members stop what they do for this order; its other work goes on.
       const text = order.status === 'done' ? '这张工单已收单，为它进行的工作已叫停。' : order.paused ? '这张工单已暂停，为它进行的工作已叫停。' : '这张工单的指示变了，为它进行的工作已叫停。'
@@ -1402,7 +1527,10 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   async function ownerCommand(session: V2Session, mutation: Mutation, text: unknown, requested: unknown, refs?: ChatInputAttachment[]) {
     if (!judge || typeof text !== 'string') return
     const past = store.command(mutation)
-    if (past) return {outcome: past.outcome, ...(past.resolved && {resolved: past.resolved.kind})}
+    if (past) {
+      store.delegation(past.workspaceId, past.orderId)
+      return {outcome: past.outcome, ...(past.resolved && {resolved: past.resolved.kind})}
+    }
     if (store.receipt(mutation) || session.closed || !completionCandidate(text)) return
     let orderId: string | undefined
     try { orderId = store.target(session, requested) } catch { return }
@@ -1420,9 +1548,10 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     }
     const {judged, reason} = await reading
     current()
+    store.assertActiveTrace(session, session.traceId)
     if (judged === 'other') return
     const starts = store.pendingStarts(session.id).filter(row => row.delegationId === orderId)
-    const saved = store.recordCommand(mutation, store.session(session.workspaceId, session.id), orderId, text, judged, reason, now?.(), refs)
+    const saved = store.recordCommand(mutation, store.traceBinding(store.session(session.workspaceId, session.id), session.traceId), orderId, text, judged, reason, now?.(), refs)
     if (!saved) return
     if (saved.completed) stopOrderWork(session.workspaceId, orderId, starts)
     postCommand(saved.requestId)
@@ -1441,16 +1570,17 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
    */
   function forwardHeld(requestId: string, command: OwnerCommand) {
     const target = store.session(command.workspaceId, command.sessionId)
+    store.assertActiveTrace(target, command.traceId ?? INITIAL_WORKSPACE_TRACE)
     if (roster(target)) return forwardGroup(target, requestId, command).then(() => undefined)
     const original: Mutation = {id: requestId, key: 'req-' + requestId, hash: command.hash}
-    return send(store.session(command.workspaceId, command.sessionId), original, command.text, command.orderId, undefined, undefined, {owner: true, wait: false})
+    return send(store.traceBinding(target, command.traceId ?? INITIAL_WORKSPACE_TRACE), original, command.text, command.orderId, undefined, undefined, {owner: true, wait: false})
   }
   /** The owner's held words, then the liaison's note, into the conversation once each (again after a restart). */
   function postCommand(requestId: string) {
     const row = store.unpostedCommands().find(item => item.requestId === requestId)
     if (!row) return
     let session: V2Session
-    try { session = structuredClone(store.session(row.workspaceId, row.sessionId)) } catch { return }
+    try { session = store.traceBinding(store.session(row.workspaceId, row.sessionId), row.traceId ?? INITIAL_WORKSPACE_TRACE) } catch { return }
     if (roster(session)) {
       void groupEngine(session).then(engine => postGroupCommand(session, engine, requestId), () => { /* posted on the next read or start */ })
       return
@@ -1472,7 +1602,12 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     mode: SendMode = {}): Promise<V2Delivery | undefined> {
     if (typeof value !== 'string' || !value.trim() || value.length > 64_000) return workspaceError(400, '请填写有效的发言，最多 64000 字')
     if (roster(session)) return workspaceError(409, '群聊的发言不走单人回合，请在群里发言')
+    session = {...session, traceId: store.assertActiveTrace(session, session.traceId)}
     const saved = store.receipt(mutation)
+    if (saved?.kind === 'turn' && (saved.traceId ?? INITIAL_WORKSPACE_TRACE) !== session.traceId) return workspaceError(409, '这条发言已保存在原对话版本')
+    const orderId = typeof requested === 'string' ? requested : saved?.kind === 'turn' ? saved.reserved[0]?.id : saved?.kind === 'interject' ? saved.workOrderId ?? undefined : undefined
+    const deleted = store.deletedReason(session.workspaceId, session.id, orderId)
+    if (deleted) return workspaceError(410, deleted)
     const active = flights.get(session.id)
     if (saved?.kind === 'follow' && saved.state === 'stopped') return workspaceError(409,'工单授权已变更，这条排队的补充已停止')
     // Queued words are reserved as their own turn when their start row comes up.
@@ -1491,6 +1626,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       if (saved.state !== 'unsent') return workspaceError(409, UNKNOWN_TURN)
     }
     // The owner is never turned away by a busy conversation: the words join the running turn or wait for the next.
+    if (active && session.traceId !== active.session.traceId) return workspaceError(409, '正在结束编辑前的执行，请稍后继续')
     if (mode.owner && !saved && (active || store.pendingStarts(session.id).length)) return interject(session, mutation, value, requested, active)
     if (active) return workspaceError(409, '上一条发言正在处理，请稍候')
     const resumed = saved?.kind === 'turn' && saved.state === 'unsent' && requested === undefined
@@ -1519,9 +1655,11 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       .finally(() => {
         flights.delete(session.id)
         if (spot) locks.release(spot.key, mutation.id)
-        if (!disposed) settleWords(session, mutation.id)
+        const currentTrace = !disposed && store.traceState(session).active === session.traceId
+        if (currentTrace) settleWords(session, mutation.id)
         if (!disposed) queueMicrotask(() => {
           if (disposed || flights.has(session.id)) return
+          if (!currentTrace) { void resumeActiveEdit(session).catch(() => {}); return }
           const next = store.pendingStarts(session.id)[0]
           if (next) startWork(next)
         })
@@ -1552,7 +1690,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     try {
       const order = store.delegation(row.workspaceId, row.orderId)
       const session = store.session(row.workspaceId, row.sessionId)
-      const evidence = source.savedResults?.(structuredClone(session), row.turnId)
+      const evidence = source.savedResults?.(store.turnTrace(session, row.turnId), row.turnId)
       if (orderEnded(order) || order.paused || order.generation !== row.generation) outcome = {kind: 'skipped', reason: '工单已变更'}
       else if (!evidence) outcome = {kind: 'failed', reason: '本轮成果暂不可读，未能验收'}
       else {
@@ -1595,7 +1733,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   /** Post the liaison's verdict to the conversation once; an order left for the owner also reminds the owner once. */
   function post(turnId: string) {
     const row = store.acceptance(turnId)
-    if (!row?.note || row.posted) return
+    if (!row?.note || row.posted || store.deletedReason(row.workspaceId, row.sessionId, row.orderId)) return
     if (row.group) { void postGroup(turnId).catch(() => { /* posted again on the next start */ }); return }
     if (!source.note) return
     try {
@@ -1606,20 +1744,34 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         catch { /* the order page and 「今天」 still show it */ }
       }
       if (row.pass) tell('done', order, turnId, '「' + order.title + '」已完成，接口人验收通过。打开工单查看成果。')
-      const messageId = source.note(structuredClone(store.session(row.workspaceId, row.sessionId)), {id: 'acceptance-' + turnId, text: row.note, workOrderId: row.orderId})
+      const messageId = source.note(store.turnTrace(store.session(row.workspaceId, row.sessionId), turnId), {id: 'acceptance-' + turnId, text: row.note, workOrderId: row.orderId})
       store.acceptancePosted(turnId, messageId || undefined)
     } catch { /* retried on the next start */ }
   }
 
-  async function read(session: V2Session): Promise<V2Transcript> {
+  async function read(session: V2Session, traceId?: string, includeLate = false): Promise<V2Transcript> {
     if (roster(session)) {
-      try { return (await groupTranscript(session)).transcript }
+      try { return (await groupTranscript(session, undefined, traceId, includeLate)).transcript }
       catch { return { messages: [], issue: '暂时无法读取这场群聊的发言，请稍后重试' } }
+    }
+    const selected = store.traceBinding(session, traceId)
+    const activeTraceId = store.traceState(session).active
+    const historical = selected.traceId !== activeTraceId || !!session.deletedAt
+    const project = (transcript: V2Transcript) => ({...transcript, traceId: selected.traceId, activeTraceId,
+      messages: store.messageReferences(session, transcript.messages.map(message => {
+        const {canEdit, actions, held, ...row} = message
+        return {...row, traceId: message.traceId ?? selected.traceId,
+          ...!historical && {actions, held, ...canEdit && !session.closed && !archived(session.workspaceId)
+            && !store.deletedReason(session.workspaceId, session.id, messageWorkOrder(session, row)) && {canEdit: true}}}
+      }))})
+    if (historical) {
+      try { return project(source.readSnapshot?.(selected, includeLate) ?? await source.read(selected)) }
+      catch { return project({messages: [], issue: '暂时无法读取这场会话的历史版本'}) }
     }
     // Held words or a liaison note that did not reach the conversation are posted again before it is read.
     for (const row of store.unpostedCommands()) if (row.workspaceId === session.workspaceId && row.sessionId === session.id) postCommand(row.requestId)
     let transcript: V2Transcript
-    try { transcript = await source.read(structuredClone(session)) }
+    try { transcript = await source.read(selected) }
     catch { transcript = { messages: [], issue: '暂时无法读取这场会话的发言，请稍后重试' } }
     current()
     // Owner words the liaison held back and the choices on its messages are the board's record.
@@ -1633,9 +1785,187 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       if (retired.has(message.id)) return []
       return [message.replyTo && retired.has(message.replyTo) ? {...message,replyTo:undefined} : message]
     })}
-    const unknown = store.unknownTurns(session.id)
-    if (!unknown.length || (await Promise.all(unknown.map(id => confirmed(session,id)))).every(Boolean)) return transcript
-    return { messages: transcript.messages, issue: [transcript.issue, UNKNOWN_TURN].filter(Boolean).map(text => text!.replace(/。+$/, '')).join('。'), complete: false }
+    if (selected.traceId !== store.assertActiveTrace(session)) return read(session, traceId, includeLate)
+    const unknown = store.unknownTurns(session.id, selected.traceId)
+    if (!unknown.length || (await Promise.all(unknown.map(id => confirmed(selected,id)))).every(Boolean)) return project(transcript)
+    return project({ messages: transcript.messages, issue: [transcript.issue, UNKNOWN_TURN].filter(Boolean).map(text => text!.replace(/。+$/, '')).join('。'), complete: false })
+  }
+
+  const revising = new Map<string, Promise<string | undefined>>()
+
+  /** The cursor and edited words were saved together. On retry, dispatch only from that durable revision. */
+  function resumeActiveEdit(session: V2Session) {
+    const state = store.traceState(session)
+    const edit = state.traces.find(trace => trace.id === state.active)?.edit
+    if (!edit || edit.admitted) return Promise.resolve(edit?.messageId)
+    const pending = revising.get(state.active)
+    if (pending) return pending
+    const resumed = dispatchEdit(session, edit).finally(() => revising.delete(state.active))
+    revising.set(state.active, resumed)
+    return resumed
+  }
+
+  async function dispatchEdit(session: V2Session, edit: WorkspaceDialogueEdit): Promise<string | undefined> {
+    current()
+    store.assertActiveTrace(session, edit.traceId)
+    if (store.session(session.workspaceId, session.id).closed) return
+    if (roster(session)) {
+      const engine = await groupEngine(session)
+      store.assertActiveTrace(session, edit.traceId)
+      if (store.session(session.workspaceId, session.id).closed) return
+      if (edit.workOrderId) store.delegation(session.workspaceId, edit.workOrderId)
+      grantGroupFiles(session, edit.workOrderId, edit.inputAttachments)
+      const old = engine.ledger.byRequest(edit.traceId)
+      const line = engine.revision(edit.text, edit.traceId, edit.workOrderId, edit.inputAttachments)
+      store.finishDialogueEdit(session, edit.traceId, lineId(line.seq))
+      if (!old) learnOwnerWords(session, line)
+      return lineId(line.seq)
+    }
+    const target = store.traceBinding(session, edit.traceId)
+    const messageId = edit.messageId ?? source.hold?.(target, {id: edit.traceId, text: edit.text, workOrderId: edit.workOrderId})
+    if (!messageId) return workspaceError(503, '这场会话没有保存改稿的来源')
+    if (!edit.messageId) store.finishDialogueEdit(session, edit.traceId, messageId, false)
+    if (flights.has(session.id)) return messageId
+    const mutation = assignmentTurn(session.workspaceId, session.id, edit.traceId, edit.text, edit.workOrderId)
+    const receipt = store.receipt(mutation)
+    if (receipt?.kind === 'turn' && (receipt.state === 'unknown' || receipt.state === 'sent')) {
+      store.finishDialogueEdit(session, edit.traceId, messageId)
+      return messageId
+    }
+    await send(target, mutation, edit.text, edit.workOrderId, undefined, undefined, {discussion: !edit.workOrderId, wait: false, revision: true})
+    // A wait for the project directory is held in memory. Keep the edit pending until its normal turn receipt exists.
+    if (store.receipt(mutation)?.kind === 'turn') store.finishDialogueEdit(session, edit.traceId, messageId)
+    return messageId
+  }
+
+  async function editDialogue(session: V2Session, mutation: Mutation, anchorId: string, body: Record<string, unknown>) {
+    if (body.sessionId !== undefined && body.sessionId !== session.id || typeof body.expectedTraceId !== 'string' || !body.expectedTraceId
+      || typeof body.text !== 'string' || body.text.length > 64_000) return workspaceError(400, '请填写有效的修改内容并刷新对话版本')
+    const replay = async (prior: WorkspaceDialogueEdit) => {
+      const messageId = prior.admitted || prior.traceId !== store.traceState(session).active ? prior.messageId : await resumeActiveEdit(session)
+      if (!messageId) return workspaceError(409, '这次编辑已记录，请刷新对话版本')
+      return {sessionId: session.id, traceId: prior.traceId, messageId}
+    }
+    const prior = store.dialogueEditReceipt(session, mutation)
+    if (prior) return replay(prior)
+    if (session.closed) return workspaceError(409, '这场会话已关闭，重新打开后才可编辑')
+    const expected = store.assertActiveTrace(session, body.expectedTraceId)
+    const traceId = 'trace-' + randomUUID()
+    const edit: WorkspaceDialogueEdit = {sessionId: session.id, traceId, requestId: mutation.id, text: body.text}
+    if (roster(session)) {
+      const engine = await groupEngine(session)
+      const duplicate = store.dialogueEditReceipt(session, mutation)
+      if (duplicate) return replay(duplicate)
+      store.assertActiveTrace(session, expected)
+      const seq = lineSeq(anchorId)
+      const line = seq === undefined ? undefined : engine.ledger.get(seq)
+      if (!line) return workspaceError(404, '当前对话里没有这条消息')
+      if (!editableGroupLine(session, line)) return workspaceError(409, '这条消息缺少可还原的本人发言记录')
+      if (!edit.text.trim() && !line.inputAttachments?.length) return workspaceError(400, '发言正文和材料至少保留一项')
+      edit.workOrderId = line.workOrderId
+      if (line.inputAttachments?.length) {
+        if (!inputAttachments) return workspaceError(503, '群聊附件服务暂不可用')
+        edit.inputAttachments = inputAttachments.resolve({workspaceId: session.workspaceId, sessionId: session.id, workOrderId: line.workOrderId}, line.inputAttachments.map(file => file.id))
+      }
+      // Catch up original deliveries before the active view changes. Existing file versions are kept independently.
+      publishGroup(session, engine.ledger.all())
+      store.startDialogueEdit(session, mutation, expected, anchorId, edit, {beforeSeq: line.seq, frozenThrough: engine.ledger.lastSeq})
+      groups?.retire(session.id)
+    } else {
+      if (!edit.text.trim()) return workspaceError(400, '修改后的发言不能为空')
+      if (!source.prepareEdit || !source.canEdit || !source.hold) return workspaceError(409, '这个会话来源暂时无法还原历史发言')
+      const transcript = await read(session, expected)
+      const duplicate = store.dialogueEditReceipt(session, mutation)
+      if (duplicate) return replay(duplicate)
+      store.assertActiveTrace(session, expected)
+      const index = transcript.messages.findIndex(message => message.id === anchorId)
+      const anchor = transcript.messages[index]
+      const parent = store.traceBinding(session, expected)
+      if (!anchor) return workspaceError(404, '当前对话里没有这条消息')
+      if (!source.canEdit(parent, anchor)) return workspaceError(409, '这条消息缺少可还原的本人发言记录')
+      edit.workOrderId = messageWorkOrder(session, anchor)
+      if (edit.workOrderId) store.delegation(session.workspaceId, edit.workOrderId)
+      source.prepareEdit(parent, {...session, traceId}, transcript.messages, index)
+      store.startDialogueEdit(session, mutation, expected, anchorId, edit)
+      const waiting = flights.get(session.id)
+      if (waiting?.waiting) waiting.controller.abort()
+    }
+    for (const row of approvals?.pending({workspaceId: session.workspaceId, sessionId: session.id}) ?? []) {
+      if ((row.traceId ?? INITIAL_WORKSPACE_TRACE) === traceId) continue
+      try { approvals!.answer(row.id, false, {workspaceId: session.workspaceId, sessionId: session.id, orderId: row.workOrderId}) }
+      catch { /* it ended while the edit was being saved */ }
+    }
+    const messageId = await resumeActiveEdit(session)
+    if (!messageId) return workspaceError(409, '编辑已记录，改稿仍在等待送达')
+    return {sessionId: session.id, traceId, messageId}
+  }
+
+  async function allOutputSources(base: Omit<OutputSource, 'transcript' | 'fileOf'>): Promise<OutputSource[]> {
+    const {session} = base
+    return Promise.all(store.traceState(session).traces.map(async trace => {
+      if (roster(session)) {
+        try {
+          const {transcript, engine} = await groupTranscript(session, undefined, trace.id, true)
+          const lines = transcript.traceId === transcript.activeTraceId && !session.deletedAt ? engine.ledger.all() : groups!.lines(session, trace.id)
+          return {...base, transcript, fileOf: groupFileOf(lines)}
+        } catch { return {...base, transcript: {traceId: trace.id, messages: [], issue: '暂时无法读取这场会话的交付来源'}} }
+      }
+      const transcript = await read(session, trace.id, true)
+      const binding = store.traceBinding(session, trace.id)
+      return {...base, transcript, fileOf: source.resultFileIdentity ? (id: string) => source.resultFileIdentity!(binding, id) : undefined}
+    }))
+  }
+
+  async function sessionAttachment(session: V2Session, attachmentId: string, params: URLSearchParams, orderId?: string) {
+    const traceId = params.get('trace') ?? undefined, requestedVersion = params.get('version') ?? undefined
+    const messageId = params.get('message') ?? undefined
+    const state = store.traceState(session)
+    let target = traceId ?? state.active
+    store.traceBinding(session, target)
+    if (requestedVersion !== undefined && !/^[a-f0-9]{64}$/.test(requestedVersion)) return workspaceError(400, '请选择有效的文件版本')
+    if (orderId && (!traceId || !messageId || !requestedVersion)) return workspaceError(400, '请提供原交付的消息和文件版本')
+    if (roster(session)) {
+      if (!groups) return workspaceError(503, '群聊暂不可用，请稍后重试')
+      const [, seq, index] = /^g-(\d+)-(\d+)$/.exec(attachmentId) ?? []
+      const findLine = (id: string) => groups.lines(session, id).find(row => row.seq === Number(seq))
+      let line = seq ? findLine(target) : undefined
+      if (!traceId && !line && seq) {
+        for (const revision of state.traces.toReversed()) {
+          line = findLine(revision.id)
+          if (line) { target = line.traceId ?? revision.id; break }
+        }
+      }
+      const file = line?.attachments?.[Number(index)]
+      if (!line || !file || messageId && messageId !== lineId(line.seq) || orderId && messageWorkOrder(session, {workOrderId: line.workOrderId, at: line.at}) !== orderId) {
+        return workspaceError(404, '会话中没有这份可读的附件')
+      }
+      const version = file.version ?? groupVersions(session).get(attachmentId)
+      if (requestedVersion && requestedVersion !== version || !version && (target !== state.active || traceId !== undefined || session.deletedAt)) {
+        return workspaceError(404, '原版本不可用，可查看交付时的原话')
+      }
+      let base: string | undefined
+      try { base = realpathSync(groups.workDir(session)) } catch { /* the archived version is independent of the working copy */ }
+      const content = publishedGroupFile(session, file, version, base)
+      if (!content) return workspaceError(404, '原版本不可用，可查看交付时的原话')
+      return {traceId: target, attachment: {id: attachmentId, label: file.name, ...content, ...version && {version}}}
+    }
+    const findMessage = async (id: string) => (await read(session, id, true)).messages.find(row => (!messageId || row.id === messageId)
+      && (!orderId || messageWorkOrder(session,row) === orderId) && row.attachments?.some(ref => ref.id === attachmentId))
+    let allowed = await findMessage(target)
+    if (!allowed && !traceId) {
+      for (const revision of state.traces.toReversed()) {
+        if (revision.id === target) continue
+        allowed = await findMessage(revision.id)
+        if (allowed) { target = allowed.traceId ?? revision.id; break }
+      }
+    }
+    if (!allowed) return workspaceError(404, '会话中没有这份可读的附件')
+    const attachment = await source.attachment(store.traceBinding(session, target), attachmentId).catch(() => workspaceError(503, '暂时无法读取这份会话附件，请稍后重试'))
+    current()
+    if (!attachment || attachment.id !== attachmentId) return workspaceError(404, '原版本不可用，可查看交付时的原话')
+    const version = fileVersion(attachment)
+    if (requestedVersion && version !== requestedVersion) return workspaceError(404, '原版本不可用，可查看交付时的原话')
+    return {traceId: target, attachment: {...attachment, version}}
   }
 
   const route: Route = async ({ method, seg: requestPath, url, body, owner }, res) => {
@@ -1648,14 +1978,29 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     const listing = seg[1] === 'workspaces' && method === 'GET' && seg.length === 2
     const execution = (session: V2Session, orderId?: string) => {
       if (roster(session)) return groupExecution(session, orderId)
-      let view
-      try { view = session.kind === 'coding' && source.execution ? source.execution(structuredClone(session), orderId) : {commands:[],runs:[]} }
+      const view = {commands: [] as ReturnType<NonNullable<V2DialogueSource['execution']>>['commands'],
+        runs: [] as ReturnType<NonNullable<V2DialogueSource['execution']>>['runs'], permissions: [] as V2PermissionChange[]}
+      try {
+        if (session.kind === 'coding' && source.execution) for (const trace of store.traceState(session).traces) {
+          const part = source.execution(store.traceBinding(session, trace.id), orderId)
+          view.commands.push(...part.commands)
+          view.runs.push(...part.runs)
+          view.permissions.push(...part.permissions ?? [])
+        }
+      }
       catch { return workspaceError(503, '暂时无法读取执行记录，请稍后重试') }
-      const pending = session.kind === 'coding' ? approvals?.pending({workspaceId:session.workspaceId,sessionId:session.id,orderId:orderId ?? null}) ?? [] : []
-      return {permissions:[], ...view, pending, ...(session.kind === 'coding' && {directory: directoryView(session, orderId)})}
+      const pending = session.kind === 'coding' ? approvals?.pending({workspaceId:session.workspaceId,sessionId:session.id,orderId:orderId ?? null}).filter(currentApproval) ?? [] : []
+      return {...view, pending, ...(session.kind === 'coding' && {directory: directoryView(session, orderId)})}
     }
     const decide = (id: string, allow: unknown, where: {workspaceId: string; sessionId?: string; orderId?: string | null}) => {
       if (typeof allow !== 'boolean') return workspaceError(400, '请选择批准或拒绝这条命令')
+      const pending = approvals?.pending(where).find(row => row.id === id)
+      const expected = body.expectedTraceId
+      if (expected !== undefined && typeof expected !== 'string') return workspaceError(400, '请选择有效的对话版本')
+      if (pending && expected !== undefined && expected !== (pending.traceId ?? INITIAL_WORKSPACE_TRACE)) return workspaceError(409, '对话版本已更新，请刷新审批')
+      const deleted = pending && store.deletedReason(pending.workspaceId, pending.sessionId, pending.workOrderId ?? undefined)
+      if (deleted) return workspaceError(410, deleted)
+      if (pending && !currentApproval(pending)) return workspaceError(409, '这条命令来自先前的对话记录，请刷新后继续')
       if (!approvals?.answer(id, allow, where)) return workspaceError(409, '这条命令已处理或已过期，请刷新执行记录')
     }
     if ((!listing || queryScope !== null) && queryScope !== scope || body.scope !== undefined && body.scope !== scope) {
@@ -1691,9 +2036,9 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         if (memoryId) {
           const version = Number(url.searchParams.get('version'))
           if (!Number.isSafeInteger(version) || version < 1) return workspaceError(400, '请选择有效的经验版本')
-          return ok({memory: staff.experienceVersion(local, memoryId, version, sharedOnly), timeZone})
+          return ok({memory: experienceReferences(staff.experienceVersion(local, memoryId, version, sharedOnly)), timeZone})
         }
-        return ok(impact ? {impact:staff.impact(impact,local)} : {...staff.view(local,sharedOnly), timeZone})
+        return ok(impact ? {impact:staff.impact(impact,local)} : {...staffReferences(staff.view(local,sharedOnly)), timeZone})
       }
       if (local) store.writable(local)
       if (body.action === 'organize') {
@@ -1702,7 +2047,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         const organized = await learning.flush(local, sharedOnly)
         current()
         groups?.refresh(local)
-        return ok({...staff.view(local,sharedOnly), organized, timeZone})
+        return ok({...staffReferences(staff.view(local,sharedOnly)), organized, timeZone})
       }
       if (sharedOnly && body.audience !== 'shared') return workspaceError(400,'请从幕僚页面管理专属经验')
       if (['proposed','witnessedToken','evidence','observed','source','discoveredBy','dependencies','actor',
@@ -1733,7 +2078,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       const applied = staff.apply(local,operation,sharedOnly)
       // Joining, leaving or a new duty or experience changes who is in the workspace's groups and what they know.
       groups?.refresh(local)
-      return ok({...applied, timeZone})
+      return ok({...staffReferences(applied), timeZone})
     }
     if (seg[1] === 'notices') {
       const [, , id, command, fileId] = seg
@@ -1752,7 +2097,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       const spaces = new Map(store.list().map(space => [space.id, space]))
       const rows = (approvals?.pending() ?? []).flatMap(row => {
         const space = spaces.get(row.workspaceId)
-        if (!space) return []
+        if (!space || !currentApproval(row)) return []
         let order, session
         try { session = store.session(row.workspaceId,row.sessionId); order = row.workOrderId ? store.delegation(row.workspaceId,row.workOrderId) : undefined } catch { return [] }
         let memberName: string | undefined
@@ -1800,6 +2145,9 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       }
       // Read-only until restored: every other write here is refused, whatever it would change.
       if (workspaceArchived(workspace)) return workspaceError(409, WORKSPACE_ARCHIVED)
+      if ((child === 'sessions' || child === 'delegations') && childId && action === 'delete' && seg.length === 6) {
+        return ok(remove(mutation, workspaceId, child === 'sessions' ? 'session' : 'order', childId))
+      }
       if (child === 'delegations' && seg.length === 4) {
         const member = body.staffId !== undefined ? activeMember(workspaceId,body.staffId) : undefined
         const {delegation: created} = store.createDelegation(mutation, workspace, !coordinate ? body : {...body, reporting: body.reporting ?? 'final'}, member)
@@ -1821,12 +2169,13 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
           try { appendGroupPermission(session, childId, change) } catch { /* the order keeps permissionChangedAt */ }
         } else if (change && source.recordPermission) {
           // The tier itself is saved; a failed log line only loses the history entry.
-          try { source.recordPermission(structuredClone(session), childId, change) } catch { /* the order keeps permissionChangedAt */ }
+          try { source.recordPermission(store.traceBinding(session), childId, change) } catch { /* the order keeps permissionChangedAt */ }
         }
         return ok({order:delegation, delegation, permission:(delegation.permission ?? 'full-access') satisfies V2CodingPermission})
       }
       if (child === 'delegations' && childId && action === 'approvals' && attachmentId && seg.length === 7) {
         const order = store.delegation(workspaceId, childId)
+        store.session(workspaceId, order.sessionId)
         decide(attachmentId, body.allow, {workspaceId, sessionId:order.sessionId, orderId:order.id})
         return ok({order:shown(order), delegation:shown(order), decided:true})
       }
@@ -1834,12 +2183,16 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         const order = store.delegation(workspaceId, childId), before = order.generation
         const starts = store.pendingStarts(order.sessionId).filter(row => row.delegationId === childId)
         const result = store.act(mutation, workspaceId, childId, body, now?.())
-        if (store.delegation(workspaceId, childId).generation !== before) stopOrderWork(workspaceId, childId, starts)
+        const current = store.delegation(workspaceId, childId)
+        if (current.generation !== before) stopOrderWork(workspaceId, childId, starts)
         const delegation = shown(result.delegation)
         return ok({order:delegation, ...result, delegation})
       }
       if (child === 'directory' && seg.length === 4) return ok(store.setDirectory(mutation, workspaceId, body))
       if (child === 'sessions' && seg.length === 4) return ok(store.createSession(mutation, workspaceId, body))
+      if (child === 'sessions' && childId && action === 'messages' && attachmentId && seg[7] === 'edit' && seg.length === 8) {
+        return ok(await editDialogue(store.session(workspaceId, childId), mutation, attachmentId, body))
+      }
       if (child === 'sessions' && childId && action === 'approvals' && attachmentId && seg.length === 7) {
         const session = store.session(workspaceId, childId)
         // A group's cards belong to the members working there, whichever order they work on.
@@ -1896,6 +2249,17 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         }
         if (action === 'messages') {
           if (body.wait !== undefined && body.wait !== false) return workspaceError(400, '请求格式无效')
+          if (body.expectedTraceId !== undefined && typeof body.expectedTraceId !== 'string') return workspaceError(400, '请选择有效的对话版本')
+          const traceId = store.assertActiveTrace(session, body.expectedTraceId)
+          if (body.expectedTraceId === undefined && traceId !== INITIAL_WORKSPACE_TRACE) return workspaceError(409, '对话版本已更新，请刷新后继续')
+          const bound = {...session, traceId}
+          if (store.traceState(session).traces.some(trace => trace.id === traceId && trace.edit && !trace.edit.admitted)) {
+            await resumeActiveEdit(session)
+            store.assertActiveTrace(session, traceId)
+            if (store.traceState(session).traces.some(trace => trace.id === traceId && trace.edit && !trace.edit.admitted)) {
+              return workspaceError(409, '改稿正在等待送达，请稍后继续')
+            }
+          }
           if (roster(session)) {
             const orderId = store.target(session, body.workOrderId)
             const {inputAttachments: ids, ...original} = body
@@ -1906,19 +2270,19 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
             }
             const text = refs.length && body.text === undefined ? '' : body.text
             const request = ids === undefined ? mutation : mutationKey(seg, {...original, ...refs.length && {text, inputAttachments: refs.map(({id, name}) => [id, name])}})
-            const command = await ownerCommand(session, request, text, orderId, refs)
+            const command = await ownerCommand(bound, request, text, orderId, refs)
             if (command) {
               grantGroupFiles(session, orderId, refs)
               return ok({session: store.session(workspaceId, childId), command})
             }
-            return ok(await groupSay(session, request, text, orderId, refs))
+            return ok(await groupSay(bound, request, text, orderId, refs))
           }
           if (body.inputAttachments !== undefined && !(Array.isArray(body.inputAttachments) && body.inputAttachments.length === 0)) return workspaceError(400, '请在工作区群聊发送附件')
           // The liaison reads words about the order itself first; they never also go to the executor.
-          const command = await ownerCommand(session, mutation, body.text, body.workOrderId)
+          const command = await ownerCommand(bound, mutation, body.text, body.workOrderId)
           if (command) return ok({session: store.session(workspaceId, childId), command})
           // `wait: false`: answer once the words are with the executor (or queued), not when the turn ends.
-          const delivery = await send(session, mutation, body.text, body.workOrderId, undefined, undefined, {owner: true, wait: body.wait !== false})
+          const delivery = await send(bound, mutation, body.text, body.workOrderId, undefined, undefined, {owner: true, wait: body.wait !== false})
           current()
           return ok({ session: store.session(workspaceId, childId), ...(delivery && {delivery}) })
         }
@@ -1929,22 +2293,11 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       if (child === 'directory' && seg.length === 4) return ok(store.suggestDirectories(url.searchParams.get('path') ?? ''))
       // Every order's delivered files together; a conversation that cannot be read is left out and said so.
       if (child === 'outputs' && seg.length === 4) {
-        const orders = store.view(workspaceId).orders.filter(order => !store.isRetiredOrder(order.id))
-        const sessions = [...new Set(orders.map(order => order.sessionId))].map(id => store.session(workspaceId, id))
-        const unread: string[] = []
-        const sources = (await Promise.all(sessions.map(async (session): Promise<OutputSource | undefined> => {
-          const owned = orders.filter(order => order.sessionId === session.id).map(order => ({id: order.id, title: order.title}))
-          if (roster(session)) {
-            const group = await groupTranscript(session).catch(() => undefined)
-            if (!group) { unread.push(session.id); return undefined }
-            return {session, transcript: group.transcript, orders: owned, fileOf: groupFileOf(group.engine)}
-          }
-          const transcript = await read(session)
-          if (transcript.issue && !transcript.messages.length) { unread.push(session.id); return undefined }
-          return {session, transcript, orders: owned}
-        }))).filter(source => source !== undefined)
+        let unavailable = false
+        const sources = (await Promise.all(store.outputSources(workspaceId).map(base => allOutputSources(base).catch(() => { unavailable = true; return [] })))).flat()
+        unavailable ||= sources.some(row => !!row.transcript.issue && !row.transcript.messages.length)
         current()
-        return ok({workspaceId, outputs: workspaceOutputs(sources), ...(unread.length > 0 && {issue: '有的会话暂时读不到，产物可能不全，请稍后重试'})})
+        return ok({workspaceId, outputs: workspaceOutputs(sources), ...unavailable && {issue: '有的会话暂时读不到，产物可能不全，请稍后重试'}})
       }
       if (seg.length === 3) {
         const stored = store.view(workspaceId)
@@ -1964,13 +2317,17 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       }
       if (child === 'delegations' && childId && action === 'outputs' && seg.length === 6) {
         const order = store.delegation(workspaceId,childId)
-        const session = store.session(workspaceId,order.sessionId)
-        // Group attachments are read live from their path, so two lines linking one path are one output.
-        const group = roster(session) ? await groupTranscript(session).catch(() => undefined) : undefined
-        const outputs = group ? publishedOutputs(session, group.transcript, order.id, groupFileOf(group.engine))
-          : roster(session) ? [] : publishedOutputs(session, await read(session), order.id)
+        const base = store.outputSources(workspaceId, order.id)[0]
+        const sources = base ? await allOutputSources(base).catch(() => []) : []
+        const outputs = base ? publishedOutputs(base.session, sources.map(row => row.transcript), order.id, (id, trace) =>
+          sources.find(row => row.transcript.traceId === trace)?.fileOf?.(id)) : []
         current()
         return ok({workspaceId,delegationId:childId,outputs})
+      }
+      if (child === 'delegations' && childId && action === 'outputs' && attachmentId && seg.length === 7) {
+        const base = store.outputSources(workspaceId, childId)[0]
+        if (!base) return workspaceError(404, '没有这张工单的交付记录')
+        return ok(await sessionAttachment(base.session, attachmentId, url.searchParams, childId))
       }
       if (child === 'delegations' && childId && action === 'execution' && seg.length === 6) {
         const order = store.delegation(workspaceId,childId)
@@ -1985,25 +2342,42 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       }
       if (child === 'sessions' && childId) {
         const session = store.session(workspaceId, childId)
+        const trace = url.searchParams.get('trace') ?? undefined
         // Paging (`limit`, `before`, `after`, `around`): one window of the ordered messages; without them, the whole transcript.
         const paging = seg.length === 5 ? pageQuery(url.searchParams) : undefined
         if (seg.length === 5 && roster(session)) {
           const observedAt = Date.now()
-          const {transcript, engine} = await groupTranscript(session, paging)
+          const {transcript, engine} = await groupTranscript(session, paging, trace)
           const portraits = store.speakerPortraits(workspaceId, childId, [...new Set([...[...transcript.messages, ...transcript.pinned ?? []].flatMap(m => m.speakerId ? [m.speakerId] : []),
             ...engine.members().map(member => groupSpeaker(session, member.id))])], staff)
-          const group = groupView(session, engine)
-          return ok({ ...transcript, session: store.session(workspaceId, childId), portraits, observedAt, group,
-            ...(group.members.some(member => member.status !== 'idle' && member.status !== 'queued') && {working: true}) })
+          const group = transcript.traceId === transcript.activeTraceId ? groupView(session, engine) : undefined
+          return ok({ ...transcript, session: store.session(workspaceId, childId), portraits, observedAt, ...group && {group},
+            ...group?.members.some(member => member.status !== 'idle' && member.status !== 'queued') && {working: true} })
         }
         if (seg.length === 5) {
           const observedAt = Date.now()
-          const transcript = await read(session)
+          let transcript = await read(session, trace)
+          const anchor = paging?.around
+          if (trace && transcript.traceId !== transcript.activeTraceId && paging) {
+            const cursor = paging.around ?? paging.before ?? paging.after
+            if (cursor && !transcript.messages.some(message => message.id === cursor)) transcript = await read(session, trace, true)
+          }
+          const origin = anchor && transcript.messages.find(message => message.id === anchor)?.traceId
+          if (!trace && origin && origin !== transcript.traceId) transcript = await read(session, origin)
+          if (!trace && anchor && !transcript.messages.some(message => message.id === anchor)) {
+            for (const previous of store.traceState(session).traces.toReversed()) {
+              if (previous.id === transcript.traceId) continue
+              const historical = await read(session, previous.id, true)
+              const source = historical.messages.find(message => message.id === anchor)
+              if (source) { transcript = source.traceId && source.traceId !== previous.id ? await read(session, source.traceId, true) : historical; break }
+            }
+          }
           const window = paging && pageWindow(transcript.messages, message => message.id, paging)
           const messages = window ? window.items : transcript.messages
           const pinned = window ? pinnedOutside(transcript.messages, messages) : []
           const portraits = store.speakerPortraits(workspaceId, childId, [...messages, ...pinned].flatMap(m => m.speakerId ? [m.speakerId] : []),staff)
-          const flight = flights.get(childId)
+          const running = flights.get(childId)
+          const flight = transcript.traceId === transcript.activeTraceId && running?.session.traceId === transcript.traceId ? running : undefined
           return ok({ ...transcript, messages, ...(window && {page: window.page}), ...(pinned.length && {pinned}), session: store.session(workspaceId, childId), portraits, observedAt, ...(flight && !flight.waiting && {working: true}),
             ...(flight?.waiting && {waiting: waitingView(flight)}) })
         }
@@ -2012,26 +2386,8 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
           current()
           return ok({workspaceId,sessionId:session.id,...view})
         }
-        if (seg.length === 7 && action === 'attachments' && attachmentId && roster(session)) {
-          const {engine} = await groupTranscript(session)
-          const [, seq, index] = /^g-(\d+)-(\d+)$/.exec(attachmentId) ?? []
-          const line = seq ? engine.ledger.get(Number(seq)) : undefined
-          const file = line?.attachments?.[Number(index)]
-          if (!line || !file) return workspaceError(404, '会话中没有这份可读的附件')
-          const [read] = groupFiles(session, [{...line, attachments: [file]}])
-          if (!read) return workspaceError(404, '这份会话附件暂时不可读')
-          const format = /\.html?$/i.test(file.path) ? 'html' as const : /\.md$/i.test(file.path) ? 'markdown' as const : 'text' as const
-          return ok({ attachment: {id: attachmentId, label: file.name, format, content: read.content} })
-        }
         if (seg.length === 7 && action === 'attachments' && attachmentId) {
-          const transcript = await read(session)
-          const allowed = transcript.messages.some(message => message.attachments?.some(ref => ref.id === attachmentId))
-          if (!allowed) return workspaceError(404, '会话中没有这份可读的附件')
-          const attachment = await source.attachment(structuredClone(session), attachmentId)
-            .catch(() => workspaceError(503, '暂时无法读取这份会话附件，请稍后重试'))
-          current()
-          if (!attachment || attachment.id !== attachmentId) return workspaceError(404, '这份会话附件暂时不可读')
-          return ok({ attachment })
+          return ok(await sessionAttachment(session, attachmentId, url.searchParams))
         }
       }
     }
@@ -2056,6 +2412,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     return job
   }
   function startWork({workspaceId,sessionId,requestId,text,delegationId:workOrderId,generation,kind,staffToken,hash,merged}:AssignmentStart): Promise<unknown> {
+    if (store.deletedReason(workspaceId, sessionId, workOrderId)) return Promise.resolve()
     // Queued owner words keep their own request; liaison work uses its assignment turn.
     const turn = kind === 'interject' && hash ? {id: requestId, key: 'req-' + requestId, hash}
       : assignmentTurn(workspaceId, sessionId, requestId, text, kind === 'follow' ? workOrderId : undefined)
@@ -2107,6 +2464,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     // Groups with members mid-call (or queued work) start now, so those members are gated and resumed; hand-overs not
     // yet in their group are posted.
     if (groups) void groups.boot().then(() => postGroupStarts()).catch(() => { /* retried on the next start */ })
+    for (const session of store.pendingDialogueEdits()) void resumeActiveEdit(session).catch(() => { /* the stored edit keeps its request */ })
     runAcceptances()
     recoverGroupLedger()
   }, dispose() {

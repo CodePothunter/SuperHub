@@ -74,7 +74,7 @@ export function OrderPermission({ base, job, changed, archived = false }: { base
 export function ApprovalCard({ row, path, decided, actor }: { row: V2PendingApproval; path: string; decided: () => Promise<void>; actor?: string }) {
   const write = useV2Write(undefined, false)
   async function answer(allow: boolean) {
-    const receipt = await write.post<Scoped>(path + '/approvals/' + segment(row.id), { allow })
+    const receipt = await write.post<Scoped>(path + '/approvals/' + segment(row.id), {allow, ...(row.traceId && {expectedTraceId:row.traceId})})
     if (receipt) await decided()
   }
   const who = actor ?? toolName(row.tool)

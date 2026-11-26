@@ -9,6 +9,7 @@ import { button, backToOrder, CLAUDE_STAFF, CODEX_STAFF, codexStaff, createOrder
 import { acceptanceHost, until } from './acceptance-host.mjs'
 import { checkCalendarConnection, connectTestCalendar, openCreatedWorkspace, readCalendar, readPeople } from './workspace-daily-acceptance.mjs'
 import { checkWorkspaceDesign } from './workspace-design-acceptance.mjs'
+import { checkConversationEdits, checkLiaisonEdit, verifyConversationRestart } from './workspace-conversation-acceptance.mjs'
 
 const { chromium } = await import(pathToFileURL(process.env.CHIEF_PLAYWRIGHT_PATH).href)
 const binaries = providerBinaries()
@@ -265,8 +266,10 @@ try {
   await createOrder(desktop,'核对手机提示')
   await openOrderSession(desktop)
   await say(desktop, '@' + CLAUDE_STAFF.name + ' 请核对手机提交成功的提示。')
-  await messages.getByText('我检查过提交提示，手机页面可以直接显示确认文字。').waitFor()
-  assert.equal(await messages.locator('li').count(),2,'仅提供最终答复的来源只显示用户和答复两条')
+  const claudeReply = messages.getByText('我检查过提交提示，手机页面可以直接显示确认文字。',{exact:true})
+  await claudeReply.waitFor()
+  assert.equal(await claudeReply.count(),1,'仅提供最终答复的成员只显示一条答复')
+  assert.equal(await messages.locator('li[data-kind="progress"] .v2-byline strong').filter({hasText:CLAUDE_STAFF.name}).count(),0)
   await button(desktop,'关闭会话').click()
   await button(desktop.getByRole('dialog'), '确认关闭').click()
   await desktop.getByText(/群聊 · 你和 \d+ 位成员 · 已关闭/).first().waitFor()
@@ -277,9 +280,9 @@ try {
   const resumed = new URLSearchParams(new URL(desktop.url()).hash.slice(4))
   assert.equal(resumed.get('session'),closedSession.get('session'))
   assert.equal(resumed.get('order'),closedSession.get('order'))
-  assert.equal(await messages.locator('li').count(),2)
+  assert.equal(await claudeReply.count(),1)
   await say(desktop,'@' + CLAUDE_STAFF.name + ' 继续核对同一个工单里的提示。')
-  await until(async () => await messages.locator('li').count() === 4,'同一张工单在原会话继续发言')
+  await until(async () => await claudeReply.count() === 2,'同一张工单在原会话继续发言')
   console.log('PASS 群聊里接口人派活、DSH 幕僚成员署名、工单暂停恢复、Claude Code 成员单答复及原会话恢复续聊')
 
   await button(desktop,'今天').click()
@@ -365,6 +368,10 @@ try {
     assert.ok(session)
     return '#v2?' + new URLSearchParams({...Object.fromEntries(place), panel:'execution', session})
   }
+  const group = await checkConversationEdits({host,desktop,mobile,scope,workspace:project.id})
+  const liaisonEdit = await checkLiaisonEdit({host,page:desktop,scope})
+  await verifyConversationRestart({host,page:desktop,scope,group,liaison:liaisonEdit})
+  console.log('PASS 桌面和手机编辑原对话、回读同名旧产物及来源、单项删除并在重启后核对')
   await checkWorkspaceDesign({desktop,mobile,host,scope,password,project,groupHash:await conversationOf(groupHash),codingHash:await conversationOf(codingHash),picture})
   assert.deepEqual(errors,[])
   console.log('PASS 宿主重启后同一对话链接、群聊原话与附件恢复；人物、日历跨端读回；既有接口人对话创建和打开具名工作区')

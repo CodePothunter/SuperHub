@@ -69,6 +69,7 @@ describe('分页合并', () => {
     expect(pageParams()).toBe('limit=40')
     expect(pageParams({ before: 'g-3' })).toBe('limit=40&before=g-3')
     expect(pageParams({ around: '10' }, 20)).toBe('limit=20&around=10')
+    expect(pageParams({ around: 'g-3' }, 20, 'trace-2')).toBe('limit=20&trace=trace-2&around=g-3')
   })
 })
 

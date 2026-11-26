@@ -107,6 +107,27 @@ describe('本地工单的约定与周期交付', () => {
     await expect(f.service().apply(w,d,record,{...owner,messageId:'another-turn'})).rejects.toThrow('另一项操作')
   })
 
+  it('marks only the deleted workspace source while preserving commitments and frozen weekly report sources', async () => {
+    const f = fixture(), space = f.space('协作'), order = f.order(space,'演示')
+    f.say(order,'workspace-source','下周完成演示。',{traceId:'initial'})
+    expect((await f.http(order,{action:'record',requestId:'workspace-evidence',kind:'mine',messageId:'workspace-source',quote:'下周完成演示'})).status).toBe(200)
+    const detached = {sessionId:'liaison-run',messageId:'liaison-source',text:'先向接口人发样本。',traceId:'liaison-trace'}
+    await f.service().apply(space.id,order.id,{action:'record',requestId:'liaison-evidence',kind:'mine',quote:'先向接口人发样本'},detached)
+    expect((await f.http(order,{action:'draft',requestId:'frozen-week'})).status).toBe(200)
+    const saved = structuredClone(f.store().followupState(space.id,order.id))
+    const deleted = f.store().deleteTarget(mutationKey(['delete-session'],{requestId:'remove-session'}),space.id,'session',order.sessionId)
+    const view = (await f.http(order)).data
+    expect(view.sessionDeletedAt).toBe(deleted.deletedAt)
+    expect(view.commitments.map(row => row.source)).toMatchObject([
+      {kind:'session',messageId:'workspace-source',traceId:'initial',sessionDeletedAt:deleted.deletedAt},
+      {kind:'liaison',messageId:'liaison-source'},
+    ])
+    expect(view.reports[0]!.sources[0]!.sessionDeletedAt).toBe(deleted.deletedAt)
+    expect(view.reports[0]!.sources[1]).not.toHaveProperty('sessionDeletedAt')
+    expect(f.store().followupState(space.id,order.id)).toEqual(saved)
+    expect((await f.http(order,{action:'draft',requestId:'another-week'})).status).toBe(410)
+  })
+
   it('answers who still owes what in one selected workspace, paginating across orders without reading raw conversations', async () => {
     const f = fixture(), a = f.space('客户'), b = f.space('家庭')
     const one = f.order(a,'客户演示'), two = f.order(a,'客户样本'), hidden = f.order(b,'家庭')

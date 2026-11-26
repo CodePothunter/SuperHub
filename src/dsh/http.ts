@@ -146,7 +146,8 @@ export function runtimeRoutes(deps: StateDeps & { requestRoomExecution?: Request
     }
     const exporting = path === '/export'
     if (exporting && owner !== true) return json(res, 403, { error: '需要主人身份才能导出资料' }), true
-    const chatPath = path === '/chat' || path === '/chat/unread' || path === '/chat/seen'
+    const chatEdit = seg[0] === 'chat' && seg[1] === 'messages' && seg[3] === 'edit' && seg.length === 4
+    const chatPath = path === '/chat' || path === '/chat/unread' || path === '/chat/seen' || path === '/chat/source' || chatEdit
     if (deps.superhub && !owner && (chatPath || (seg[0] === 'rooms' && method === 'POST'))) {
       return json(res, 403, { error: '需要主人身份才能访问接口人对话或向讨论发送操作' }), true
     }
@@ -264,7 +265,25 @@ export function runtimeRoutes(deps: StateDeps & { requestRoomExecution?: Request
         return content === undefined ? json(res, 404, { error: '文件不可读' }) : json(res, 200, { content }), true
       }
       if (seg[0] === 'tickets' && seg[1] && seg[2] === 'document') return json(res, 200, documentView(deliveryDocument(engine, brain, seg[1], url.searchParams.get('path') ?? '', url.searchParams.get('version') || undefined))), true
-      if (path === '/chat') return json(res, 200, await deps.chat.view(pageQuery(url.searchParams))), true
+      if (path === '/chat') {
+        const trace = url.searchParams.get('trace')
+        const page = pageQuery(url.searchParams)
+        if (trace !== null) {
+          deps.superhub?.checkScope(url.searchParams.get('scope'))
+          if (!trace || trace.length > 120) return json(res, 400, { error: '对话版本标识不合法' }), true
+        }
+        const view = trace === null ? await deps.chat.view(page) : await deps.chat.view(page, trace)
+        return json(res, 200, { ...view, ...deps.superhub && { scope: deps.superhub.scope } }), true
+      }
+      if (path === '/chat/source' && deps.superhub) {
+        deps.superhub.checkScope(url.searchParams.get('scope'))
+        const sessionId = url.searchParams.get('sessionId'), messageId = url.searchParams.get('messageId')
+        if (!sessionId || sessionId.length > 160 || !messageId || messageId.length > 200) {
+          return json(res, 400, { error: '请提供原话及所在对话的标识' }), true
+        }
+        const source = await deps.chat.source(sessionId, messageId)
+        return json(res, 200, { scope: deps.superhub.scope, ...source }), true
+      }
       // 「一句话交办」的红点：上次看过之后接口人的新消息数（网页与手机共用服务端的已读点）
       if (path === '/chat/unread' && deps.liaisonSeen) {
         deps.superhub?.checkScope(url.searchParams.get('scope'))
@@ -337,10 +356,27 @@ export function runtimeRoutes(deps: StateDeps & { requestRoomExecution?: Request
       const seenAt = deps.liaisonSeen.mark(body.at)
       return done(200, { ...deps.superhub && { scope: deps.superhub.scope }, seenAt: new Date(seenAt).toISOString() })
     }
+    if (chatEdit) {
+      if (owner !== true) return done(403, { error: '需要主人身份才能编辑对话' })
+      if (!deps.superhub) return done(503, { error: '当前宿主无法编辑对话' })
+      deps.superhub.checkScope(body.scope ?? url.searchParams.get('scope'))
+      const { requestId, sessionId, expectedTraceId, text: revised } = body
+      if (typeof requestId !== 'string' || !/^[a-zA-Z0-9_-]{1,120}$/.test(requestId)) return done(400, { error: '请提供有效的请求标识' })
+      if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 160 || typeof expectedTraceId !== 'string' || !expectedTraceId
+        || expectedTraceId.length > 120) return done(400, { error: '请刷新接口人对话后再编辑' })
+      if (typeof revised !== 'string' || revised.length > 40_000 || revised.trimStart().startsWith('〔系统〕')) {
+        return done(400, { error: '请输入有效的主人原话，最多 40000 字' })
+      }
+      const result = await deps.chat.edit(seg[2]!, { sessionId, requestId, expectedTraceId, text: revised })
+      return done(200, { scope: deps.superhub.scope, ...result })
+    }
     if (path === '/chat') {
       const t = text(body.text, 40_000) // 主人可能贴进一大段别的助手的回答
       const mode = body.mode === 'queue' || body.mode === 'steer' ? body.mode : 'auto'
       const sessionId = text(body.sessionId, 100) || undefined
+      if (body.expectedTraceId !== undefined && typeof body.expectedTraceId !== 'string') return done(400, { error: '对话版本标识不合法' })
+      deps.chat.assertTrace(opt(body.expectedTraceId))
+      const trace = deps.chat.activeTrace()
       let inputAttachments: ChatInputAttachment[] | undefined
       if (body.inputAttachments !== undefined) {
         if (!owner) return done(403, { error: '需要主人身份才能发送聊天附件' })
@@ -358,11 +394,11 @@ export function runtimeRoutes(deps: StateDeps & { requestRoomExecution?: Request
         const receipt = await deps.superhub.submit({ ...body, requestId }, { channel: 'chat', sessionId, chatMode: mode, inputAttachments })
         if (receipt.items.every(item => item.state === 'conversation')) {
           await deps.superhub.deliver(receipt.id, receipt.items[0]!.id, receipt.source.text, receipt.source.requestId,
-            (said, id, refs) => deps.chat.say(said, mode, sessionId, id, refs))
+            (said, id, refs) => deps.chat.say(said, mode, sessionId, id, refs, trace))
         }
         return done(200, { ok: true, receipt: deps.superhub.view(receipt.id) })
       }
-      await deps.chat.say(t, mode, sessionId)
+      await deps.chat.say(t, mode, sessionId, undefined, [], trace)
       return done()
     }
     if (path === '/inbox') {

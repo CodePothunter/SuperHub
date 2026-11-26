@@ -36,4 +36,21 @@ describe('workspaceOutputs：编程会话与旧会话', () => {
     ])
     expect(rows.map(row => [row.key, row.deliveredBy])).toEqual([['s2/a', [{id: '旧执行者', name: '旧执行者'}]], ['s1/a', [{id: 'codex', name: 'Codex'}]]])
   })
+
+  it('keeps exact same-path versions and deduplicates inherited deliveries by their origin', () => {
+    const room = session('s')
+    const orders = [{id:'d1', title:'周报', deletedAt:'2026-11-26T00:00:00Z'}]
+    const first = line('m1', 1, {traceId:'initial', workOrderId:'d1', attachments:[{id:'doc',label:'周报.md',version:'old'}]})
+    const second = line('m2', 2, {traceId:'trace-2', workOrderId:'d1', attachments:[{id:'doc',label:'周报.md',version:'new'}]})
+    const initial = {traceId:'initial', messages:[first]}
+    const amended = {traceId:'trace-2', messages:[first,second]}
+    const fileOf = () => '周报.md'
+    const outputs = workspaceOutputs([initial,amended].map(transcript => ({session:room, transcript, orders, fileOf})))
+    expect(outputs).toHaveLength(1)
+    expect(outputs[0]?.orders).toEqual(orders)
+    expect(outputs[0]?.versions?.map(output => [output.traceId,output.messageId,output.attachment.version]))
+      .toEqual([['trace-2','m2','new'],['initial','m1','old']])
+    expect(publishedOutputs(room,[initial,amended],'d1',fileOf).map(output => [output.traceId,output.attachment.version]))
+      .toEqual([['initial','old'],['trace-2','new']])
+  })
 })

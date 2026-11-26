@@ -8,14 +8,18 @@ import { usePagedHistory, type PagedView } from './paged-history.ts'
 export const V2_ROOT = '/v2/workspaces'
 export const segment = encodeURIComponent
 export const V2Client = createContext({ scope: '', revoke: (_message: string) => {} })
-type Observation<T> = { key: string; data?: T; error?: string }
+type Observation<T> = { key: string; data?: T; error?: string; status?: number }
 const messageOf = (error: unknown) => error instanceof Error ? error.message : '读取工作区时出现问题'
 
-export function scopedResource(scope: string, resource: string) {
+export function resourceQuery(resource: string, values: URLSearchParams) {
   const [path, search] = resource.split('?')
   const params = new URLSearchParams(search)
-  params.set('scope', scope)
+  for (const [key, value] of values) params.set(key, value)
   return path + '?' + params
+}
+
+export function scopedResource(scope: string, resource: string) {
+  return resourceQuery(resource, new URLSearchParams({scope}))
 }
 
 export function clearV2PrivateCache(scope?: string) {
@@ -30,7 +34,7 @@ export function clearV2PrivateCache(scope?: string) {
 }
 
 /** A failed transport can keep its last observation. A denied or missing object cannot. */
-export function useV2Read<T extends Scoped>(resource: string | undefined, valid: (value: Scoped, resource: string) => value is T, interval?: number, revision?: number) {
+export function useV2Read<T extends Scoped>(resource: string | undefined, valid: (value: Scoped, resource: string) => value is T, interval?: number, revision?: string | number) {
   const { scope, revoke } = useContext(V2Client)
   const key = resource && scopedResource(scope, resource)
   const generation = useRef(0)
@@ -54,7 +58,7 @@ export function useV2Read<T extends Scoped>(resource: string | undefined, valid:
         revoke(messageOf(error))
         return
       }
-      setState(previous => ({ key, data: status !== 404 && previous?.key === key ? previous.data : undefined, error: messageOf(error) }))
+      setState(previous => ({ key, data: status !== 404 && status !== 410 && previous?.key === key ? previous.data : undefined, error: messageOf(error), status }))
     }
   }, [scope, key, resource, valid, revoke])
   useEffect(() => {
@@ -68,7 +72,8 @@ export function useV2Read<T extends Scoped>(resource: string | undefined, valid:
     void poll(true)
     return () => { stopped = true; clearTimeout(timer) }
   }, [key, refresh, interval, revision])
-  return { data: state?.key === key ? state?.data : undefined, error: state?.key === key ? state?.error : undefined, refresh }
+  const observation = state?.key === key ? state : undefined
+  return { data:observation?.data, error:observation?.error, ...(observation?.status !== undefined && {status:observation.status}), refresh }
 }
 
 /**
@@ -79,18 +84,30 @@ export function useV2PagedRead<V extends Scoped & PagedView<T>, T extends { id: 
   valid: (value: Scoped, resource: string) => value is V,
   options: { interval?: number; anchor?: string; following?: () => boolean; combine?: (previous: V | undefined, next: V) => V } = {}) {
   const { scope, revoke } = useContext(V2Client)
+  const key = resource && [scope, resource, options.anchor].join('\n')
+  const requested = useRef(key)
+  requested.current = key
+  // Preserve a source URL's resolved trace even when the active transcript
+  // changes. Ordinary conversation polls keep discovering the current trace.
+  const sourceTrace = useRef<{key: string; id: string}>(undefined)
   const read = useCallback(async (query: string) => {
-    if (!resource) throw new Error('没有可读的对话')
-    const data = await hubRead<Scoped>(scope, scopedResource(scope, resource + '?' + query))
-    if (!valid(data, resource)) throw new Error('工作区返回的内容不完整，请重新读取。')
+    if (!resource || !key) throw new Error('没有可读的对话')
+    const params = new URLSearchParams(query)
+    if (sourceTrace.current?.key === key) params.set('trace', sourceTrace.current.id)
+    const endpoint = resourceQuery(resource, params)
+    const data = await hubRead<Scoped>(scope, scopedResource(scope, endpoint))
+    if (!valid(data, endpoint)) throw new Error('工作区返回的内容不完整，请重新读取。')
+    if (key === requested.current && options.anchor && params.get('around') === options.anchor && data.traceId) {
+      sourceTrace.current = {key, id:data.traceId}
+    }
     return data
-  }, [scope, resource, valid])
+  }, [scope, resource, key, options.anchor, valid])
   return usePagedHistory<V, T>({
-    key: resource && scope + '\n' + resource, read, id: item => item.id, ...options,
+    key, read, id: item => item.id, ...options,
     failed: error => {
       const status = error instanceof ApiError ? error.status : undefined
       if (status === 401 || status === 403 || status === 409) { revoke(messageOf(error)); return 'stop' }
-      return status === 404 ? 'clear' : 'keep'
+      return status === 404 || status === 410 ? 'clear' : 'keep'
     },
     message: messageOf,
   })

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import type { IntakeContext } from '../core/superhub-intake.ts'
 import { workspaceArchived, type V2Message } from '../core/workspace-v2.ts'
 import type { FollowupView } from '../core/workspace-followup.ts'
-import { chatFromEvents } from './chat.ts'
+import { chatFromEvents, type LiaisonChat } from './chat.ts'
 import type { SessionEventLike } from './ports.ts'
 import type { nativeIntakeSource } from './superhub.ts'
 import type { workspaceV2Routes } from './workspace-v2.ts'
@@ -85,7 +85,7 @@ function projection(view: FollowupView, args: Args, offset: number) {
 }
 
 export async function liaisonOrderFollowup(store: WorkspaceV2Store, access: OrderFollowupAccess, args: Args, turn: OwnerTurn,
-  origin?: {context?:IntakeContext; operation?:'read'|'write'}) {
+  origin?: {context?:IntakeContext; operation?:'read'|'write'}, locate?: LiaisonChat['source']) {
   const {source} = turn
   const {action, work_order_id:named, reference, offset = 0} = args
   if (!['read','sources','record','resolve','schedule','draft'].includes(String(action))) throw new Error('请选择有效的工单跟进操作。')
@@ -147,7 +147,8 @@ export async function liaisonOrderFollowup(store: WorkspaceV2Store, access: Orde
   const requestId = createHash('sha256').update(JSON.stringify(['order-followup',source.requestId,order.id,action,identity])).digest('hex')
   const body = {action, requestId, ...(action === 'record' && {entries:args.entries}), ...(action === 'resolve' && {id:args.id}),
     ...(action === 'schedule' && (args.enabled === false ? {enabled:false} : {weekday:args.weekday,time:args.time ?? '17:00'}))}
-  const evidence = action === 'record' ? {sessionId:turn.sessionId,messageId:source.messageId,text:source.text,at:source.at} : undefined
+  const locator = action === 'record' ? await locate?.(turn.sessionId, source.messageId, source.requestId).catch(() => undefined) : undefined
+  const evidence = action === 'record' ? {sessionId:turn.sessionId,messageId:source.messageId,text:source.text,at:source.at,locator} : undefined
   const result = await access.apply(id,order.id,body,evidence)
   return {...target, ...projection(result,args,0)}
 }

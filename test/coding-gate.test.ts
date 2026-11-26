@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { V2CodingPermission } from '../src/core/workspace-v2.ts'
 import { commandApprovals, type PendingCommand } from '../src/dsh/approvals.ts'
 import { APPROVAL_COMMAND_LIMIT, CodingGate, GATE_DEADLINE_ENV, GATE_SOCKET_ENV, GATE_TOKEN_ENV, hookArguments, HOOK_SLACK_MS, llmReviewer, parseReview,
-  TOOL_SLACK_SECONDS, type GateRequest, type Reviewer } from '../src/dsh/coding-gate.ts'
+  TOOL_SLACK_SECONDS, type CodingGateOptions, type GateRequest, type Reviewer, type ReviewVerdict } from '../src/dsh/coding-gate.ts'
 import type { HostContext, Llm } from '../src/dsh/ports.ts'
 import type { GateLine } from '../src/dsh/workspace-command-log.ts'
 
@@ -22,7 +22,8 @@ afterEach(() => {
 
 const host = {logger: {warn: () => {}, info: () => {}}} as unknown as HostContext
 
-function setup(options: {tier?: V2CodingPermission; review?: Reviewer; timeoutMinutes?: number; reviewTimeoutMs?: number; missing?: boolean} = {}) {
+function setup(options: {tier?: V2CodingPermission; review?: Reviewer; timeoutMinutes?: number; reviewTimeoutMs?: number; missing?: boolean;
+  executionRefusal?: CodingGateOptions['executionRefusal']} = {}) {
   const dir = temp()
   const hookScript = join(dir, "owner's hooks", 'hook.js')
   mkdirSync(dirname(hookScript))
@@ -31,7 +32,7 @@ function setup(options: {tier?: V2CodingPermission; review?: Reviewer; timeoutMi
   const approvals = commandApprovals(host, () => undefined, {timeoutMinutes: options.timeoutMinutes ?? 30, onRequest: row => asked.push(row)})
   const state = {tier: options.tier as V2CodingPermission | undefined, missing: options.missing ?? false}
   const gate = new CodingGate({scope: 'brain', socketDir: join(dir, 'run'), hookScript, approvals, review: options.review,
-    reviewTimeoutMs: options.reviewTimeoutMs, node: '/opt/node 24/bin/node',
+    reviewTimeoutMs: options.reviewTimeoutMs, node: '/opt/node 24/bin/node', executionRefusal: options.executionRefusal,
     order: () => {
       if (state.missing) throw new Error('gone')
       return {permission: state.tier, title: '清理探针', promise: '删除工作目录里的 probe.txt', original: '把 probe.txt 删掉'}
@@ -45,6 +46,20 @@ function setup(options: {tier?: V2CodingPermission; review?: Reviewer; timeoutMi
 }
 
 describe('命令把关：档位 × 风险', () => {
+  it('工单删除后拒绝后续调用，已在等待的自动审查无法重新放行', async () => {
+    const entered = Promise.withResolvers<void>(), review = Promise.withResolvers<ReviewVerdict>()
+    let deleted = false
+    const t = setup({tier:'approve-for-me', review:async () => { entered.resolve(); return review.promise },
+      executionRefusal: () => deleted ? '这张工单已删除' : undefined})
+    const waiting = t.ask('rm probe.txt')
+    await entered.promise
+    deleted = true
+    review.resolve({decision:'allow', reason:'曾获准删除探针'})
+    await expect(waiting).resolves.toMatchObject({decision:'deny',reason:expect.stringContaining('工单已删除')})
+    await expect(t.ask('git status')).resolves.toMatchObject({decision:'deny',reason:expect.stringContaining('工单已删除')})
+    expect(t.asked).toHaveLength(0)
+    expect(t.lines.map(row => row.decision)).toEqual(['rejected','rejected'])
+  })
   it('普通命令在三档下都直接放行并留痕', async () => {
     for (const tier of [undefined, 'ask', 'approve-for-me', 'full-access'] as const) {
       const review = vi.fn<Reviewer>()

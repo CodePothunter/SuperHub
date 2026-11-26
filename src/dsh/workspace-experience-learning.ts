@@ -29,6 +29,7 @@ export interface ExperienceOwnerSource {
   text: string
   workspaceId?: string
   sessionId?: string
+  traceId?: string
   orderId?: string
   messageId?: string
 }
@@ -266,6 +267,7 @@ export function createExperienceLearning(options: Options) {
 
   function ownerEvidence(source: ExperienceOwnerSource, quote: string): ExperienceEvidence {
     return {kind: 'owner', id: source.id, workspaceId: source.workspaceId, sessionId: source.sessionId,
+      ...(source.traceId && {traceId: source.traceId}),
       orderId: source.orderId, messageId: source.messageId, quote}
   }
 

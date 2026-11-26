@@ -13,6 +13,8 @@ import { liaisonSpeakerId, workspaceSpeakerId } from './workspace-speaker-id.ts'
 import { checkProjectDirectory } from './project-directory.ts'
 import type { ExperienceRef, ExperienceSelection, WorkspaceExperiencePort } from '../core/workspace-experience.ts'
 import { experienceDelta, experienceHistory, experiencePrompt, experienceRevoked } from './workspace-group-members.ts'
+import { INITIAL_WORKSPACE_TRACE } from './workspace-dialogue-trace.ts'
+import { fileVersion } from './workspace-notices.ts'
 
 export interface CodingExperienceResult {
   workspaceId: string
@@ -104,6 +106,8 @@ interface Journal {
   groupLead?: string
   groupExperience?: ExperienceRef[]
   groupExperienceTask?: string
+  /** Experience versions that may have influenced the inherited public group prefix. */
+  replayGroupExperience?: ExperienceRef[]
   /** The first order may keep using the original working copy. Later orders have sibling directories. */
   workRootOrder?: string | null
   /**
@@ -153,6 +157,19 @@ function readSpeakers(session: V2Session, lead: string, journal: Journal): V2Mes
       return {...message, speakerId: workspaceSpeakerId(lead, 'executor', session.executor)}
     }
     return message
+  })
+}
+
+/** Older journals already kept these exact bytes, before references carried version digests. */
+function versionFiles(messages: V2Message[], attachments: readonly V2Attachment[]) {
+  let archived: Map<string, V2Attachment> | undefined
+  return messages.map(message => {
+    if (!message.attachments?.some(file => !file.version)) return message
+    archived ??= new Map(attachments.map(file => [file.id, file]))
+    return {...message, attachments: message.attachments.map(ref => {
+      const file = archived?.get(ref.id)
+      return !ref.version && file ? {...ref, version: fileVersion(file)} : ref
+    })}
   })
 }
 
@@ -250,7 +267,9 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
   }
   function files(session: V2Session): SessionFiles {
     const workspace = dialogueKey(scope, session.workspaceId), room = dialogueKey(workspace, session.id)
-    const records = scopedDirectory(root, ['ops', 'superhub-v2-dialogues', workspace, room])
+    const parts = ['ops', 'superhub-v2-dialogues', workspace, room]
+    if (session.traceId && session.traceId !== INITIAL_WORKSPACE_TRACE) parts.push('traces', dialogueKey(session.traceId))
+    const records = scopedDirectory(root, parts)
     const work = scopedDirectory(root, ['work', 'superhub-v2', workspace, room])
     // DSH discovers project instructions from cwd up to the nearest .git marker.
     if (session.kind === 'group') scopedDirectory(work, ['.git'])
@@ -267,7 +286,7 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
         && (!msg.speakerId || previous.speakerId === msg.speakerId) && (!msg.workOrderId || previous.workOrderId === msg.workOrderId)
         && (!group || previous.at === msg.at)) continue
       const attachments = msg.role !== 'agent' || relay ? [] : group ? groupDocuments(msg) : linkedFiles(msg.text, msg.id, work)
-      const visible = attachments.length ? {...msg, attachments: attachments.map(({id, label}) => ({id, label}))} : msg
+      const visible = attachments.length ? {...msg, attachments: attachments.map(file => ({id: file.id, label: file.label, version: fileVersion(file)}))} : msg
       for (const a of attachments) if (!journal.attachments.some(stored => stored.id === a.id)) journal.attachments.push(a)
       if (at === -1) journal.messages.push(visible)
       else journal.messages[at] = {...previous, ...visible, at: group ? msg.at : previous!.at}
@@ -283,7 +302,10 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
     if (change(journal)) save(location.journal, journal)
   }
   async function submit(session: V2Session, input: V2TurnInput, outer: AbortSignal, location: SessionFiles, entry: Live, events?: V2TurnEvents) {
+    const stillCurrent = () => { if (events?.canStart?.() === false) throw beforeDispatch('对话版本已更新') }
+    stillCurrent()
     const journal = load(location.journal)
+    const firstInFork = !!session.traceId && session.traceId !== INITIAL_WORKSPACE_TRACE && !journal.members.length
     const orderId = selectedOrder(session, input)
     if (orderId && !session.delegationIds.includes(orderId)) throw beforeDispatch('这张工单不属于本场会话。')
     const old = journal.turns.find(t => t.id === input.id)
@@ -345,7 +367,7 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
         }
         if (options.gate) {
           try {
-            lease = options.gate.open({workspaceId: session.workspaceId, sessionId: session.id, ...(orderId && {orderId}), turnId: input.id,
+            lease = options.gate.open({workspaceId: session.workspaceId, sessionId: session.id, traceId: session.traceId, ...(orderId && {orderId}), turnId: input.id,
               tool: session.executor === 'codex' ? 'codex' : 'claude-code', cwd: workDir}, line => appendCommandLog(location.commands, line))
           } catch (error) { throw beforeDispatch(error instanceof Error ? error.message : 'SuperHub 命令把关不可用，未启动编程工具。') }
         }
@@ -448,6 +470,7 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
         let answer: Awaited<ReturnType<typeof staff.answer>> | undefined
         let picked: ExperienceSelection | undefined, retained: ExperienceRef[] = []
         while (!answer) {
+          stillCurrent()
           const used = added.length
           const said = [words, ...added.map(row => OWNER_LABEL + row.text)].join('\n\n')
           const selection = select(said, staff.member.staffId, added.at(-1)?.text ?? ownerTask)
@@ -496,7 +519,9 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
         const instruction = '你在本工作区的具名讨论群中。需要协作者时使用本群原生团队工具，并让实际参与者自己发言。向群成员发送的文字会出现在群记录中。需要交付文件时，将全文放在 Markdown 围栏代码块里，首行写三个反引号、markdown、text 或 html，再写 title="文件名"。要引用本轮发言，可在消息开头单独写〔回复原话 "' + userId + '"〕。' + SPEAKER_GUIDE + '\n' + context
         const selection = groupSelection
         const behavior = selection && experiencePrompt(selection)
-        const recap = groupReopened && earlier.filter(message => message.speakerId === 'owner').slice(-12).map(spoken)
+        const safeToReplay = !selection || !experienceRevoked(selection, journal.replayGroupExperience)
+        const recap = firstInFork ? earlier.filter(message => message.speakerId === 'owner' || safeToReplay).map(spoken)
+          : groupReopened && earlier.filter(message => message.speakerId === 'owner').slice(-12).map(spoken)
         const ownerContext = recap && recap.length ? '同一工单此前的主人原话：\n' + JSON.stringify(recap) : ''
         const settled = new Map<string, boolean>()
         const root = group.lead.id
@@ -508,6 +533,7 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
           return groups.steer(root, input.id, words.id, OWNER_LABEL + words.text)
         })
         try {
+          stillCurrent()
           await groups.run(group.lead, group.teams, input.id, words, [instruction,behavior,ownerContext].filter(Boolean).join('\n\n'), signal, (rows, members) => {
             const changed = publish(journal, rows, location.work, true)
             if (changed || JSON.stringify(members) !== JSON.stringify(journal.members)) {
@@ -585,6 +611,7 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
             ...(lease && tool === 'codex' && {gate: lease, ...(options.codexTrustWaitMs !== undefined && {trustWaitMs: options.codexTrustWaitMs})}),
             onSteerable: handle => { steer = handle },
             beforeInput: () => {
+              stillCurrent()
               current()
               submitting = true
               if (nativeSession && selection) saveBinding(nativeSession)
@@ -732,6 +759,38 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
     if (changed) save(location.journal, current)
   }
   return {
+    canEdit(session, message) {
+      if (message.role !== 'user' || message.speakerId !== 'owner' || message.relayed || !/^u-[a-f0-9]{32}$/.test(message.id)) return false
+      return load(files(session).journal).messages.some(row => row.id === message.id && row.role === 'user' && row.text === message.text)
+    },
+    prepareEdit(parent, child, messages, before) {
+      const source = files(parent), fork = files(child)
+      const journal = load(source.journal)
+      const prefix = messages.slice(0, before).map(({actions: _actions, held: _held, canEdit: _canEdit, ...row}) => row)
+      const ids = new Set(prefix.map(row => row.id))
+      const attachments = new Set(prefix.flatMap(row => row.attachments?.map(file => file.id) ?? []))
+      const lead = groups.leadId(parent.workspaceId, parent.id)
+      const turns = journal.turns.filter(row => row.state === 'done' && ids.has(ownerMessageId(lead, row.id))).map(row => ({...row,
+        replyIds: row.replyIds?.filter(id => ids.has(id)), interjections: row.interjections?.filter(item => ids.has(ownerMessageId(lead, item.id))),
+        process: undefined, nativeSessionId: undefined, resumed: undefined}))
+      const inherited: Journal = {...empty(), messages: prefix, turns,
+        attachments: journal.attachments.filter(file => attachments.has(file.id)),
+        workRootOrder: journal.workRootOrder ?? (journal.turns.length ? parent.legacyMessageOrder?.id ?? null : undefined),
+        ...(child.kind === 'group' && {groupLead: lead + '-' + dialogueKey(child.traceId!).slice(0, 12),
+          replayGroupExperience: experienceHistory(journal.replayGroupExperience, journal.groupExperience)})}
+      save(source.journal + '.snapshot', {...empty(), messages, attachments: journal.attachments})
+      save(fork.journal, inherited)
+    },
+    readSnapshot(session, includeLate) {
+      const location = files(session)
+      const sealed = existsSync(location.journal + '.snapshot')
+      const preserved = load(location.journal + '.snapshot')
+      if (sealed && !includeLate) return {messages: versionFiles(preserved.messages, preserved.attachments)}
+      const covered = new Set(preserved.messages.map(message => message.id))
+      const journal = load(location.journal)
+      const late = readSpeakers(session, groups.leadId(session.workspaceId, session.id), journal).filter(message => !covered.has(message.id))
+      return {messages: versionFiles([...preserved.messages, ...late], [...preserved.attachments, ...journal.attachments])}
+    },
     experienceSource(session, turnId) {
       const turn = load(files(session).journal).turns.find(row => row.id === turnId && row.state === 'done')
       if (turn) return {refs: turn.experience ?? [], staffId: turn.experienceStaffId}
@@ -770,8 +829,7 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
       return join(root, 'work', 'superhub-v2', ...sibling ?? [workspace, room])
     },
     savedResults(session, requestId) {
-      const workspace = dialogueKey(scope, session.workspaceId), room = dialogueKey(workspace, session.id)
-      const journal = load(join(root, 'ops', 'superhub-v2-dialogues', workspace, room, 'source.json'))
+      const journal = load(files(session).journal)
       const index = journal.turns.findIndex(turn => turn.id === requestId)
       const turn = journal.turns[index]
       if (!turn || turn.state !== 'done') return
@@ -828,8 +886,10 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
       const relayed = new Set(journal.turns.filter(turn => /^(start|follow)-/.test(turn.id) && !turn.liaison).map(turn => ownerMessageId(lead, turn.id)))
       const messages = readSpeakers(session, lead, journal)
         .map(message => message.delivery === 'pending' && !live ? {...message, delivery: 'unknown' as const} : message)
-        .map(message => message.role === 'user' && relayed.has(message.id) ? {...message, relayed: true as const} : message)
-      return {messages, ...(issue ? {issue, complete} : {})}
+        .map(message => message.role === 'user' && relayed.has(message.id) ? {...message, relayed: true as const}
+          : message.role === 'user' && message.speakerId === 'owner' && !message.relayed && /^u-[a-f0-9]{32}$/.test(message.id)
+            ? {...message, canEdit: true as const} : message)
+      return {messages: versionFiles(messages, journal.attachments), ...(issue ? {issue, complete} : {})}
     },
     async confirmed(session, requestId) {
       const location = files(session)
@@ -926,9 +986,11 @@ export function createV2DialogueSource(options: Options): V2DialogueSource & {di
       appendCommandLog(files(session).commands, {kind: 'permission', id: 'p-' + randomUUID(), workOrderId, at: change.at, from: change.from, to: change.to, by: 'owner'})
     },
     async attachment(session, id) {
-      const journal = load(files(session).journal)
+      const location = files(session)
+      const journal = load(location.journal)
+      const snapshot = load(location.journal + '.snapshot')
       if (journal.messages.some(m => m.attachments?.some(ref => ref.id === id))) {
-        const file = journal.attachments.find(a => a.id === id)
+        const file = snapshot.attachments.find(a => a.id === id) ?? journal.attachments.find(a => a.id === id)
         if (file) {
           const {locationId: _locationId, ...attachment} = file
           return attachment

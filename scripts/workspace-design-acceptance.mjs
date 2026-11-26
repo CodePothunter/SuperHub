@@ -173,6 +173,9 @@ async function checkLiveMotion(page,base,hash) {
   // Archived display names and independently identified, same-named people can coexist in an older projection.
   const archivedId = 'archived-display-name-only'
   const peers = ['s-'+ '3'.repeat(24),'s-'+ '4'.repeat(24),'s-'+ '5'.repeat(24)]
+  const visibleShapes = () => feed(page).locator('.v2-chat-avatar').evaluateAll(icons =>
+    [...new Set(icons.map(el => el.dataset.shape).filter(shape => shape !== 'neutral'))])
+  const activeShapes = await visibleShapes()
   let reordered = false
   const sessionRead = url => url.pathname.endsWith('/sessions/'+sessionId)
   await page.route(sessionRead,async route => {
@@ -205,8 +208,8 @@ async function checkLiveMotion(page,base,hash) {
     reordered = true
     await page.waitForFunction(() => document.querySelector('[data-message-id^="former-"]')?.dataset.messageId === 'former-2')
     assert.deepEqual(await pairings(),initial,'历史顺序改变也能读到同一位成员的署名与头像')
-    const shapes = await feed(page).locator('.v2-chat-avatar').evaluateAll(icons => [...new Set(icons.map(el => el.dataset.shape).filter(shape => shape !== 'neutral'))])
-    assert.equal(shapes.length,5,'五位具名参与者各有可辨认的轮廓')
+    const shapes = await visibleShapes()
+    assert.equal(shapes.length,activeShapes.length + peers.length,'归档里的三位具名参与者各有可辨认的轮廓')
   } finally { await page.unroute(sessionRead) }
 }
 

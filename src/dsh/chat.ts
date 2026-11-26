@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto'
 import type { ChatInputAttachment } from '../core/chat-attachments.ts'
 import type { Disposition } from '../core/model.ts'
 import type { Store } from '../core/store.ts'
+import type { IntakeContext } from '../core/superhub-intake.ts'
 import { LIAISON_PRODUCT_GUIDE, ORDER_FOLLOWUP_TOOL } from '../core/workspace-product.ts'
 import { mergeHistory } from './liaison.ts'
 import type { TicketReplyReceipt } from './room-work.ts'
@@ -19,6 +20,8 @@ import type { Agent, NativePromptPart, SessionController, SessionEventLike } fro
 import { liaisonRoomRequest, type DiscussionReceipt, type DiscussionResult } from './room-results.ts'
 import { profileImportId } from '../core/profile-import.ts'
 import { pageWindow, speechCursor, type PageInfo, type PageQuery } from '../core/paging.ts'
+import { INITIAL_LIAISON_TRACE, liaisonAccepted, liaisonEditError, liaisonForkPrefix, liaisonTraceConflict,
+  type LiaisonEdit, type LiaisonEditRequest, type LiaisonTraceBinding, type LiaisonTraces } from './liaison-traces.ts'
 
 /** 接口人处理一件事的过程中的一步：想了什么，或者用了什么工具。 */
 export interface ChatStep {
@@ -34,6 +37,9 @@ export interface ChatMessage {
   seq: number
   /** First public event in an aggregated liaison reply, shared by the live and completed views. */
   firstSeq?: number
+  /** The edit receipt supplies an anchor before the native user event is visible. */
+  messageId?: string
+  canEdit?: boolean
   role: 'you' | 'liaison'
   text: string
   requestId?: string
@@ -48,7 +54,7 @@ export interface ChatMessage {
   /** 只来自 chief_inbox 的宿主回执，按事件去向解析，不从模型文字猜工单。 */
   dispatches?: ChatDispatch[]
   discussions?: DiscussionReceipt[]
-  workspaces?: { id: string; name: string; delegationId?: string; delegationTitle?: string }[]
+  workspaces?: { id: string; name: string; delegationId?: string; delegationTitle?: string; workOrderDeletedAt?: string }[]
   profileImports?: { importId: string }[]
 }
 
@@ -80,6 +86,9 @@ export interface ChatView {
   observedAt?: number
   /** 当前第二大脑绑定的接口人会话，用于阻止旧窗口把消息发到新上下文。 */
   sessionId?: string
+  scope?: string
+  traceId?: string
+  activeTraceId?: string
   messages: ChatMessage[]
   busy: boolean
   live?: LiveTurn
@@ -312,43 +321,125 @@ export const offsetSpeech = (message: ChatMessage, offset: number): ChatMessage 
   ...message, seq: message.seq + offset, ...(message.firstSeq !== undefined && {firstSeq: message.firstSeq + offset})
 })
 
+export interface LiaisonEditing {
+  traces: LiaisonTraces
+  binding(): LiaisonTraceBinding
+  waitRotation(): Promise<void>
+  events(sessionId: string): Promise<readonly SessionEventLike[]>
+  origin(source: { requestId: string; text: string }): { context?: IntakeContext; operation?: 'read' | 'write' } | undefined
+  checkPrefix(events: readonly SessionEventLike[], context: IntakeContext | undefined, text: string): void
+  create(sessionId: string): Promise<void>
+  prepare(sessionId: string, sourceId: string): Promise<Agent>
+  deliver(edit: LiaisonEdit, send: () => Promise<void>): Promise<void>
+  assertCurrent(): void
+}
+
 export class LiaisonChat {
   private readonly parts: LiaisonParts
   private readonly sent = new Map<string, Promise<void>>()
   private delivering = 0
+  private editRunning = false
+  private tail: Promise<unknown> = Promise.resolve()
   /** session 传一个会话 id 表示只有一段（不换段）；传 LiaisonParts 支持换段。 */
   constructor(private readonly controller: SessionController, session: string | LiaisonParts, private readonly agent: () => Promise<Agent>,
     private readonly notices: () => ChatView['notices'] = () => [],
     private readonly dispatchState?: (eventId: string) => Omit<ChatDispatch, 'eventId'> | undefined,
     private readonly workReplies?: () => TicketReplyReceipt[],
-    private readonly orderLabel?: (workspaceId:string,orderId:string) => string | undefined,
+    private readonly orderLabel?: (workspaceId:string,orderId:string) => string | { title: string; deletedAt?: string } | undefined,
     private readonly discussionResults?: (receipts: readonly DiscussionReceipt[], options?: { historical?: boolean }) => Promise<DiscussionResult[]>,
     private readonly input?: { service: ChatAttachments; forRequest: AttachmentLookup },
-    private readonly beforeDelivery?: (requestId: string, text: string) => Promise<void>) {
+    private readonly beforeDelivery?: (requestId: string, text: string) => Promise<void>,
+    private readonly editing?: LiaisonEditing) {
     this.parts = typeof session === 'string' ? fixedParts(session) : session
   }
 
   sending(): boolean { return this.delivering > 0 }
+  editingHistory(): boolean { return this.editRunning }
 
-  project(events: readonly SessionEventLike[]) { return chatFromEvents(events, LIAISON_HISTORY_MAX, this.input?.forRequest) }
+  project(events: readonly SessionEventLike[]) {
+    const result = chatFromEvents(events, LIAISON_HISTORY_MAX, this.input?.forRequest)
+    const traces = this.editing?.traces
+    if (traces) for (const message of result.messages) {
+      const id = message.requestId && traces.revision(message.requestId)
+      if (id) message.messageId = id
+    }
+    return result
+  }
+
+  activeTrace(): string { return this.editing?.traces.activeTraceId ?? INITIAL_LIAISON_TRACE }
+
+  /** Old commitments stored raw DSH occurrence IDs. Resolve them once the owner follows that source. */
+  async source(sessionId: string, nativeMessageId: string, requestId?: string) {
+    const editing = this.editing
+    if (!editing) throw liaisonEditError(503, '当前宿主无法定位接口人原话')
+    editing.assertCurrent()
+    const isActiveSegment = () => editing.binding().segments.some(part => part.id === sessionId)
+    if (!isActiveSegment() && !editing.traces.nativeIds().has(sessionId)) throw liaisonEditError(404, '接口人原话已不可用')
+    const events = await editing.events(sessionId)
+    editing.assertCurrent()
+    const exact = events.find(event => {
+      if (event.type !== 'user/message') return false
+      const data = event.data as {id?: string; source?: {kind?: string; rpcId?: string}} | undefined
+      return data?.source?.kind === 'user' && (data.id === nativeMessageId || (!data.id && String(event.seq) === nativeMessageId)
+        || requestId !== undefined && data.source.rpcId === requestId)
+    })
+    if (exact) {
+      const rpcId = (exact.data as {source?: {rpcId?: string}}).source?.rpcId
+      const history = isActiveSegment() ? await this.history() : undefined
+      const matches = editing.traces.snapshots().flatMap(([traceId, snapshot]) => {
+        const segment = snapshot.segments.find(part => part.id === sessionId)
+        return segment ? [{ traceId, offset: segment.offset, messages: snapshot.messages }] : []
+      })
+      const active = editing.binding().segments.find(part => part.id === sessionId)
+      if (active && history && history.traceId === this.activeTrace()) matches.push({ traceId: history.traceId, offset: active.offset, messages: history.history })
+      for (const { traceId, offset, messages } of matches) {
+        const message = messages.find(row => row.role === 'you' && row.seq === exact.seq + offset && row.requestId === rpcId)
+        if (message) return { sessionId: this.parts.base(), traceId, messageId: chatCursor(message) }
+      }
+    }
+    throw liaisonEditError(404, '接口人原话已不可用')
+  }
+
+  private serial<T>(run: () => Promise<T>): Promise<T> {
+    const operation = this.tail.then(run)
+    this.tail = operation.catch(() => {})
+    return operation
+  }
 
   /** 对话历史（含之前各段的归档）、进行中的一轮和其中的讨论回执。 */
   private async history() {
-    const agent = await this.agent()
+    let current: string, traceId: string, agent: Agent
+    do {
+      current = this.parts.current()
+      traceId = this.activeTrace()
+      agent = await this.agent()
+    } while (current !== this.parts.current() || traceId !== this.activeTrace())
     const observedAt = Date.now()
     const { messages, live } = this.project(agent.session?.snapshotEvents() ?? [])
     const offset = this.parts.offset()
-    const current = offset ? messages.map(m => offsetSpeech(m, offset)) : messages
+    const active = offset ? messages.map(m => offsetSpeech(m, offset)) : messages
     const archived = this.parts.archived()
     // 完整的合并历史（不截断）：分页在它上面取窗口，旧客户端与未读仍按最近 80 条。
-    const history = archived.length ? mergeHistory(archived, current, Infinity) : current
-    const receipts = [...archived, ...current].flatMap(message => message.discussions ?? []).concat(live?.discussions ?? [])
-    return { agent, observedAt, offset, history, live, receipts }
+    const history = archived.length ? mergeHistory(archived, active, Infinity) : active
+    const pending = this.editing?.traces.activeEdit()
+    if (pending?.nativeId === agent.id && pending.phase !== 'preparing' && !active.some(m => m.messageId === pending.messageId)
+      && (pending.phase !== 'accepted' || [...agent.inbox?.nextStep ?? [], ...agent.inbox?.nextTurn ?? []].some(m => m.source?.rpcId === pending.messageId))) {
+      history.push({ seq: (active.at(-1)?.seq ?? offset) + 1, messageId: pending.messageId, time: pending.at,
+        role: 'you', text: pending.request.text, ...pending.attachments.length && { inputAttachments: pending.attachments } })
+    }
+    const receipts = history.flatMap(message => message.discussions ?? []).concat(live?.discussions ?? [])
+    return { agent, observedAt, offset, history, live, receipts, traceId }
   }
 
   /** 不带 `page` 时返回最近 80 条（旧客户端）；带 `page` 时返回那一页并附 `page`。派工状态、工单标签只解析返回的消息。 */
-  async view(page?: PageQuery): Promise<ChatView> {
-    const { agent, observedAt, offset, history: all, live, receipts } = await this.history()
+  async view(page?: PageQuery, trace?: string): Promise<ChatView> {
+    const frozen = trace && trace !== this.activeTrace() ? this.editing?.traces.snapshot(trace) : undefined
+    if (trace && trace !== this.activeTrace() && !frozen) throw liaisonEditError(404, '没有这版接口人对话')
+    const { agent, observedAt, offset, history: all, live, receipts, traceId } = frozen
+      ? { agent: undefined, observedAt: frozen.observedAt, offset: 0, history: frozen.messages, live: undefined,
+        receipts: frozen.messages.flatMap(m => m.discussions ?? []), traceId: trace }
+      : await this.history()
+    if (trace && trace !== traceId) return this.view(page, trace)
     const window = page ? pageWindow(all, chatCursor, page) : undefined
     const history = window ? window.items : all.slice(-LEGACY_CHAT_LIMIT)
     const resolve = (sources: ChatDispatch[] | undefined) => (Array.isArray(sources) ? sources : []).flatMap(source => {
@@ -359,19 +450,22 @@ export class LiaisonChat {
       return [{ eventId: source.eventId, ...state }]
     })
     const labels = (links: NonNullable<ChatMessage['workspaces']>) => links.map(link => {
-      const title = link.delegationId && this.orderLabel?.(link.id,link.delegationId)
-      return title ? {...link,delegationTitle:title} : link
+      const label = link.delegationId && this.orderLabel?.(link.id,link.delegationId)
+      if (!label) return link
+      if (typeof label === 'string') return {...link,delegationTitle:label}
+      return {...link,delegationTitle:label.title, ...label.deletedAt && {workOrderDeletedAt:label.deletedAt}}
     })
-    const resolved = (message: ChatMessage): ChatMessage => ({ ...message, ...(message.dispatches && {dispatches:resolve(message.dispatches)}),
-      ...(message.workspaces && {workspaces:labels(message.workspaces)}) })
+    const resolved = ({ canEdit: _canEdit, ...message }: ChatMessage): ChatMessage => ({ ...message, ...(message.dispatches && {dispatches:resolve(message.dispatches)}),
+      ...(message.workspaces && {workspaces:labels(message.workspaces)}),
+      ...!frozen && this.editing && this.controller.fork && message.role === 'you' && message.requestId && { canEdit: true } })
     const discussionResults = await this.discussionResults?.(receipts)
     return {
-      sessionId: this.parts.base(), observedAt,
+      sessionId: this.parts.base(), observedAt, traceId, activeTraceId: this.activeTrace(),
       messages: history.map(resolved),
-      busy: agent.status === 'running' || live !== undefined, ...live ? { live: { ...live,
+      busy: agent?.status === 'running' || live !== undefined, ...live ? { live: { ...live,
         ...(live.firstSeq !== undefined && {firstSeq: live.firstSeq + offset}), ...(live.dispatches && {dispatches:resolve(live.dispatches)}),
-        ...(live.workspaces && {workspaces:labels(live.workspaces)}) } } : {}, notices: this.notices(),
-      ...this.workReplies ? { workReplies: this.workReplies() } : {},
+        ...(live.workspaces && {workspaces:labels(live.workspaces)}) } } : {}, notices: frozen ? [] : this.notices(),
+      ...!frozen && this.workReplies ? { workReplies: this.workReplies() } : {},
       ...(discussionResults?.length && { discussionResults }),
       ...(window && { page: window.page }),
     }
@@ -396,14 +490,169 @@ export class LiaisonChat {
     if (expectedSession && expectedSession !== this.parts.base()) throw Object.assign(new Error('第二大脑已切换，请刷新对话后重新发送'), { status: 409 })
   }
 
+  assertTrace(expectedTrace?: string) {
+    if ((expectedTrace ?? INITIAL_LIAISON_TRACE) !== this.activeTrace()) throw liaisonTraceConflict()
+  }
+
+  edit(messageId: string, request: LiaisonEditRequest): Promise<{ sessionId: string; traceId: string; messageId: string }> {
+    return this.serial(async () => {
+      const editing = this.editing
+      if (!editing || !this.controller.fork) throw liaisonEditError(503, '当前 DSH 宿主无法从原话继续对话')
+      editing.assertCurrent()
+      this.assertSession(request.sessionId)
+      const prior = editing.traces.edit(request.requestId)
+      if (prior && (prior.originalMessageId !== messageId || prior.request.text !== request.text
+        || prior.request.sessionId !== request.sessionId || prior.request.expectedTraceId !== request.expectedTraceId)) {
+        throw liaisonEditError(409, '这个请求标识已用于另一处编辑')
+      }
+      this.editRunning = true
+      try {
+        await editing.waitRotation()
+        if (prior?.phase === 'accepted') return this.editResult(prior)
+        if (prior && prior.phase !== 'preparing') {
+          await this.deliverEdit(prior, editing)
+          return this.editResult(prior)
+        }
+        this.assertTrace(request.expectedTraceId)
+        const active = editing.traces.activeEdit()
+        if (active && active.phase !== 'accepted') await this.deliverEdit(active, editing)
+
+        const { history, agent } = await this.history()
+        const anchor = history.find(message => chatCursor(message) === messageId)
+        if (!anchor || anchor.role !== 'you' || !anchor.requestId) throw liaisonEditError(404, '找不到可编辑的主人原话')
+        const binding = editing.binding()
+        const index = binding.segments.findLastIndex(segment => segment.offset <= anchor.seq)
+        const segment = binding.segments[index]
+        if (!segment) throw liaisonEditError(409, '这条消息所在的原生对话段不可用')
+        const source = segment.id === agent.id ? agent.session?.snapshotEvents() ?? [] : await editing.events(segment.id)
+        const cut = liaisonForkPrefix(source, anchor.seq - segment.offset, anchor)
+        const origin = editing.origin({ requestId: anchor.requestId, text: cut.text })
+        const context = origin?.context
+        editing.checkPrefix(cut.events, context, request.text)
+        const attachments = this.editAttachments(anchor.inputAttachments ?? [])
+        if (!request.text.trim() && !attachments.length) throw liaisonEditError(400, '原话内容不能为空')
+        const traceId = randomUUID()
+        let edit: LiaisonEdit = prior ?? { request, originalMessageId: messageId, traceId,
+          messageId: 'edit-' + traceId, at: Date.now(), phase: 'preparing', context, ...origin?.operation === 'read' && { readOnly: true }, attachments }
+        editing.assertCurrent()
+        if (!prior) editing.traces.record(edit, binding)
+        if (!edit.nativeId) {
+          const before = cut.events.at(-1)
+          const child = before ? (await this.controller.fork({ sessionId: segment.id, atSeq: before.seq })).sessionId : 'chief-liaison-' + edit.traceId
+          if (!before) await editing.create(child)
+          if (!child || binding.segments.some(part => part.id === child)) throw liaisonEditError(503, 'DSH 未返回可续写的执行上下文')
+          editing.assertCurrent()
+          edit = { ...edit, nativeId: child }
+          editing.traces.record(edit)
+        }
+        const child = await editing.prepare(edit.nativeId!, segment.id)
+        // The source may have contained later queued inputs. A fork is idle; remove its inherited inbox before waking it.
+        this.clearInbox(child)
+        if (child.status === 'running' || child.inbox?.nextTurn.length || child.inbox?.nextStep.length) {
+          throw liaisonEditError(503, '无法确认新版本的收件箱已清空，请重试这次编辑')
+        }
+        this.grantPrefix(child.id, history.slice(0, history.indexOf(anchor)))
+        const old = await this.history()
+        editing.assertCurrent()
+        editing.traces.publish(edit, {
+          segments: [...binding.segments.slice(0, index), { id: child.id, offset: segment.offset }],
+          archived: binding.archived.filter(message => message.seq < segment.offset),
+        }, { segments: binding.segments, messages: this.freeze(old), observedAt: old.observedAt })
+        this.clearInbox(old.agent)
+        await this.deliverEdit({ ...edit, phase: 'ready' }, editing)
+        return this.editResult(edit)
+      } finally { this.editRunning = false }
+    })
+  }
+
+  recoverEdit() {
+    const editing = this.editing
+    return this.serial(async () => {
+      const edit = editing?.traces.activeEdit()
+      if (!editing || !edit || edit.phase === 'accepted') return
+      this.editRunning = true
+      try { await this.deliverEdit(edit, editing) } finally { this.editRunning = false }
+    })
+  }
+
+  private editResult(edit: LiaisonEdit) { return { sessionId: this.parts.base(), traceId: edit.traceId, messageId: edit.messageId } }
+
+  private editAttachments(refs: readonly ChatInputAttachment[]) {
+    if (!refs.length) return []
+    if (!this.input) throw liaisonEditError(503, '当前宿主无法转交原话中的附件')
+    return this.input.service.resolve({ sessionId: this.parts.base() }, refs.map(ref => ref.id))
+  }
+
+  private grantPrefix(nativeId: string, prefix: ChatMessage[]) {
+    for (const ref of new Map(prefix.flatMap(message => (message.inputAttachments ?? []).map(ref => [ref.id, ref] as const))).values()) {
+      this.input?.service.allowRead(nativeId, this.editAttachments([ref]))
+    }
+  }
+
+  private clearInbox(agent: Agent) {
+    const inbox = agent.inbox
+    if (inbox) for (const message of [...inbox.nextStep, ...inbox.nextTurn]) inbox.remove?.(message.id)
+  }
+
+  private freeze({ history, live, offset }: Awaited<ReturnType<LiaisonChat['history']>>): ChatMessage[] {
+    if (live?.firstSeq === undefined) return history
+    return [...history, { seq: live.firstSeq + offset, firstSeq: live.firstSeq + offset, role: 'liaison',
+      text: live.text, time: live.firstSpokenAt ?? live.since, steps: live.steps,
+      ...live.dispatches && { dispatches: live.dispatches }, ...live.discussions && { discussions: live.discussions },
+      ...live.workspaces && { workspaces: live.workspaces }, ...live.profileImports && { profileImports: live.profileImports } }]
+  }
+
+  private async deliverEdit(edit: LiaisonEdit, editing: LiaisonEditing) {
+    editing.assertCurrent()
+    this.assertTrace(edit.traceId)
+    const agent = await this.agent()
+    editing.assertCurrent()
+    if (agent.id !== edit.nativeId) throw liaisonEditError(409, '续写的执行上下文已改变')
+    await editing.deliver(edit, async () => {
+      if (liaisonAccepted(agent, edit.messageId, true)) {
+        if (edit.attachments.length) this.input?.service.allowRead(agent.id, edit.attachments)
+        return
+      }
+      if (edit.phase === 'sending') throw liaisonEditError(503, '改稿已保存，接口人的接收回执暂不可核对。请刷新后再用同一次编辑重试。')
+      try {
+        await this.prompt(agent, edit.request.text, 'queue', edit.messageId, edit.attachments, () => {
+          editing.assertCurrent()
+          this.assertTrace(edit.traceId)
+          editing.traces.record({ ...edit, phase: 'sending' })
+        })
+      } catch (error) {
+        const rejected = (error as { cause?: unknown })?.cause ?? error
+        const code = (rejected as {code?: string} | undefined)?.code
+        if (code === 'session/attachment-invalid' && !liaisonAccepted(agent, edit.messageId, true)) {
+          editing.assertCurrent()
+          editing.traces.record({ ...edit, phase: 'ready' })
+        }
+        throw error
+      }
+    })
+    editing.assertCurrent()
+    editing.traces.record({ ...edit, phase: 'accepted' })
+  }
+
   async say(text: string, mode: 'auto' | 'queue' | 'steer' = 'auto', expectedSession?: string, requestId?: string,
-    inputAttachments: readonly ChatInputAttachment[] = []): Promise<void> {
+    inputAttachments: readonly ChatInputAttachment[] = [], expectedTrace = this.activeTrace()): Promise<void> {
     this.assertSession(expectedSession)
-    if (!requestId) return this.deliver(text, mode, randomUUID(), inputAttachments)
-    const prior = this.sent.get(requestId)
+    this.assertTrace(expectedTrace)
+    const deliveryId = requestId ?? randomUUID()
+    const key = expectedTrace + ':' + deliveryId
+    const prior = this.sent.get(key)
     if (prior) return prior
-    const run = this.deliver(text, mode, requestId, inputAttachments).catch(error => { this.sent.delete(requestId); throw error })
-    this.sent.set(requestId, run)
+    const run = this.serial(async () => {
+      this.assertTrace(expectedTrace)
+      this.editing?.assertCurrent()
+      const phase = this.editing?.traces.activeEdit()?.phase
+      if (phase === 'sending' || phase === 'ready') {
+        throw liaisonEditError(409, '接口人正在接收改稿，请刷新后继续发言')
+      }
+      if (requestId && this.editing?.traces.hasRequest(requestId)) return
+      await this.deliver(text, mode, deliveryId, inputAttachments)
+    }).catch(error => { this.sent.delete(key); throw error })
+    this.sent.set(key, run)
     if (this.sent.size > 512) this.sent.delete(this.sent.keys().next().value!)
     return run
   }
@@ -414,47 +663,51 @@ export class LiaisonChat {
     this.delivering++
     try {
       const agent = await this.agent() // 确保会话已存在并带上接口人的设定
-      const { id: sessionId } = agent
-      const service = this.input?.service
-      if (refs.length && !service) throw Object.assign(new Error('当前宿主无法转交聊天附件'), { status: 503 })
       if (this.parts.archived().some(message => message.role === 'you' && message.requestId === requestId)) return
-      const matches = (input: {source?: {kind?: string; rpcId?: string}} | undefined) =>
-        input?.source?.kind === 'user' && input.source.rpcId === requestId
-      const accepted = () => agent.inbox?.nextStep.some(matches) || agent.inbox?.nextTurn.some(matches)
-        || agent.session?.snapshotEvents().some(event => event.type === 'user/message' && matches(event.data as Parameters<typeof matches>[0]))
-      const allowRead = () => { if (refs.length) service?.allowRead(sessionId, refs) }
-      if (accepted()) return allowRead()
-      const content: NativePromptPart[] = text ? [{type: 'text', text}] : []
-      if (refs.length) content.push(...await service!.promptParts(sessionId, refs, AbortSignal.timeout(30_000)))
-      const send = (m: 'queue' | 'steer') => this.controller.prompt({ requestId, sessionId, mode: m, content }, AbortSignal.timeout(30_000))
-      const chosen = mode === 'auto' ? agent.status === 'running' ? 'steer' : 'queue' : mode
-      const prompt = async (m: 'queue' | 'steer') => {
-        try {
-          const result = await send(m)
-          return result && typeof result === 'object' && 'error' in result ? result.error : undefined
-        } catch (error) {
-          if ((error as {code?: string} | null)?.code === 'session/agent-busy') return error
-          throw error
-        }
-      }
-      try {
-        let error = await prompt(chosen)
-        // steer 没赶上时用相同请求标识排队。附件准入失败直接回报。
-        if (error && chosen === 'steer' && (!refs.length || (error as {code?: string}).code === 'session/agent-busy')) error = await prompt('queue')
-        if (error) throw error
-      } catch (error) {
-        if (!accepted()) {
-          if (refs.length) throw Object.assign(new Error(chatAttachmentError(error)), {
-            status: (error as {code?: string} | null)?.code === 'session/attachment-invalid' ? 422 : 503, cause: error,
-          })
-          if (error instanceof Error) throw error
-          throw new Error(`接口人没有收到：${JSON.stringify(error).slice(0, 200)}`)
-        }
-      }
-      allowRead()
+      await this.prompt(agent, text, mode, requestId, refs)
     } finally {
       this.delivering--
     }
+  }
+
+  private async prompt(agent: Agent, text: string, mode: 'auto' | 'queue' | 'steer', requestId: string, refs: readonly ChatInputAttachment[],
+    beforePrompt?: () => void): Promise<void> {
+    const { id: sessionId } = agent
+    const service = this.input?.service
+    if (refs.length && !service) throw Object.assign(new Error('当前宿主无法转交聊天附件'), { status: 503 })
+    const accepted = () => liaisonAccepted(agent, requestId, !!beforePrompt)
+    const allowRead = () => { if (refs.length) service?.allowRead(sessionId, refs) }
+    if (accepted()) return allowRead()
+    const content: NativePromptPart[] = text ? [{type: 'text', text}] : []
+    if (refs.length) content.push(...await service!.promptParts(sessionId, refs, AbortSignal.timeout(30_000)))
+    this.editing?.assertCurrent()
+    beforePrompt?.()
+    const send = (m: 'queue' | 'steer') => this.controller.prompt({ requestId, sessionId, mode: m, content }, AbortSignal.timeout(30_000))
+    const chosen = mode === 'auto' ? agent.status === 'running' ? 'steer' : 'queue' : mode
+    const prompt = async (m: 'queue' | 'steer') => {
+      try {
+        const result = await send(m)
+        return result && typeof result === 'object' && 'error' in result ? result.error : undefined
+      } catch (error) {
+        if ((error as {code?: string} | null)?.code === 'session/agent-busy') return error
+        throw error
+      }
+    }
+    try {
+      let error = await prompt(chosen)
+      // steer 没赶上时用相同请求标识排队。附件准入失败直接回报。
+      if (error && chosen === 'steer' && (!refs.length || (error as {code?: string}).code === 'session/agent-busy')) error = await prompt('queue')
+      if (error) throw error
+    } catch (error) {
+      if (!accepted()) {
+        if (refs.length) throw Object.assign(new Error(chatAttachmentError(error)), {
+          status: (error as {code?: string} | null)?.code === 'session/attachment-invalid' ? 422 : 503, cause: error,
+        })
+        if (error instanceof Error) throw error
+        throw new Error(`接口人没有收到：${JSON.stringify(error).slice(0, 200)}`)
+      }
+    }
+    allowRead()
   }
 }
 

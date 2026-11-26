@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -80,6 +80,96 @@ function fixture(turnLimit = 4, approvals?: WorkspaceApprovals) {
     forOrder:(d:V2Delegation) => store.session(d.workspaceId,d.sessionId), accept:() => route.assign, follow:() => route.follow,
     store: () => store, assign: (id:string,text:string, selected?:string) => route.assign(id,text,'codex',selected) }
 }
+
+describe('workspace deletion', () => {
+  it('stops only the deleted order, retains its old message and lets its sibling take the next turn', async () => {
+    const f = fixture(), w = await f.workspace(), s = await f.session(w)
+    const first = await f.job(w, '第一单', s), other = await f.job(w, '第二单', s)
+    const started = Promise.withResolvers<AbortSignal>(), late = Promise.withResolvers<void>()
+    f.source.send.mockImplementationOnce(async (_session, _input, signal) => { started.resolve(signal); await late.promise })
+    const firstTurn = f.send(s, '第一单原话', 'first-turn', first.id)
+    const abort = await started.promise
+    const queued = await f.call<{delivery:string}>(f.path(s) + '/messages', {requestId:'other-turn',text:'第二单还要继续',workOrderId:other.id})
+    expect(queued.data.delivery).toBe('queued')
+    const message: V2Message = {id:'first-history', workOrderId:first.id, author:'主人', role:'user', text:'原记录', at:new Date().toISOString()}
+    f.messages.set(s.id, [message])
+    const target = '/' + w.id + '/orders/' + first.id
+    const deleteBody = {requestId:'remove-first'}
+    const denied = await f.call(target + '/delete', deleteBody, {owner:false})
+    expect(denied.status).toBe(403)
+    expect(abort.aborted).toBe(false)
+    const deleted = await f.call<{scope:string;id:string;deletedAt:string}>(target + '/delete', deleteBody, {via:'public'})
+    expect(deleted).toMatchObject({status:200,data:{scope,id:first.id}})
+    expect(abort.aborted).toBe(true)
+    late.resolve()
+    expect((await firstTurn).status).toBe(410)
+    await vi.waitFor(() => expect(f.source.send).toHaveBeenCalledTimes(2))
+    expect(f.source.send.mock.calls[1]![1]).toMatchObject({id:'other-turn',workOrderId:other.id})
+    expect((await f.view(w)).orders.map(order => order.id)).toEqual([other.id])
+    expect((await f.call<V2SessionView>(f.path(s))).data).toMatchObject({session:{id:s.id,delegationIds:[other.id]},
+      messages:[{...message,workOrderDeletedAt:deleted.data.deletedAt}]})
+    expect(f.messages.get(s.id)).toEqual([message])
+    expect((await f.call(target)).status).toBe(410)
+    expect((await f.send(s,'再次明确选择已删除工单',undefined,first.id)).status).toBe(410)
+    expect((await f.send(s,'只剩第二单')).status).toBe(200)
+    expect(f.source.send.mock.calls.at(-1)![1].workOrderId).toBe(other.id)
+    expect((await f.call('/' + w.id + '/orders/' + other.id + '/delete', deleteBody)).status).toBe(409)
+    const calls = f.source.send.mock.calls.length
+    f.restart()
+    expect(await f.call(target + '/delete', deleteBody)).toEqual(deleted)
+    expect(await f.call(target + '/delete', {requestId:'remove-first-again'})).toEqual(deleted)
+    expect((await f.call(target)).status).toBe(410)
+    expect(f.source.send).toHaveBeenCalledTimes(calls)
+  })
+
+  it('preserves the order when the responsible session is removed and refuses its old mutations', async () => {
+    const f = fixture(), w = await f.workspace(), foreign = await f.workspace('另一区'), s = await f.session(w)
+    const path = f.path(s), create = {requestId:'order-original',title:'原工单',sessionId:s.id}
+    const order = (await f.call<{order:V2Delegation}>('/' + w.id + '/orders',create)).data.order
+    const orderPath = '/' + w.id + '/orders/' + order.id
+    expect((await f.call(orderPath + '/followup', {requestId:'weekly',action:'schedule',weekday:1,time:'10:00'})).status).toBe(200)
+    expect(f.store().scheduledFollowups().map(job => job.id)).toEqual([order.id])
+    const deletion = {requestId:'remove-session'}
+    expect((await f.call(path + '/delete',deletion,{scope:'old-brain'})).status).toBe(409)
+    expect((await f.call('/' + foreign.id + '/sessions/' + s.id + '/delete',deletion)).status).toBe(404)
+    expect((await f.call(path + '/delete',deletion,{marker:false})).status).toBe(403)
+    const deleted = await f.call<{deletedAt:string}>(path + '/delete',deletion)
+    expect(deleted.status).toBe(200)
+    f.restart()
+    const board = await f.view(w)
+    expect(board.sessions).toEqual([])
+    expect(board.orders).toMatchObject([{id:order.id,sessionId:s.id,sessionDeletedAt:deleted.data.deletedAt,reason:'所属会话已删除'}])
+    expect((await f.call(path)).status).toBe(410)
+    expect((await f.call(path + '/reopen',{requestId:'open-again'})).status).toBe(410)
+    expect((await f.call(path + '/attachments/not-present')).status).toBe(410)
+    expect((await f.call('/' + foreign.id + '/sessions/' + s.id)).status).toBe(404)
+    expect((await f.call('/' + w.id + '/orders',create)).status).toBe(410)
+    expect((await f.call(orderPath)).status).toBe(200)
+    expect((await f.call(orderPath + '/followup')).data).toMatchObject({sessionDeletedAt:deleted.data.deletedAt})
+    expect(f.store().scheduledFollowups()).toEqual([])
+    expect((await f.act(order,'resume')).status).toBe(410)
+    expect((await f.act(order,'complete',{stopSchedule:true})).data.delegation.status).toBe('done')
+    expect((await f.call(orderPath + '/delete',{requestId:'remove-retained-order'})).status).toBe(200)
+    expect(f.source.send).not.toHaveBeenCalled()
+  })
+
+  it('keeps the original state when the deletion receipt cannot be saved', async () => {
+    const f = fixture(), w = await f.workspace(), s = await f.session(w)
+    const path = join(f.root,'ops','superhub-v2',workspaceFingerprint(scope) + '.json')
+    renameSync(path, path + '.backup')
+    mkdirSync(path)
+    const body = {requestId:'storage-failure'}
+    try {
+      expect((await f.call(f.path(s) + '/delete', body)).status).toBe(503)
+      expect((await f.call(f.path(s))).status).toBe(200)
+    } finally {
+      rmSync(path, {recursive:true})
+      renameSync(path + '.backup', path)
+    }
+    expect((await f.call(f.path(s) + '/delete', body)).status).toBe(200)
+    expect((await f.call(f.path(s))).status).toBe(410)
+  })
+})
 
 describe('SuperHub 2.0 workspace routes', () => {
   it('entrusts the original result to the appropriate native conversation with no product mode', async () => {
@@ -456,7 +546,8 @@ describe('SuperHub 2.0 workspace routes', () => {
     ]
     f.messages.set(s.id, turns)
     f.source.attachment.mockResolvedValue({ id: 'artifact', label: '预览', format: 'markdown', content: '本轮交付' })
-    expect((await f.call<V2SessionView>(f.path(s))).data.messages).toEqual(turns)
+    const projected = turns.map(message => ({...message,traceId:'initial'}))
+    expect((await f.call<V2SessionView>(f.path(s))).data.messages).toEqual(projected)
     const suffix = '/attachments/artifact'
     expect((await f.call(f.path(other) + suffix)).status).toBe(404)
     expect((await f.call('/' + b.id + '/sessions/' + s.id + suffix)).status).toBe(404)
@@ -467,7 +558,7 @@ describe('SuperHub 2.0 workspace routes', () => {
     expect(unreadable.status).toBe(503)
     expect(unreadable.data.error).not.toContain('private')
     await f.call(f.path(s) + '/close', { requestId: 'close-s' })
-    expect((await f.call<V2SessionView>(f.path(s))).data.messages).toEqual(turns)
+    expect((await f.call<V2SessionView>(f.path(s))).data.messages).toEqual(projected)
     f.messages.set(s.id, [])
     expect((await f.call(f.path(s) + suffix)).status).toBe(404)
     f.source.read.mockRejectedValueOnce(Error('sensitive source internals'))

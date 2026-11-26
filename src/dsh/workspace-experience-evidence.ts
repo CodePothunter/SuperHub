@@ -7,7 +7,7 @@ const isTest = /^\s*(?:(?:pnpm|npm|yarn|bun|cargo|go)\s+test\b|(?:pnpm\s+exec\s+
 type CommandResult = { command: string; exitCode: number; outputTail?: string }
 
 export function commandExperienceEvidence(where: {
-  workspaceId: string; sessionId: string; orderId?: string; turnId: string; staffId?: string
+  workspaceId: string; sessionId: string; traceId?: string; orderId?: string; turnId: string; staffId?: string
 }, id: string, {command, exitCode, outputTail}: CommandResult): ExperienceEvidence {
   return {
     ...where, id, kind: isTest.test(command) ? 'test' : 'tool',

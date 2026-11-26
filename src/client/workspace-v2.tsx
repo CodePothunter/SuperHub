@@ -6,9 +6,9 @@ import type { Scoped } from './superhub-api.ts'
 import { WorkspaceMark } from './workspace-brand.tsx'
 import { WorkspaceIcon } from './workspace-icon.tsx'
 import hubEmblem from './artwork/hub-fold.webp'
-import { clearV2PrivateCache, segment, useV2Read, useV2Write, V2Client, V2_ROOT } from './workspace-v2-api.ts'
+import { clearV2PrivateCache, resourceQuery, segment, useV2Read, useV2Write, V2Client, V2_ROOT } from './workspace-v2-api.ts'
 import { ArchivedWorkspace, delegationState, Issue, readableTime, sessionKind, useArchived, V2Dialog, V2Icon } from './workspace-v2-elements.tsx'
-import { isOrderOriginal, isWorkspaceIndex, isWorkspaceView } from './workspace-v2-response.ts'
+import { isOrderOriginal, isWorkspaceIndex, isWorkspaceOrder, isWorkspaceView } from './workspace-v2-response.ts'
 import { ConversationBoard, Transcript } from './workspace-v2-talk.tsx'
 import { HistoryHome, HistoryPanel, TransferDialog } from './workspace-history.tsx'
 import { WorkspaceLiaison } from './workspace-liaison.tsx'
@@ -30,9 +30,12 @@ import { StaffBoard } from './workspace-staff.tsx'
 import { isStaffView, staffPath } from './workspace-staff-response.ts'
 import { WorkspaceSettings } from './workspace-settings.tsx'
 import { WORKSPACE_V2_STYLE } from './workspace-v2-style.ts'
+import { DeleteWorkspaceTarget } from './workspace-conversation-actions.tsx'
+import type { CommitmentSource } from '../core/workspace-followup.ts'
+import type { ExperienceEvidence } from '../core/workspace-experience.ts'
 
 interface Props { scope: string; native?: () => void; configure: boolean; reloadBrain: () => Promise<void> }
-type Place = { view: SuperhubSurface | 'profile'; workspace?: string; panel?: 'execution' | 'outputs' | 'staff' | 'experience'; delegation?: string; session?: string; message?: string; item?: string; date?: string }
+type Place = { view: SuperhubSurface | 'profile'; workspace?: string; panel?: 'execution' | 'outputs' | 'staff' | 'experience'; delegation?: string; session?: string; message?: string; trace?: string; item?: string; date?: string }
 type Popup = 'new-space' | 'switch-space' | 'delegate' | 'new-session' | 'narrow' | 'cancel' | 'liaison' | 'import' | 'export'
 
 export function readPlace(scope: string): Place {
@@ -49,7 +52,7 @@ export function readPlace(scope: string): Place {
   const workPanel = panel === 'execution' || panel === 'outputs' || panel === 'experience' ? panel : staffPanel
   if (view === 'workspace' && workPanel === 'experience') return {view,workspace:id('workspace'),panel:workPanel}
   if (view === 'workspace') return {view,workspace:id('workspace'),panel:workPanel,item:staffPanel && id('item'),
-    delegation:id('order') ?? id('delegation'),session:id('session'),message:id('message')}
+    delegation:id('order') ?? id('delegation'),session:id('session'),message:id('message'),trace:id('trace')}
   return {view:'today',workspace:id('workspace')}
 }
 
@@ -68,10 +71,21 @@ function BrainWorkspace(props: Props) {
   </V2Client.Provider></div>
 }
 
+interface LiaisonSource extends Scoped {sessionId: string; traceId: string; messageId: string}
+function isLiaisonSource(value: Scoped): value is LiaisonSource {
+  const row = value as Partial<LiaisonSource>
+  return [row.sessionId, row.traceId, row.messageId].every(field => typeof field === 'string' && field.length > 0)
+}
+
 function Home({ scope, native, configure, reloadBrain }: Props) {
   const [place, setPlace] = useState<Place>(() => readPlace(scope))
   const [opening, setOpening] = useState<Place>()
   const [popup, setPopup] = useState<Popup>()
+  const [liaisonSource, setLiaisonSource] = useState<CommitmentSource>()
+  const oldLiaisonSource = liaisonSource && !liaisonSource.traceId
+  const sourceLookup = useV2Read(oldLiaisonSource ? resourceQuery('/chat/source',
+    new URLSearchParams({sessionId:liaisonSource.sessionId, messageId:liaisonSource.messageId})) : undefined, isLiaisonSource)
+  const shownLiaisonSource = oldLiaisonSource ? sourceLookup.data : liaisonSource
   const [orderStaff,setOrderStaff] = useState<StaffMember>()
   const [orderSession, setOrderSession] = useState<string>()
   const [visibleSession, setVisibleSession] = useState<string>()
@@ -108,18 +122,19 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
     if (next.panel) search.set('panel', next.panel)
     if (next.session) search.set('session', next.session)
     if (next.message) search.set('message', next.message)
+    if (next.trace) search.set('trace', next.trace)
     if (next.delegation) search.set('order', next.delegation)
     if (next.item) search.set('item', next.item)
     if (next.date) search.set('date', next.date)
     const hash = '#v2?' + search
     if (location.hash !== hash) history.pushState({...history.state, chiefSettingsParent:next.view === 'settings' ? scope : undefined}, '', hash)
-    setPlace(next); setPopup(undefined); setNotice('')
+    setPlace(next); setPopup(undefined); setLiaisonSource(undefined); setNotice('')
   }, [scope])
   useEffect(() => {
     const follow = () => {
       const next = readPlace(scope)
       if (currentView.current === 'settings' && next.view !== 'settings') returnFocus.current = 'settings-button'
-      setPlace(next); setPopup(undefined); setNotice('')
+      setPlace(next); setPopup(undefined); setLiaisonSource(undefined); setNotice('')
     }
     window.addEventListener('popstate', follow); window.addEventListener('hashchange', follow)
     return () => { window.removeEventListener('popstate', follow); window.removeEventListener('hashchange', follow) }
@@ -155,7 +170,19 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
   }
   const openWorkspace = (id?: string) => go({ view: 'workspace', workspace: id })
   const openDelegation = (id: string) => go({ view: 'workspace', workspace: chosenId, delegation: id })
-  const openSession = (id: string, from?: string, message?: string) => go({ view: 'workspace', workspace: chosenId, panel: 'execution', session: id, delegation: from, message })
+  const openSession = (id: string, from?: string, message?: string, trace?: string) =>
+    go({ view: 'workspace', workspace: chosenId, panel: 'execution', session: id, delegation: from, message, trace })
+  const openOutputSource = (row: {sessionId: string; orderId?: string; messageId: string; traceId?: string}) =>
+    openSession(row.sessionId, row.orderId, row.messageId, row.traceId)
+  const openLiaisonSource = (source: CommitmentSource) => { setLiaisonSource(source); setPopup('liaison') }
+  function openEvidence(source: ExperienceEvidence) {
+    if (!source.workspaceId) return
+    if (!source.sessionDeletedAt && source.sessionId && source.messageId &&
+      (source.kind !== 'owner' || view?.sessions.some(session => session.id === source.sessionId))) {
+      go({view:'workspace',workspace:source.workspaceId,delegation:source.orderId,
+        panel:'execution',session:source.sessionId,message:source.messageId,trace:source.traceId})
+    } else if (!source.orderDeletedAt && source.orderId) go({view:'workspace',workspace:source.workspaceId,delegation:source.orderId})
+  }
   const openHistory = (item?: string) => go({ view: 'history', item })
   /** 「设置 → 定时安排」：从接口人的定时提醒或「经验」面板进入，落在这一节。 */
   const openSchedules = () => go({ view: 'settings', item: 'schedules' })
@@ -181,8 +208,8 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
   const outputsPanel = place.panel === 'outputs'
   const openOutputs = () => go({view:'workspace',workspace:chosenId,panel:'outputs'})
   // Outputs are re-read while an order can still deliver, and whenever the orders change (a turn spent, a new order).
-  const outputsFeed = {live: !archived && !!view?.orders.some(order => !orderEnded(order) && !order.paused),
-    revision: view?.orders.reduce((sum, order) => sum + order.remainingTurns + 1, 0)}
+  const outputsFeed = {live: !archived && !!view?.orders.some(order => !orderEnded(order) && !order.paused && !order.sessionDeletedAt),
+    revision: view && [view.sessions.length, ...view.orders.map(order => [order.id, order.remainingTurns, order.sessionDeletedAt])].flat().join('/')}
   const selecting = place.view === 'workspace' && !!workspace
   const reading = selecting && panel && !!place.session
   const liaisonSession = selecting && view?.sessions.find(s => s.id === (panel ? visibleSession : delegation?.sessionId))
@@ -207,7 +234,7 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
     open={row => go(row.workOrderId ? {view:'workspace',workspace:row.workspaceId,delegation:row.workOrderId}
       : {view:'workspace',workspace:row.workspaceId,panel:'execution',session:row.sessionId})}
     openOrder={row => go({view:'workspace',workspace:row.workspaceId,delegation:row.orderId})}/>
-  const lostOrder = place.delegation && (index.data && !workspace || view && !delegation)
+  const lostOrder = !panel && place.delegation && (index.data && !workspace || view && !delegation)
   async function reread() { await Promise.all([index.refresh(), current.refresh()]) }
   return <ArchivedWorkspace.Provider value={archived}><OwnerActions.Provider value={{ items:pending, refresh:ownerActions.refresh }}>
     <header className="v2-mast"><div className="v2-bound">
@@ -253,7 +280,7 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
       {pendingList(place.view === 'today')}
       <OrderResultInbox today={place.view === 'today'} goToday={() => go({view:'today'})}
         openOrder={row => go({view:'workspace',workspace:row.workspaceId,delegation:row.orderId})}
-        openSource={row => go({view:'workspace',workspace:row.workspaceId,delegation:row.orderId,panel:'execution',session:row.sessionId,message:row.messageId})}/>
+        openSource={row => go({view:'workspace',workspace:row.workspaceId,delegation:row.orderId,panel:'execution',session:row.sessionId,message:row.messageId,trace:row.traceId})}/>
       {selecting && <nav className="v2-subnav" aria-label="工作区版面">
         <button aria-current={!place.panel ? 'page' : undefined} onClick={() => openWorkspace(chosenId)}><V2Icon name="work"/>概览</button>
         <button aria-current={panel ? 'page' : undefined} onClick={() => go({ view: 'workspace', workspace: chosenId, panel: 'execution' })}><V2Icon name="chat"/>执行</button>
@@ -269,8 +296,7 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
         openStaff={() => go({view:'settings',panel:'staff'})}/>}
       {place.view === 'settings' && staffPanel && <StaffBoard key={place.item ?? 'list'} spaces={spaces} selected={place.item}
         select={item => go({view:'settings',panel:'staff',item})} openOrder={(workspace,delegation) => go({view:'workspace',workspace,delegation})}
-        openEvidence={source => source.workspaceId && go({view:'workspace',workspace:source.workspaceId,delegation:source.orderId,
-          ...source.sessionId && source.messageId && source.kind !== 'owner' ? {panel:'execution',session:source.sessionId,message:source.messageId} : {}})}
+        openEvidence={openEvidence}
         openMembership={(workspace,item) => go({view:'workspace',workspace,panel:'staff',item})}/>}
       {place.view === 'people' && <WorkspacePeople selected={place.item} open={item => go({view:'people',item})}
         back={() => go({view:'people'},place.item)}/>}
@@ -292,38 +318,37 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
       {place.view === 'workspace' && <Issue text={index.error} retry={index.refresh}/>}
       {place.view === 'workspace' && !index.data && !index.error && <p role="status" className="v2-quiet">正在读取工作区…</p>}
       {index.data && place.view === 'workspace' && (entering ? <p role="status" className="v2-quiet">正在打开…</p>
-        : lostOrder ? <div className="v2-empty">这张工单已不可用。 <button className="v2-link" onClick={() => openWorkspace(workspace?.id)}>返回工作区</button></div>
+        : lostOrder && place.delegation ? <MissingOrder base={base} id={place.delegation} back={() => openWorkspace(workspace?.id)}/>
         : !spaces.length || !place.workspace && !activeSpaces.length ? <section className="v2-welcome"><V2Icon name="work"/><h2>按项目整理会话和工单</h2>
           {spaces.length > 0 && <p>工作区都已归档，可在「切换工作区 → 已归档」查看或恢复。</p>}
           <button className="v2-button" onClick={() => setPopup('new-space')}><V2Icon name="plus"/>创建工作区</button></section>
         : lostWorkspace ? <div className="v2-empty">这份工作区已不可用。 <button className="v2-link" onClick={() => setPopup('switch-space')}>选择工作区</button></div>
         : <><Issue text={current.error} retry={current.refresh}/>
           {!view && !current.error && <p role="status" className="v2-quiet">正在读取会话和工单…</p>}
-          {view && base && (panel ? <ConversationBoard key={view.workspace.id} base={base} view={view} selected={place.session} origin={place.delegation} sourceMessage={place.message}
+          {view && base && (panel ? <ConversationBoard key={view.workspace.id} base={base} view={view} selected={place.session} origin={place.delegation} sourceMessage={place.message} trace={place.trace}
             visible={setVisibleSession}
             open={id => openSession(id, delegation?.sessionId === id ? delegation.id : undefined)}
             target={(id,orderId) => openSession(id,orderId)} newOrder={newOrder}
             back={() => go({ view: 'workspace', workspace: chosenId, panel: 'execution' }, 'session-' + place.session)}
             openDelegation={openDelegation} create={() => setPopup('new-session')} changed={current.refresh}/>
-            : outputsPanel ? <OutputsBoard key={view.workspace.id} base={base} feed={outputsFeed}/>
+            : outputsPanel ? <OutputsBoard key={view.workspace.id} base={base} feed={outputsFeed} openSource={openOutputSource}/>
             : staffPanel || experiencePanel ? <StaffBoard key={view.workspace.id+'/'+place.panel+'/'+(place.item ?? 'list')}
               workspace={view} spaces={spaces} selected={place.item} experience={experiencePanel}
               select={item => go({view:'workspace',workspace:chosenId,panel:'staff',item})}
               openOrder={(workspace,delegation) => go({view:'workspace',workspace,delegation})}
-              openEvidence={source => source.workspaceId && go({view:'workspace',workspace:source.workspaceId,delegation:source.orderId,
-                ...source.sessionId && source.messageId && (source.kind !== 'owner' || view.sessions.some(session=>session.id === source.sessionId))
-                  ? {panel:'execution',session:source.sessionId,message:source.messageId} : {}})}
+              openEvidence={openEvidence}
               openMembership={(workspace,item) => go({view:'workspace',workspace,panel:'staff',item})}
               openGlobal={item=>go({view:'settings',panel:'staff',item})} openSchedules={openSchedules}
               assign={staff => newOrder(undefined,staff)}/>
-            : place.delegation ? delegation ? <WorkOrderPage key={delegation.id} job={delegation} view={view} base={base} message={place.message}
+            : place.delegation ? delegation ? <WorkOrderPage key={delegation.id} job={delegation} view={view} base={base} message={place.message} trace={place.trace}
               back={() => go({ view: 'workspace', workspace: chosenId }, 'job-' + delegation.id)}
-              open={(id,message) => id === delegation.sessionId ? go({view:'workspace',workspace:chosenId,delegation:delegation.id,message}) : openSession(id, delegation.id, message)}
+              open={(id,message,trace) => id === delegation.sessionId && !trace ? go({view:'workspace',workspace:chosenId,delegation:delegation.id,message}) : openSession(id, delegation.id, message, trace)}
+              openLiaisonSource={openLiaisonSource}
               openOrder={openDelegation} target={(id,orderId) => orderId ? openDelegation(orderId) : openSession(id)} newOrder={newOrder}
               popup={setPopup} changed={current.refresh}/>
               : null
             : <><ProjectDirectory key={view.workspace.id} workspace={view.workspace} changed={current.refresh}/>
-              <RecentOutputs key={'outputs-' + view.workspace.id} base={base} feed={outputsFeed} showAll={openOutputs} openOrder={openDelegation}/>
+              <RecentOutputs key={'outputs-' + view.workspace.id} base={base} feed={outputsFeed} showAll={openOutputs} openOrder={openDelegation} openSource={openOutputSource}/>
               <Overview view={view} openJob={openDelegation} openSession={openSession} delegate={() => newOrder()} create={() => setPopup('new-session')}/>
               <ArchiveWorkspace key={view.workspace.id} workspace={view.workspace} personalId={personalId} done={async () => {
                 const name = view.workspace.name
@@ -334,9 +359,16 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
         </>)}
       {notice && <p className="v2-feedback" role="status">{notice}</p>}
     </div></main>
-    {popup === 'liaison' && <WorkspaceLiaison scope={scope} surface={place.view === 'profile' ? 'history' : place.view} workspace={selecting ? workspace : undefined}
+    {popup === 'liaison' && oldLiaisonSource && !shownLiaisonSource && <V2Dialog title="定位接口人原话" close={() => {setPopup(undefined);setLiaisonSource(undefined)}}>
+      {sourceLookup.error ? <Issue text={sourceLookup.error} retry={sourceLookup.refresh}/> : <p role="status">正在查找原话…</p>}
+    </V2Dialog>}
+    {popup === 'liaison' && (!oldLiaisonSource || shownLiaisonSource) && <WorkspaceLiaison key={JSON.stringify([shownLiaisonSource?.sessionId, shownLiaisonSource?.traceId, shownLiaisonSource?.messageId])} scope={scope}
+      surface={place.view === 'profile' ? 'history' : place.view} workspace={selecting ? workspace : undefined}
+      trace={shownLiaisonSource?.traceId} sourceMessage={shownLiaisonSource?.messageId} sourceSession={shownLiaisonSource?.sessionId}
+      currentTrace={() => setLiaisonSource(undefined)}
       sessionId={liaisonSession ? liaisonSession.id : undefined} workOrderId={liaisonOrder || undefined}
-      selectedId={place.view === 'people' ? place.item : place.view === 'calendar' ? place.date : selecting ? workspace.id : undefined} close={() => setPopup(undefined)} openProfileImport={openProfile}
+      selectedId={place.view === 'people' ? place.item : place.view === 'calendar' ? place.date : selecting ? workspace.id : undefined}
+      close={() => {setPopup(undefined);setLiaisonSource(undefined)}} openProfileImport={openProfile}
       pending={(pendingCount > 0 || ownerActions.error) ? pendingList(true) : undefined}
       changed={index.refresh} openWorkspace={id => { void enterCreated({view:'workspace',workspace:id},index.refresh) }}
       openDelegation={(workspace, delegation) => { void enterCreated({view:'workspace',workspace,delegation}, async () => {
@@ -356,6 +388,15 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
     {(popup === 'narrow' || popup === 'cancel') && delegation && base && !archived && <ChangeDelegation action={popup} job={delegation} base={base} close={() => setPopup(undefined)}
       done={async () => { setPopup(undefined); setNotice(popup === 'narrow' ? '已记录新的执行范围。' : '工单已取消。'); await current.refresh() }}/>}
   </OwnerActions.Provider></ArchivedWorkspace.Provider>
+}
+
+function MissingOrder({base, id, back}: {base?: string; id: string; back: () => void}) {
+  const state = useV2Read(base && base + '/orders/' + segment(id), isWorkspaceOrder)
+  const message = state.status === 410 ? '工单已删除。' : state.status === 404 || !base ? '这张工单已不可用。' : !state.error && '正在读取工单…'
+  return <div className="v2-empty">
+    {message ? <span role="status">{message}</span> : <Issue text={state.error} retry={state.refresh}/>}
+    {' '}<button className="v2-link" onClick={back}>返回工作区</button>
+  </div>
 }
 
 /** The SuperHub mark in the header: a button back to the plain 「今天」 home (Enter and Space work as on any button). */
@@ -444,23 +485,26 @@ export function Overview({ view, openJob, openSession, delegate, create }: {
   view: V2WorkspaceView; openJob: (id: string) => void; openSession: (id: string) => void; delegate: () => void; create: () => void
 }) {
   const archived = useArchived()
+  const orphaned = view.orders.filter(order => order.sessionDeletedAt)
+  const orderRow = (order: V2Delegation) => <button data-focus={'job-' + order.id} className="v2-row v2-order-row" key={order.id} onClick={() => openJob(order.id)}>
+    <span className="v2-row-title"><strong>{order.title}</strong><span className="v2-status">{delegationState(order)}</span></span>
+    <small>{order.owner}{order.promise !== order.title && ' · ' + order.promise}</small>
+    {order.status === 'done' ? <span className="v2-next" data-state="done">已完成{order.completedAt && ' · ' + readableTime(order.completedAt)}</span>
+      : order.status === 'closed' ? order.reason && <span className="v2-next">{order.reason}</span>
+      : !order.sessionDeletedAt && order.nextCheckAt && <span className="v2-next">下次跟进 · {readableTime(order.nextCheckAt)}</span>}</button>
   return <section className="v2-work-orders" aria-label="会话与工单">
     <div className="v2-section-head"><h2><V2Icon name="chat"/>会话与工单</h2>
       {!archived && <div className="v2-actions"><button className="v2-link" onClick={create}>新建会话</button><button className="v2-button" onClick={delegate}>新建工单</button></div>}</div>
-    {view.sessions.length ? <div className="v2-order-groups">{view.sessions.map(session => {
+    {view.sessions.length || orphaned.length ? <div className="v2-order-groups">{view.sessions.map(session => {
       const orders = view.orders.filter(order => order.sessionId === session.id)
       return <section key={session.id} className="v2-card" aria-label={session.title}>
         <button className="v2-row v2-order-session" data-focus={'session-' + session.id} onClick={() => openSession(session.id)}>
           <span className="v2-row-title"><strong>{session.title}</strong><V2Icon name="next"/></span>
           <small>{sessionKind(session)}{session.closed && ' · 已关闭'} · {orders.length} 张工单</small></button>
-        {orders.map(order => <button data-focus={'job-' + order.id} className="v2-row v2-order-row" key={order.id} onClick={() => openJob(order.id)}>
-          <span className="v2-row-title"><strong>{order.title}</strong><span className="v2-status">{delegationState(order)}</span></span>
-          <small>{order.owner}{order.promise !== order.title && ' · ' + order.promise}</small>
-          {order.status === 'done' ? <span className="v2-next" data-state="done">已完成{order.completedAt && ' · ' + readableTime(order.completedAt)}</span>
-            : order.status === 'closed' ? order.reason && <span className="v2-next">{order.reason}</span>
-            : order.nextCheckAt && <span className="v2-next">下次跟进 · {readableTime(order.nextCheckAt)}</span>}</button>)}
+        {orders.map(orderRow)}
       </section>
-    })}</div> : <div className="v2-empty">还没有会话或工单。</div>}
+    })}{orphaned.length > 0 && <section className="v2-card" aria-label="所属会话已删除">
+      <h3 className="v2-orphaned-heading">所属会话已删除</h3>{orphaned.map(orderRow)}</section>}</div> : <div className="v2-empty">还没有会话或工单。</div>}
   </section>
 }
 
@@ -480,10 +524,11 @@ export const ORDER_SIDE_PANEL_MIN = 960
  * controls and records sit in a side panel on a wide workspace, and in a collapsible 「工单信息」 above the conversation
  * otherwise. Approval cards stay outside the fold so a waiting command is always visible.
  */
-export function WorkOrderPage({ job, view, base, message, back, open, openOrder, target, newOrder, popup, changed, initialWide = false }: {
-  job: V2Delegation; view: V2WorkspaceView; base: string; message?: string; back: () => void; open: (id: string, message?: string) => void
+export function WorkOrderPage({ job, view, base, message, trace, back, open, openLiaisonSource, openOrder, target, newOrder, popup, changed, initialWide = false }: {
+  job: V2Delegation; view: V2WorkspaceView; base: string; message?: string; trace?: string; back: () => void; open: (id: string, message?: string, trace?: string) => void
   openOrder: (id: string) => void; target: (sessionId: string, orderId?: string) => void; newOrder: (sessionId: string) => void
   popup: (value: Popup) => void; changed: () => Promise<void>
+  openLiaisonSource?: (source: CommitmentSource) => void
   /** Layout before the workspace width is measured. */
   initialWide?: boolean
 }) {
@@ -502,23 +547,26 @@ export function WorkOrderPage({ job, view, base, message, back, open, openOrder,
   // A roster group's approval cards stand above its composer; the order keeps its command record here.
   const execution = session && (session.kind === 'coding' || session.engine === 'roster')
     && <OrderExecution key={job.id} base={base} job={job} session={session} cards={session.kind === 'coding'}/>
-  const info = <OrderInfo job={job} view={view} base={base} open={open} popup={popup} changed={changed}/>
+  const info = <OrderInfo job={job} view={view} base={base} open={open} openLiaisonSource={openLiaisonSource}
+    popup={popup} changed={changed} deleted={() => { back(); void changed() }}/>
   return <section ref={page} className="v2-job v2-order-page" data-wide={wide}>
     <button className="v2-link" onClick={back}><V2Icon name="back"/>返回概览</button>
     {!wide && <details className="v2-order-fold"><summary>工单信息<small>{delegationState(job)}</small></summary>{info}</details>}
     {!wide && execution}
     <div className="v2-order-layout">
-      <div className="v2-order-chat">{session ? <Transcript key={session.id + '/' + job.id} embedded base={base} session={session} view={view} origin={job.id}
+      <div className="v2-order-chat">{session ? <Transcript key={JSON.stringify([session.id, job.id, trace, message])}
+        embedded base={base} session={session} view={view} origin={job.id} trace={trace} currentTrace={() => open(session.id)}
         sourceMessage={message} compact={!wide} back={back} openDelegation={openOrder} target={target} newOrder={newOrder} changed={changed}/>
-        : <div className="v2-empty">这张工单的会话暂不可用。</div>}</div>
+        : <div className="v2-empty">{job.sessionDeletedAt ? '所属会话已删除。' : '这张工单的会话暂不可用。'}</div>}</div>
       {wide && <aside className="v2-order-info" aria-label="工单信息"><h2>工单信息</h2>{execution}{info}</aside>}
     </div>
   </section>
 }
 
-function OrderInfo({ job, view, base, open, popup, changed }: {
-  job: V2Delegation; view: V2WorkspaceView; base: string; open: (id: string, message?: string) => void;
-  popup: (value: Popup) => void; changed: () => Promise<void>
+function OrderInfo({ job, view, base, open, openLiaisonSource, popup, changed, deleted }: {
+  job: V2Delegation; view: V2WorkspaceView; base: string; open: (id: string, message?: string, trace?: string) => void;
+  popup: (value: Popup) => void; changed: () => Promise<void>; deleted: () => void
+  openLiaisonSource?: (source: CommitmentSource) => void
 }) {
   const action = useV2Write()
   const archived = useArchived()
@@ -534,29 +582,32 @@ function OrderInfo({ job, view, base, open, popup, changed }: {
       <dl className="v2-card v2-ledger">{[['负责人', job.owner], ['承诺结果', job.promise], ['状态', delegationState(job)],
         ...(job.status === 'closed' ? [['关闭原因', job.reason]] : job.status === 'done' ? [['完成时间', (job.completedAt ? readableTime(job.completedAt) : '')
           + (job.completedBy === 'owner-words' ? ' · 按你在对话中的话收单' : job.completedBy === 'owner' ? ' · 你已确认收单' : '')]]
-          : job.nextCheckAt ? [['下次跟进',readableTime(job.nextCheckAt) + ' · 按周期安排']] : []),
+          : job.nextCheckAt && !job.sessionDeletedAt ? [['下次跟进',readableTime(job.nextCheckAt) + ' · 按周期安排']] : []),
         ...(!orderEnded(job) && job.reason ? [['当前情况', job.reason]] : []),
         ...(job.acceptance ? [['接口人验收', acceptanceState(job.acceptance)]] : []), ['执行范围', job.boundary],
         ...(gated ? [['运行目录', directoryText(directory)]] : []),
-        ...(session ? [['所属会话', session.title + ' · ' + sessionKind(session) + (session.closed ? ' · 已关闭' : '')]] : [])].map(([label, value]) =>
+        ...(session ? [['所属会话', session.title + ' · ' + sessionKind(session) + (session.closed ? ' · 已关闭' : '')]]
+          : job.sessionDeletedAt ? [['所属会话', '已删除']] : [])].map(([label, value]) =>
           <div key={label}><dt>{label}</dt><dd>{value || '尚未登记'}</dd></div>)}</dl>
       {directory?.source === 'superhub' && !archived && <div className="v2-actions"><button className="v2-link" onClick={() => setBinding(true)}>绑定项目目录</button></div>}
       {binding && !archived && <DirectoryDialog workspace={view.workspace} close={() => setBinding(false)} changed={changed}/>}
-      {job.status === 'done' && !archived && <div className="v2-actions">
+      {job.status === 'done' && session && !archived && <div className="v2-actions">
           <button className="v2-button" disabled={action.busy} onClick={async () => { await action.post(base + '/orders/' + segment(job.id) + '/action', { action: 'reopen', expectedGeneration: job.generation }); await changed() }}>重新打开</button></div>}
       {!orderEnded(job) && !archived && <div className="v2-actions">
           <button className="v2-button primary" disabled={action.busy} onClick={async () => { await action.post(base + '/orders/' + segment(job.id) + '/action', { action: 'complete', expectedGeneration: job.generation, ...(job.hasSchedule && {stopSchedule: true}) }); await changed() }}>{job.hasSchedule ? '标为完成并停止周期安排' : '标为完成'}</button>
-          <button className="v2-button" disabled={action.busy} onClick={async () => { await action.post(base + '/orders/' + segment(job.id) + '/action', { action: paused ? 'resume' : 'pause', expectedGeneration: job.generation }); await changed() }}>{paused ? '恢复工单' : '暂停工单'}</button>
-          <button className="v2-button" onClick={() => popup('narrow')}>收窄范围</button><button className="v2-link" onClick={() => popup('cancel')}>取消工单</button></div>}
+          {session && <button className="v2-button" disabled={action.busy} onClick={async () => { await action.post(base + '/orders/' + segment(job.id) + '/action', { action: paused ? 'resume' : 'pause', expectedGeneration: job.generation }); await changed() }}>{paused ? '恢复工单' : '暂停工单'}</button>}
+          {session && <button className="v2-button" onClick={() => popup('narrow')}>收窄范围</button>}<button className="v2-link" onClick={() => popup('cancel')}>取消工单</button></div>}
+      <div className="v2-actions"><DeleteWorkspaceTarget path={base + '/orders/' + segment(job.id)} kind="工单" title={job.title} done={deleted}/></div>
       <Issue text={action.error}/>
     </section>
     {gated && <OrderPermission key={job.id} base={base} job={job} changed={changed} archived={archived}/>}
-    {session && <OrderOutputs job={job} base={base} sessions={[session,...history]}/>}
+    <OrderOutputs job={job} base={base} sessions={session ? [session,...history] : history} openSource={open}/>
     {job.hasOriginal && <OrderOriginal key={job.id} path={base + '/orders/' + segment(job.id) + '/original'}/>}
     {decisions.length > 0 && <section className="v2-decisions"><h3>决定记录</h3>{decisions.map(d => <div className="v2-decision" key={d.id + '/' + d.version}><small>{readableTime(d.at)}</small><p>{d.text}</p></div>)}</section>}
-    {session && <OrderFollowup base={base} job={job} session={session} openSource={open}/>}
-    {history.length > 0 && <details className="v2-delivery-log"><summary>历史会话（{history.length}）</summary>
-      {history.map(s => <button className="v2-row" key={s.id} onClick={() => open(s.id)}>{s.title}</button>)}</details>}
+    <OrderFollowup base={base} job={job} session={session} openSource={open} openLiaisonSource={openLiaisonSource}/>
+    {history.length + (job.deletedHistorySessions?.length ?? 0) > 0 && <details className="v2-delivery-log"><summary>历史会话（{history.length + (job.deletedHistorySessions?.length ?? 0)}）</summary>
+      {history.map(s => <button className="v2-row" key={s.id} onClick={() => open(s.id)}>{s.title}</button>)}
+      {job.deletedHistorySessions?.map(s => <div className="v2-row" key={s.id}>{s.title} · 会话已删除</div>)}</details>}
   </div>
 }
 

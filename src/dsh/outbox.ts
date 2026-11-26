@@ -27,7 +27,7 @@ export interface Notice {
   attempts: number
 }
 
-export interface NoticeOrder { workspaceId: string; orderId: string }
+export interface NoticeOrder { workspaceId: string; orderId: string; orderDeletedAt?: string }
 export interface NoticeSchedule { id: string; title: string; when: string }
 
 const KEEP = 400

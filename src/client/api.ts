@@ -9,7 +9,7 @@ import type { WarroomState } from '../dsh/view.ts'
 import type { IntakeReceipt } from '../dsh/superhub.ts'
 import { pendingIntent } from './request-id.ts'
 import { speechCursor } from '../core/paging.ts'
-import { appendNewer, emptyPaged, isPageInfo, mergeTail, pageParams, prependOlder, type EdgeState, type Paged, type PageCursor } from './paged-history.ts'
+import { anchoredPage, appendNewer, emptyPaged, isPageInfo, mergeTail, pageParams, prependOlder, type EdgeState, type Paged, type PageCursor } from './paged-history.ts'
 
 export type { TicketCard, WarroomState } from '../dsh/view.ts'
 export type { CommitmentRow, LineRow, MeetingRow, PersonRow, PocState } from '../dsh/poc-view.ts'
@@ -120,7 +120,8 @@ import type { ChatMessage, ChatView } from '../dsh/chat.ts'
  * 历史分页：轮询只取最近一页并与已加载的部分合并，`loadOlder` 按游标补更早的一页（见 paged-history.ts）。
  * `following` 说明界面是否停在底部：两次轮询之间新增超过一页时，停在底部就换成最新一页，否则保留阅读位置。
  */
-export function useChat(onSettled: () => void, scope?: string, onDenied?: (message: string) => void, following?: () => boolean) {
+export function useChat(onSettled: () => void, scope?: string, onDenied?: (message: string) => void, following?: () => boolean,
+  source?: {trace?: string; message?: string; sessionId?: string}) {
   const [view, setView] = useState<ChatView>({ messages: [], busy: false, notices: [] })
   const [paged, setPaged] = useState<Paged<ChatMessage>>(emptyPaged)
   const pagedRef = useRef(paged)
@@ -144,41 +145,66 @@ export function useChat(onSettled: () => void, scope?: string, onDenied?: (messa
   const pollId = useRef(0)
   const loaded = useRef(false)
   const session = useRef<string | undefined>(undefined)
+  const trace = useRef<string | undefined>(undefined)
+  const activeTrace = useRef<string | undefined>(undefined)
+  const sourceTrace = useRef<string | undefined>(undefined)
   const sendError = useRef<string | undefined>(undefined)
   const sendIds = useRef(new Map<string, string>())
   const mounted = useRef(false)
   const knownScope = useRef(scope)
   knownScope.current = scope
   const updatePending = (next: PendingMessage[]) => { pendingRef.current = next; setPending(next) }
-  const read = useCallback(async (cursor?: PageCursor) => {
-    const next = await api<ChatView>('/chat?' + new URLSearchParams([...scope ? [['scope', scope]] : [], ...new URLSearchParams(pageParams(cursor))]))
+  const requestedTrace = source?.trace, anchor = source?.message, requestedSession = source?.sessionId
+  const read = useCallback(async (cursor?: PageCursor, atTrace?: string) => {
+    const params = new URLSearchParams(pageParams(cursor))
+    const target = requestedTrace ?? sourceTrace.current ?? atTrace
+    if (scope) params.set('scope', scope)
+    if (target) params.set('trace', target)
+    const next = await api<ChatView>('/chat?' + params)
+    if (scope && next?.scope !== undefined && next.scope !== scope) throw new ApiError('接口人会话归属已改变，请重新连接。', 409)
+    if (requestedSession && next?.sessionId !== requestedSession) throw new ApiError('原话所属的接口人会话当前不可读。', 410)
     if (!next || !Array.isArray(next.messages) || !Array.isArray(next.notices) || (scope && !next.sessionId) || (next.page !== undefined && !isPageInfo(next.page))
-      || next.messages.some(row => !row || row.inputAttachments !== undefined && !(Array.isArray(row.inputAttachments) && row.inputAttachments.every(isChatInputAttachment)))) {
+      || (target && next.traceId !== target) || (next.traceId !== undefined && typeof next.traceId !== 'string')
+      || (next.activeTraceId !== undefined && typeof next.activeTraceId !== 'string')
+      || next.messages.some(row => !row || (row.canEdit !== undefined && typeof row.canEdit !== 'boolean')
+        || row.inputAttachments !== undefined && !(Array.isArray(row.inputAttachments) && row.inputAttachments.every(isChatInputAttachment)))) {
       throw new Error('主机未返回完整的接口人会话，请重新读取。')
     }
     return next
-  }, [scope])
+  }, [scope, requestedTrace, requestedSession])
   const poll = useCallback(async () => {
     if (!mounted.current || scope !== knownScope.current) return
     clearTimeout(timer.current)
     const request = ++pollId.current
     let busy = wasBusy.current
     try {
-      const next = await read()
+      let linked = !loaded.current ? anchor : undefined
+      let next: ChatView
+      try { next = await read(linked ? {around:linked} : undefined) }
+      catch (error) {
+        if (!linked || !(error instanceof ApiError) || error.status !== 410) throw error
+        linked = undefined
+        next = await read()
+      }
       if (request !== pollId.current) return
-      if (session.current && next.sessionId && session.current !== next.sessionId) {
+      if (linked) sourceTrace.current = next.traceId
+      if (loaded.current && (session.current !== next.sessionId || trace.current !== next.traceId)) {
         sequence.current = -1
         sendIds.current.clear()
         updatePending([])
         epoch.current++
         updatePaged(emptyPaged())
+        setEdges({older:'idle', newer:'idle'})
       }
       session.current = next.sessionId
+      trace.current = next.traceId
+      activeTrace.current = next.activeTraceId
       loaded.current = true
       sequence.current = next.messages.reduce((seq, m) => Math.max(seq, m.seq), sequence.current)
       const replace = replaceNext.current
       replaceNext.current = false
-      const merged = mergeTail(replace ? emptyPaged<ChatMessage>() : pagedRef.current, next.messages, next.page, speechCursor, followRef.current?.() ?? true)
+      const merged = linked && next.page ? anchoredPage(next.messages, next.page)
+        : mergeTail(replace ? emptyPaged<ChatMessage>() : pagedRef.current, next.messages, next.page, speechCursor, followRef.current?.() ?? true)
       const first = (items: ChatMessage[]) => items[0] && speechCursor(items[0])
       if (merged.items.length < pagedRef.current.items.length || first(merged.items) !== first(pagedRef.current.items)) epoch.current++
       updatePaged(merged)
@@ -196,20 +222,20 @@ export function useChat(onSettled: () => void, scope?: string, onDenied?: (messa
       setError((e as Error).message)
     }
     if (document.visibilityState === 'visible') timer.current = setTimeout(() => { void poll() }, busy ? 1000 : 6000)
-  }, [onSettled, scope, onDenied, read])
+  }, [onSettled, scope, onDenied, read, anchor])
   /** 往上补更早的一页，或在没接到最新时往下补一页。`beforeApply` 在写入前调用（记下阅读位置）。 */
   const edge = useCallback(async (side: 'older' | 'newer', beforeApply?: () => void) => {
     const state = pagedRef.current
     const item = side === 'older' ? state.items[0] : state.items.at(-1)
     if (!item || edgeBusy.current[side] || !mounted.current || (side === 'older' ? !state.hasOlder : !state.hasNewer)) return
-    const round = epoch.current, owner = session.current
+    const round = epoch.current, owner = session.current, version = trace.current
     edgeBusy.current[side] = true
     setEdges(previous => ({ ...previous, [side]: 'loading', [side + 'Error']: undefined }))
     let outcome: EdgeState = 'idle', message: string | undefined
     try {
       const cursor = speechCursor(item)
-      const next = await read(side === 'older' ? { before: cursor } : { after: cursor })
-      if (!mounted.current || round !== epoch.current || next.sessionId !== owner) return
+      const next = await read(side === 'older' ? { before: cursor } : { after: cursor }, version)
+      if (!mounted.current || round !== epoch.current || next.sessionId !== owner || next.traceId !== version) return
       if (next.page) {
         beforeApply?.()
         const merged = side === 'older' ? prependOlder(pagedRef.current, next.messages, next.page, speechCursor) : appendNewer(pagedRef.current, next.messages, next.page, speechCursor)
@@ -248,12 +274,14 @@ export function useChat(onSettled: () => void, scope?: string, onDenied?: (messa
     document.addEventListener('visibilitychange', onVisible)
     return () => { mounted.current = false; ++pollId.current; clearTimeout(timer.current); document.removeEventListener('visibilitychange', onVisible) }
   }, [poll])
-  const say = useCallback(async (text: string, mode: ChatMode = 'auto', context?: IntakeContext, inputAttachments: ChatInputAttachment[] = []) => {
+  const say = useCallback(async (text: string, mode: ChatMode = 'auto', context?: IntakeContext, inputAttachments: ChatInputAttachment[] = [], expectedTraceId = trace.current) => {
     // 第一次发言前先知道历史的序号和目标会话，旧的同文消息不能确认本次发送。
     if (!loaded.current) { await poll(); if (!loaded.current) return false }
-    if (!mounted.current || scope !== knownScope.current || (scope && !session.current)) return false
+    if (!mounted.current || scope !== knownScope.current || (scope && !session.current)
+      || (trace.current && activeTrace.current && trace.current !== activeTrace.current)) return false
     if (inputAttachments.length && !text.trim()) text = ''
     const payload = { text, mode, sessionId: session.current, ...context ? { context } : {},
+      ...(expectedTraceId && {expectedTraceId}),
       ...(inputAttachments.length && {inputAttachments:inputAttachments.map(row => row.id)}) }
     const intent = scope ? pendingIntent(scope, '/chat', payload, sendIds.current) : undefined
     const message: PendingMessage = { id: ++localId.current, text, time: Date.now(), afterSeq: sequence.current, requestId: intent?.id,
@@ -288,7 +316,8 @@ export function useChat(onSettled: () => void, scope?: string, onDenied?: (messa
   // 往上翻阅（没接到最新）时，还没确认的发言等回到最新时再显示在末尾。
   const messages: ChatMessage[] = [...paged.items, ...paged.hasNewer ? [] : visiblePending.map(p => ({ seq: Number.MAX_SAFE_INTEGER - p.id, role: 'you' as const, text: p.text, time: p.time,
     ...(p.inputAttachments && {inputAttachments:p.inputAttachments}) }))]
-  return { sessionId: view.sessionId, messages, confirmedMessages: paged.items, observedAt: view.observedAt, notices: view.notices,
+  return { sessionId: view.sessionId, ...(view.traceId && {traceId:view.traceId}), ...(view.activeTraceId && {activeTraceId:view.activeTraceId}),
+    messages, confirmedMessages: paged.items, observedAt: view.observedAt, notices: view.notices,
     workReplies: view.workReplies, ...(view.discussionResults && { discussionResults: view.discussionResults }),
     live: view.live, busy: view.busy || pending.length > 0, error, say, refresh: poll, tick,
     hasOlder: paged.hasOlder, hasNewer: paged.hasNewer, loadOlder, loadNewer, toLatest,

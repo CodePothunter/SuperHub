@@ -28,7 +28,9 @@ export function workDirectory(value: unknown): value is V2WorkDirectory {
 function delegation(value: unknown): value is V2Delegation {
   return record(value) && strings(value, 'id', 'workspaceId', 'title', 'owner', 'promise', 'boundary', 'createdAt') && optionalText(value.nextCheckAt)
     && typeof value.status === 'string' && ['accepted', 'active', 'waiting', 'closed', 'done'].includes(value.status)
-    && optionalText(value.completedAt) && optionalText(value.completedFrom)
+    && optionalText(value.completedAt) && optionalText(value.completedFrom) && optionalText(value.sessionDeletedAt)
+    && (value.deletedHistorySessions === undefined || Array.isArray(value.deletedHistorySessions)
+      && value.deletedHistorySessions.every(row => record(row) && strings(row, 'id', 'title', 'deletedAt')))
     && (value.completedBy === undefined || value.completedBy === 'owner' || value.completedBy === 'owner-words')
     && (value.hasSchedule === undefined || value.hasSchedule === true)
     && Number.isSafeInteger(value.generation) && Number.isSafeInteger(value.remainingTurns)
@@ -56,7 +58,7 @@ function decision(value: unknown): value is V2Decision {
   return record(value) && strings(value, 'id', 'workspaceId', 'delegationId', 'text', 'at') && Number.isSafeInteger(value.version)
 }
 function fileRef(value: unknown): value is V2AttachmentRef {
-  return record(value) && strings(value, 'id', 'label')
+  return record(value) && strings(value, 'id', 'label') && optionalText(value.version)
 }
 const GROUP_LINE_KINDS = ['message', 'progress', 'event']
 const GROUP_MEMBER_KINDS = ['dsh', 'codex', 'claude-code']
@@ -81,6 +83,7 @@ function message(value: unknown): value is V2Message {
   return record(value) && strings(value, 'id', 'author', 'at', 'text') && (value.role === 'user' || value.role === 'agent')
     // SuperHub's own lines in a roster group (its faint events) have no speaker at all.
     && optionalText(value.replyTo) && optionalText(value.workOrderId) && (value.speakerId === undefined || isSpeakerId(value.speakerId))
+    && optionalText(value.workOrderDeletedAt) && optionalText(value.traceId) && (value.canEdit === undefined || typeof value.canEdit === 'boolean')
     && groupLine(value)
     && (value.inputAttachments === undefined || Array.isArray(value.inputAttachments) && value.inputAttachments.every(isChatInputAttachment))
     && (value.attachments === undefined || Array.isArray(value.attachments) && value.attachments.every(fileRef))
@@ -127,9 +130,12 @@ function groupState(value: unknown, workspace: string, sessionId: string): value
     && Array.isArray(value.approvals) && value.approvals.every(row => pendingApproval(row, workspace) && row.sessionId === sessionId)
 }
 export function isSessionView(value: Scoped, resource: string): value is SessionView {
+  const [path, query] = resource.split('?')
+  const trace = new URLSearchParams(query).get('trace')
   return record(value) && session(value.session)
     && (value.group === undefined || groupState(value.group, value.session.workspaceId, value.session.id))
-    && resource.endsWith('/' + encodeURIComponent(value.session.workspaceId) + '/sessions/' + encodeURIComponent(value.session.id))
+    && !!path?.endsWith('/' + encodeURIComponent(value.session.workspaceId) + '/sessions/' + encodeURIComponent(value.session.id))
+    && (trace === null || value.traceId === trace) && optionalText(value.traceId) && optionalText(value.activeTraceId)
     && Array.isArray(value.messages) && value.messages.every(message) && optionalText(value.issue)
     && (value.observedAt === undefined || Number.isSafeInteger(value.observedAt))
     && (value.portraits === undefined || isSpeakerPortraits(value.portraits))
@@ -141,7 +147,11 @@ export function isSessionView(value: Scoped, resource: string): value is Session
 export function isAttachmentView(value: Scoped, resource: string): value is FileView {
   if (!record(value) || !record(value.attachment) || !fileRef(value.attachment)) return false
   const file = value.attachment
-  return resource.endsWith('/attachments/' + encodeURIComponent(file.id))
+  const [path, query] = resource.split('?')
+  const version = new URLSearchParams(query).get('version')
+  const suffix = '/' + encodeURIComponent(file.id)
+  return !!(path?.endsWith('/attachments' + suffix) || path?.endsWith('/outputs' + suffix) && version !== null)
+    && (version === null || file.version === version)
     && (file.format === 'html' || file.format === 'markdown' || file.format === 'text') && typeof file.content === 'string'
 }
 
@@ -149,6 +159,10 @@ function sameOrderPath(resource: string, workspace: string, order: string, suffi
   const root = '/v2/workspaces/' + encodeURIComponent(workspace)
   const end = '/' + encodeURIComponent(order) + suffix
   return resource === root + '/orders' + end || resource === root + '/delegations' + end
+}
+
+export function isWorkspaceOrder(value: Scoped, resource: string): value is Scoped & {order: V2Delegation} {
+  return record(value) && delegation(value.order) && sameOrderPath(resource, value.order.workspaceId, value.order.id, '')
 }
 
 const optionalCode = (value: unknown) => value === undefined || value === null || Number.isSafeInteger(value)
@@ -167,7 +181,7 @@ function permissionChange(value: unknown): value is V2PermissionChange {
 export function pendingApproval(value: unknown, workspace?: string, order?: string | null): value is V2PendingApproval {
   return record(value) && strings(value, 'id', 'workspaceId', 'sessionId', 'turnId', 'command', 'cwd', 'reason', 'requestedAt', 'expiresAt')
     // `dsh`: a DSH member of a roster group asked (`memberId` names it).
-    && (value.tool === 'codex' || value.tool === 'claude-code' || value.tool === 'dsh') && optionalText(value.memberId)
+    && (value.tool === 'codex' || value.tool === 'claude-code' || value.tool === 'dsh') && optionalText(value.memberId) && optionalText(value.traceId)
     && (value.workOrderId === null || typeof value.workOrderId === 'string')
     && (workspace === undefined || value.workspaceId === workspace) && (order === undefined || value.workOrderId === order)
 }
@@ -218,8 +232,9 @@ export function isFollowupView(value: unknown, resource: string): value is Follo
     || !sameOrderPath(resource, value.workspaceId, value.orderId, '/followup')
     || typeof value.timeZone !== 'string' || !value.timeZone || typeof value.currentWeek !== 'string') return false
   const source = (row: unknown) => record(row) && (row.kind === 'session' || row.kind === 'liaison') && strings(row, 'sessionId', 'messageId', 'author', 'at')
+    && optionalText(row.sessionDeletedAt) && optionalText(row.traceId)
   const { commitments, reports, schedule } = value
-  return Array.isArray(commitments) && commitments.every(row => record(row) && strings(row, 'id', 'kind', 'quote', 'dueState')
+  return optionalText(value.sessionDeletedAt) && Array.isArray(commitments) && commitments.every(row => record(row) && strings(row, 'id', 'kind', 'quote', 'dueState')
     && ['mine', 'theirs', 'request'].includes(String(row.kind))
     && ['unscheduled', 'upcoming', 'today', 'overdue', 'resolved'].includes(String(row.dueState))
     && typeof row.resolved === 'boolean' && optionalText(row.person) && optionalText(row.dueAt)
@@ -232,11 +247,16 @@ export function isFollowupView(value: unknown, resource: string): value is Follo
     && (value.reportId === undefined || reports.some(row => row.id === value.reportId))
 }
 
+function outputSource(row: unknown): row is WorkOrderOutput {
+  return record(row) && strings(row, 'sessionId', 'messageId') && !!row.sessionId && !!row.messageId
+    && fileRef(row.attachment) && !!row.attachment.id && !!row.attachment.label.trim()
+    && optionalText(row.traceId) && optionalText(row.orderId) && optionalText(row.at) && optionalText(row.sessionDeletedAt)
+}
+
 export function isOrderOutputs(value: unknown, resource: string): value is Scoped & {workspaceId: string; delegationId: string; outputs: WorkOrderOutput[]} {
   return record(value) && typeof value.scope === 'string' && typeof value.workspaceId === 'string' && typeof value.delegationId === 'string'
     && sameOrderPath(resource, value.workspaceId, value.delegationId, '/outputs') && Array.isArray(value.outputs)
-    && value.outputs.every(row => record(row) && strings(row, 'sessionId', 'messageId') && !!row.sessionId && !!row.messageId
-      && fileRef(row.attachment) && !!row.attachment.id && !!row.attachment.label.trim())
+    && value.outputs.every(outputSource)
 }
 
 /** `GET …/:w/outputs`: the workspace's delivered files, each with the orders (tags) and speakers that delivered it. */
@@ -244,9 +264,12 @@ export function isWorkspaceOutputs(value: unknown, resource: string): value is S
   const named = (row: unknown) => record(row) && strings(row, 'id', 'name') && !!row.id
   return record(value) && typeof value.scope === 'string' && typeof value.workspaceId === 'string' && optionalText(value.issue)
     && resource === '/v2/workspaces/' + encodeURIComponent(value.workspaceId) + '/outputs' && Array.isArray(value.outputs)
-    && value.outputs.every(row => record(row) && strings(row, 'key', 'label', 'at', 'sessionId', 'messageId')
-      && !!row.key && !!row.sessionId && !!row.messageId && fileRef(row.attachment) && !!row.attachment.id && !!String(row.label).trim()
-      && Array.isArray(row.orders) && row.orders.length > 0 && row.orders.every(order => record(order) && strings(order, 'id', 'title') && !!order.id)
+    && value.outputs.every(row => record(row) && strings(row, 'key', 'label', 'at')
+      && !!row.key && !!String(row.label).trim()
+      && Array.isArray(row.orders) && row.orders.length > 0 && row.orders.every(order => record(order) && strings(order, 'id', 'title') && !!order.id && optionalText(order.deletedAt))
+      && (row.versions === undefined || Array.isArray(row.versions) && row.versions.every(version =>
+        outputSource(version) && typeof version.at === 'string' && typeof version.orderId === 'string'))
+      && outputSource(row)
       && Array.isArray(row.deliveredBy) && row.deliveredBy.every(named))
 }
 

@@ -23,8 +23,9 @@ export const emptyPaged = <T>(): Paged<T> => ({ items: [], hasOlder: false, hasN
 
 export type PageCursor = { before: string } | { after: string } | { around: string } | Record<string, never>
 /** 分页查询串（不含 `?`）。 */
-export function pageParams(cursor: PageCursor = {}, limit = PAGE_SIZE): string {
+export function pageParams(cursor: PageCursor = {}, limit = PAGE_SIZE, traceId?: string): string {
   const params = new URLSearchParams({ limit: String(limit) })
+  if (traceId) params.set('trace', traceId)
   for (const [key, value] of Object.entries(cursor)) params.set(key, value)
   return params.toString()
 }
@@ -69,7 +70,7 @@ export function appendNewer<T>(state: Paged<T>, newer: readonly T[], page: PageI
 export const anchoredPage = <T>(items: readonly T[], page: PageInfo): Paged<T> => ({ items: [...items], hasOlder: page.older, hasNewer: page.newer })
 
 export type EdgeState = 'idle' | 'loading' | 'error'
-export interface PagedView<T> { messages: T[]; page?: PageInfo }
+export interface PagedView<T> { messages: T[]; page?: PageInfo; traceId?: string }
 
 interface Options<V extends PagedView<T>, T> {
   /** 换了对象（会话、第二大脑）时清空重读；undefined 时不读。 */
@@ -135,12 +136,15 @@ export function usePagedHistory<V extends PagedView<T>, T>(options: Options<V, T
   const jumpTo = useCallback(async (target: string) => {
     const check = liveKey.current
     if (!check) return
+    // A source URL resolves its trace on first read. Once a view is loaded,
+    // quotes and cursors locate messages within that view.
+    const traceId = state.current.view?.traceId
     const round = ++epoch.current
     update(previous => ({ ...previous, jumping: target, missing: undefined, older: 'idle', newer: 'idle', olderError: undefined, newerError: undefined }))
     try {
-      const next = await latest.current.read(pageParams({ around: target }))
+      const next = await latest.current.read(pageParams({ around: target }, PAGE_SIZE, traceId))
       if (!current(check, round)) return
-      update(previous => ({ ...previous, key: check, view: combine(previous.view, next), error: undefined, jumping: undefined,
+      update(previous => ({ ...previous, key: check, view: combine(previous.view?.traceId === next.traceId ? previous.view : undefined, next), error: undefined, jumping: undefined,
         paged: next.page ? anchoredPage(next.messages, next.page) : mergeTail(previous.paged, next.messages, undefined, latest.current.id, true) }))
     } catch (error) {
       if (!current(check, round)) return
@@ -164,23 +168,28 @@ export function usePagedHistory<V extends PagedView<T>, T>(options: Options<V, T
     const have = state.current.key === check && (state.current.view || state.current.paged.items.length)
     // 第一次读到带深链接的会话：直接读那条消息所在的一页（之后的轮询仍取最新一页来更新状态）。
     if (!have && target && state.current.missing !== target && !state.current.jumping) return jumpTo(target)
-    const seq = ++pollSeq.current
+    if (state.current.jumping) return
+    const seq = ++pollSeq.current, round = epoch.current
     try {
       const next = await latest.current.read(pageParams())
-      if (check !== liveKey.current || seq < applied.current) return
+      if (!current(check, round) || seq < applied.current) return
       applied.current = seq
       const follow = latest.current.following?.() ?? true
-      const replace = replaceNext.current
+      const changedTrace = !!state.current.view && state.current.view.traceId !== next.traceId
+      const replace = replaceNext.current || changedTrace
       replaceNext.current = false
-      update(previous => previous.jumping ? { ...previous, view: combine(previous.view, next), error: undefined } : ({ ...previous, key: check, view: combine(previous.view, next), error: undefined,
+      if (changedTrace) epoch.current++
+      update(previous => ({ ...previous, key: check, view: combine(changedTrace ? undefined : previous.view, next), error: undefined,
+        ...(changedTrace && {older: 'idle', newer: 'idle', olderError: undefined, newerError: undefined, missing: undefined}),
         paged: mergeTail(replace ? emptyPaged<T>() : previous.paged, next.messages, next.page, latest.current.id, follow) }))
     } catch (error) {
-      if (check !== liveKey.current || seq < applied.current) return
+      if (!current(check, round) || seq < applied.current) return
       const how = fail(error)
       if (how === 'stop') return
+      if (how === 'clear') epoch.current++
       update(previous => ({ ...previous, error: text(error), ...(how === 'clear' && { view: undefined, paged: emptyPaged<T>() }) }))
     }
-  }, [update, jumpTo])
+  }, [update, jumpTo, current])
 
   const edge = useCallback(async (side: 'older' | 'newer', beforeApply?: () => void) => {
     const check = liveKey.current, round = epoch.current
@@ -190,8 +199,10 @@ export function usePagedHistory<V extends PagedView<T>, T>(options: Options<V, T
     update(previous => ({ ...previous, [side]: 'loading', [side + 'Error']: undefined }))
     const cursor = latest.current.id(edgeItem)
     try {
-      const next = await latest.current.read(pageParams(side === 'older' ? { before: cursor } : { after: cursor }))
+      const traceId = state.current.view?.traceId
+      const next = await latest.current.read(pageParams(side === 'older' ? { before: cursor } : { after: cursor }, PAGE_SIZE, traceId))
       if (!current(check, round)) return
+      if (state.current.view?.traceId !== next.traceId) { void toLatest(); return }
       beforeApply?.()
       update(previous => ({ ...previous, view: combine(previous.view, next), [side]: 'idle',
         paged: !next.page ? previous.paged : side === 'older' ? prependOlder(previous.paged, next.messages, next.page, latest.current.id)

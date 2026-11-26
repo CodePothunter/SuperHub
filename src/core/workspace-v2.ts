@@ -71,6 +71,12 @@ export interface V2Delegation {
   conversationId?: string
   /** Earlier conversations from boards that supported multiple links remain readable. */
   historySessionIds?: string[]
+  /** The order is deleted. Its row still proves the identity of historical references. */
+  deletedAt?: string
+  /** View only: the order's responsible conversation has been deleted. */
+  sessionDeletedAt?: string
+  /** View only: deleted conversations listed in `historySessionIds`. */
+  deletedHistorySessions?: {id: string; title: string; deletedAt: string}[]
   title: string
   owner: string
   promise: string
@@ -144,6 +150,8 @@ export interface V2Decision {
 
 export interface V2Session {
   id: string
+  /** The internal conversation version when a source adapter reads or writes a particular trace. */
+  traceId?: string
   workspaceId: string
   title: string
   kind: 'coding' | 'group'
@@ -165,11 +173,21 @@ export interface V2Session {
   legacyMessageOrder?: { id: string; through: string }
   closed: boolean
   createdAt: string
+  /** Explicit deletion in this workspace. Independent of whether the conversation was closed. */
+  deletedAt?: string
 }
 
-export interface V2AttachmentRef { id: string; label: string }
+export interface V2AttachmentRef { id: string; label: string; version?: string }
 export interface V2OrderOriginal { text: string; complete: boolean }
-export interface WorkOrderOutput { sessionId: string; messageId: string; attachment: V2AttachmentRef }
+export interface WorkOrderOutput {
+  sessionId: string
+  messageId: string
+  attachment: V2AttachmentRef
+  traceId?: string
+  sessionDeletedAt?: string
+  orderId?: string
+  at?: string
+}
 /**
  * One delivered file across a workspace's orders (`GET …/:w/outputs`), listed once however many orders or lines linked it.
  * `key` is stable and never the file path. `sessionId`, `messageId` and `attachment` are its latest reference (what opens
@@ -179,12 +197,18 @@ export interface WorkspaceOutput extends WorkOrderOutput {
   key: string
   label: string
   at: string
-  orders: { id: string; title: string }[]
+  orders: { id: string; title: string; deletedAt?: string }[]
   deliveredBy: { id: string; name: string }[]
+  /** Other deliveries of this file when their exact source is recorded. */
+  versions?: (WorkOrderOutput & {at: string; orderId: string})[]
 }
 export interface V2Attachment extends V2AttachmentRef { format: 'markdown' | 'text' | 'html'; content: string }
 export interface V2Message {
   id: string
+  /** The conversation version in which this message first appeared. */
+  traceId?: string
+  /** This row is authenticated owner speech and can be used as a revision anchor. */
+  canEdit?: boolean
   role: 'user' | 'agent'
   author: string
   /** Absent for historical messages that carry only a display name. */
@@ -192,6 +216,8 @@ export interface V2Message {
   at: string
   text: string
   workOrderId?: string
+  /** View only: the explicitly attributed work order has been deleted. */
+  workOrderDeletedAt?: string
   replyTo?: string
   attachments?: V2AttachmentRef[]
   /** Materials the owner supplied with this message or the liaison relayed to this order. */
@@ -231,7 +257,7 @@ export type V2Delivery = 'steered' | 'pending' | 'queued' | 'unsent' | 'unknown'
 export const V2_DELIVERIES: readonly V2Delivery[] = ['steered', 'pending', 'queued', 'unsent', 'unknown']
 
 /** Only a single binding recorded before migration can own an unlabelled historical message. */
-export function messageWorkOrder(session: V2Session, message: V2Message): string | undefined {
+export function messageWorkOrder(session: V2Session, message: Pick<V2Message, 'at' | 'workOrderId'>): string | undefined {
   if (message.workOrderId) return message.workOrderId
   const legacy = session.legacyMessageOrder
   if (legacy && Date.parse(message.at) < Date.parse(legacy.through)) return legacy.id
@@ -239,6 +265,8 @@ export function messageWorkOrder(session: V2Session, message: V2Message): string
 
 export interface V2Transcript {
   messages: V2Message[]
+  traceId?: string
+  activeTraceId?: string
   issue?: string
   /** An informational notice (e.g. a native turn with one reply) can accompany a complete public transcript. */
   complete?: boolean
@@ -335,6 +363,7 @@ export interface V2PendingApproval {
   id: string
   workspaceId: string
   sessionId: string
+  traceId?: string
   workOrderId: string | null
   turnId: string
   /** `dsh`: a DSH group member. */
@@ -386,9 +415,17 @@ export type V2SteerOutcome = 'steered' | 'pending' | 'rejected'
 export interface V2TurnEvents {
   /** The owner's words are durably recorded with the source and dispatch has begun; the caller may stop waiting. */
   dispatched?(): void
+  /** The turn must still belong to the active trace at the native dispatch boundary. */
+  canStart?(): boolean
 }
 
 export interface V2DialogueSource {
+  /** Verify owner authorship from the persisted receipt, rather than the display name. */
+  canEdit?(session: V2Session, message: V2Message): boolean
+  /** Seal the parent transcript; seed a new source with the acknowledged prefix and fresh bindings. */
+  prepareEdit?(parent: V2Session, child: V2Session, messages: V2Message[], before: number): void
+  /** Read a sealed source version without polling or resuming its native conversation. */
+  readSnapshot?(session: V2Session, includeLate?: boolean): V2Transcript
   /** Public messages eligible for automatic reuse under this current staff authorization. */
   staffSources?(session:V2Session,orderId:string,token:string):Set<string>
   /** Locally saved first turn and published text, used to restore old automatically named orders. */

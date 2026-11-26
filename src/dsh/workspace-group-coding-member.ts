@@ -185,7 +185,7 @@ export class CodingMemberRunner implements MemberRunner {
     const attempt = async (resume: string | undefined, body: string, materials?: MemberInputs) => {
       let lease: GateLease | undefined
       try {
-        lease = this.options.gate?.open({ workspaceId: call.group.workspaceId, sessionId: call.group.groupId, ...call.workOrderId && { orderId: call.workOrderId },
+        lease = this.options.gate?.open({ workspaceId: call.group.workspaceId, sessionId: call.group.groupId, traceId: call.group.traceId, ...call.workOrderId && { orderId: call.workOrderId },
           turnId, tool, cwd: call.group.workDir, member: { id: call.member.id, name: call.member.name }, title: call.group.title },
         line => this.log(call, line), { approval: waiting => { if (run.active) sink.approval(call.callId, waiting) } })
       } catch (error) {
@@ -230,6 +230,7 @@ export class CodingMemberRunner implements MemberRunner {
             if (!selection) accept()
           },
           beforeInput: () => {
+            if (call.group.canStart?.() === false) throw new Error('对话版本已更新')
             current()
             submitting = true
             if (currentSession && selection) rememberBinding(currentSession)

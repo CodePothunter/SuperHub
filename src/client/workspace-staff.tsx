@@ -130,8 +130,10 @@ export function StaffBoard(props:Props) {
       </div>
       <p>{memory.text}</p>
       <ExperienceDetails memory={memory} openEvidence={openEvidence} timeZone={view?.timeZone}/>
-      <div className="v2-actions">{memory.orderId && memory.workspaceId && <button className="v2-link" onClick={()=>openOrder(memory.workspaceId!,memory.orderId!)}>查看来源工单</button>}
-        {memory.lastUsed && <button className="v2-link" onClick={()=>openOrder(memory.lastUsed!.workspaceId,memory.lastUsed!.orderId)}>最近提供给工单 · {readableTime(memory.lastUsed.at)}</button>}</div>
+      <div className="v2-actions">{memory.orderDeletedAt ? <span className="v2-quiet">来源工单已删除</span>
+        : memory.orderId && memory.workspaceId && <button className="v2-link" onClick={()=>openOrder(memory.workspaceId!,memory.orderId!)}>查看来源工单</button>}
+        {memory.lastUsed?.orderDeletedAt ? <span className="v2-quiet">最近提供给工单 · 已删除</span>
+          : memory.lastUsed && <button className="v2-link" onClick={()=>openOrder(memory.lastUsed!.workspaceId,memory.lastUsed!.orderId)}>最近提供给工单 · {readableTime(memory.lastUsed.at)}</button>}</div>
       {editable && (memory.status !== 'retired' || needsDecision || dateExpired(memory)) && <div className="v2-actions">
         {memory.status === 'proposed' && !memory.replacementPending && <button className="v2-button" disabled={write.busy} onClick={()=>command('accept','已采纳经验。')}>
           {needsDecision ? '采纳当前版本' : '采纳'}</button>}
@@ -264,13 +266,15 @@ function ExperienceSources({sources, openEvidence}: {sources:ExperienceEvidence[
   const original = document.error ? undefined : document.data?.attachment
   return <>{sources.map(source=>{
     const path = artifactPath(source)
-    return <div key={JSON.stringify([source.kind,source.id,source.version,source.quote])}>
+    return <div key={JSON.stringify([source.kind,source.id,source.traceId,source.version,source.quote])}>
       <strong>{evidenceLabels[source.kind]}</strong>
       <div><small>来源编号 · {source.id}{source.version && ' · 来源版本 '+source.version}</small></div>
       {source.quote && <p>{source.quote}</p>}
       <div className="v2-actions">
         {path && <button className="v2-link" onClick={()=>setSelected(path)}>查看交付原件</button>}
-        {openEvidence && source.workspaceId && (source.messageId && source.sessionId || source.orderId)
+        {source.orderDeletedAt && <span className="v2-quiet">工单已删除</span>}
+        {source.sessionDeletedAt && <span className="v2-quiet">来源会话已删除</span>}
+        {openEvidence && source.workspaceId && (source.messageId && source.sessionId && !source.sessionDeletedAt || source.orderId && !source.orderDeletedAt)
           && <button className="v2-link" onClick={()=>openEvidence(source)}>打开来源</button>}
       </div>
     </div>

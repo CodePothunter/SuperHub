@@ -541,7 +541,7 @@ describe('方案 A：模型理解、结构化提交；主人本轮原话作为�
     const record = {action:'record',entries:[{kind:'mine',quote:'我答应讲解流程',messageId:'m1'}]}
     await f.call('chief_order_followup',record,sourceTurn)
     const saved = f.workspaceRoutes.followup.view(workspace.id,order.id).commitments[0]!
-    expect(saved.source).toEqual({kind:'session',sessionId:session.id,messageId:'m1',author:'我',at:'2026-11-19T08:00:00Z'})
+    expect(saved.source).toEqual({kind:'session',sessionId:session.id,traceId:'initial',messageId:'m1',author:'我',at:'2026-11-19T08:00:00Z'})
     await expect(f.call('chief_order_followup',{...record,work_order_id:sibling.id},sourceTurn)).rejects.toThrow('选中')
     await expect(f.call('chief_order_followup',{action:'sources',message_id:'m2'},sourceTurn)).rejects.toThrow('没有')
     await expect(f.call('chief_order_followup',{action:'record',entries:[{kind:'mine',quote:'预算',messageId:'m2'}]},sourceTurn)).rejects.toThrow()
