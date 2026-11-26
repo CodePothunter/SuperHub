@@ -337,11 +337,14 @@ body[data-ds-dark-theme]:not([data-chief-standalone]) .wv2 { ${darkPalette} }
 .wv2 .v2-byline { display:flex; flex-wrap:wrap; align-items:baseline; gap:8px; margin:0 2px 3px; font-size:13px; }
 .wv2 .v2-byline strong { min-width:0; overflow-wrap:anywhere; }
 .wv2 .v2-byline time { color:var(--v-muted); font-size:12px; font-variant-numeric:tabular-nums; }
-.wv2 .v2-byline .v2-edit-message { color:var(--v-muted); min-height:28px; padding-inline:7px; }
-.wv2 .v2-byline .v2-edit-message:hover,.wv2 .v2-byline .v2-edit-message:focus-visible { color:var(--hub-brand-text); }
+.wv2 .v2-edit-message { display:inline-grid; place-items:center; align-self:center; flex:none; width:28px; height:28px;
+  margin-block:-4px; border-radius:7px; color:var(--v-muted); }
+.wv2 .v2-edit-message:hover:enabled { color:var(--v-ink); background:var(--v-tint); }
+@media (hover:hover) and (pointer:fine) {
+  .wv2 .v2-turn:not(:hover):not(:focus-within) .v2-edit-message { opacity:0; }
+}
 .wv2 .v2-delete-target { color:var(--v-alert); }
 .wv2 .v2-orphaned-heading { margin:0; padding:14px 16px 9px; font-size:15px; color:var(--v-muted); }
-@media (pointer:coarse) { .wv2 .v2-byline .v2-edit-message { min-height:44px; } }
 .wv2 .v2-bubble { padding:8px 12px; border:1px solid var(--v-soft); border-radius:2px 10px 10px; background:var(--chat-back); font:400 14px/1.7 var(--v-font); }
 .wv2 .mine .v2-bubble { border-color:transparent; border-radius:10px 2px 10px 10px; background:var(--chat-own); }
 .wv2 .v2-markdown { min-width:0; overflow-wrap:anywhere; }
@@ -359,6 +362,24 @@ body[data-ds-dark-theme]:not([data-chief-standalone]) .wv2 { ${darkPalette} }
 .wv2 .v2-compose label,.wv2 .v2-dialog form>label { display:grid; gap:5px; font-size:14px; font-weight:550; }
 .wv2 :is(textarea,input:not([type=checkbox]),select) { width:100%; min-width:0; border:1px solid var(--v-line); border-radius:6px; padding:8px 11px; background:var(--v-paper); color:var(--v-ink); font-size:15px; font-weight:400; }
 .wv2 textarea { resize:vertical; }
+.wv2 .v2-message:has(> .v2-message-editor) { width:55ch; }
+.wv2 .v2-message-editor { display:grid; min-width:0; gap:8px; padding:10px; border:1px solid var(--v-line);
+  border-radius:16px; background:var(--v-tint); }
+.wv2 .v2-message-editor textarea { display:block; field-sizing:content; min-height:80px; max-height:min(36dvh,256px);
+  padding:7px 9px; border:0; border-radius:8px; background:transparent; resize:none; overflow-y:auto; overflow-wrap:anywhere;
+  line-height:1.55; outline-offset:-2px; }
+.wv2 .v2-editor-attachments { padding-inline:9px; color:var(--v-muted); font-size:12px; overflow-wrap:anywhere; }
+.wv2 .v2-editor-actions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+.wv2 .v2-editor-actions .v2-button { min-height:36px; border-radius:999px; padding:6px 13px; white-space:nowrap; }
+@media (pointer:coarse), (max-width:700px) {
+  .wv2 .v2-edit-message { width:44px; height:44px; margin-block:0; }
+  .wv2 .v2-message-editor textarea { font-size:16px; }
+  .wv2 .v2-editor-actions .v2-button { min-height:44px; }
+}
+@media (pointer:coarse) {
+  .wv2 .v2-message-editor:has(> textarea:focus) { border-color:var(--hub-brand-text); }
+  .wv2 .v2-message-editor textarea:focus-visible { outline:none; }
+}
 .wv2 .v2-close-chat { margin-inline-start:auto; }
 .wv2 .v2-chat-foot { border-top:1px solid var(--v-line); padding:7px 17px; }
 .wv2 .v2-chat-foot:empty { display:none; }

@@ -13,7 +13,7 @@ import { GroupDeliveries, GroupRoster, GroupStatus, MemberBadges, MentionMenu, m
 import { ChatComposer, MessageInputAttachments, useChatAttachments } from './chat-attachments.tsx'
 import { OwnerActionReply, OwnerActions } from './workspace-owner-actions.tsx'
 import type { OwnerAction } from '../core/workspace-engagement.ts'
-import { DeleteWorkspaceTarget, MessageEditor, type MessageEdit } from './workspace-conversation-actions.tsx'
+import { DeleteWorkspaceTarget, MessageEditButton, MessageEditor } from './workspace-conversation-actions.tsx'
 import { attachmentResource } from './workspace-output-source.ts'
 
 interface BoardProps {
@@ -152,7 +152,7 @@ export function Transcript({ base, session, view, origin, sourceMessage, trace, 
   const latestDraft = useRef(draft)
   latestDraft.current = draft
   const [attachment, setAttachment] = useState<{ message: string; traceId?: string; ref: V2AttachmentRef }>()
-  const [revision, setRevision] = useState<MessageEdit>()
+  const [revision, setRevision] = useState<{message: SessionLine; traceId: string}>()
   const [savedMessage, setSavedMessage] = useState<{id: string; traceId: string}>()
   const [confirmClose, setConfirmClose] = useState(false)
   const edit = (value: string) => {
@@ -165,6 +165,12 @@ export function Transcript({ base, session, view, origin, sourceMessage, trace, 
   }
   const closed = session.closed || result?.session.closed
   const messages = result?.messages ?? []
+  const activeTraceId = result?.activeTraceId
+  const activeEdit = result && !closed && !archived ? revision : undefined
+  const original = activeEdit?.message
+  // A poll may switch traces before this draft is submitted. Keep its own row mounted through the conflict.
+  const displayedMessages = original && !messages.some(message => message.id === original.id)
+    ? [...messages, original].sort((a, b) => a.at.localeCompare(b.at)) : messages
   // A group on the group engine: members, their status, the @ menu and mention chips.
   const group = session.engine === 'roster' ? result?.group : undefined
   const mention = useMentionMenu(group && !closed && !readOnlySource && !archived ? group.members : undefined, draft, edit)
@@ -212,7 +218,7 @@ export function Transcript({ base, session, view, origin, sourceMessage, trace, 
     appending.current = false
     // On opening, the newest message shows (a linked message is centred by its own effect below).
     if (!positioned.current) { positioned.current = true; if (!sourceMessage) showLatest(); return }
-    if (following.current && !skip) showLatest()
+    if (following.current && !activeEdit && !skip) showLatest()
   }, [lastId, result?.traceId])
   usePortraitArrivals(history, JSON.stringify([path, closed, result?.traceId]), readOnlySource ? undefined : result?.messages, result?.observedAt)
   const byId = new Map(messages.map(m => [m.id, m]))
@@ -273,7 +279,7 @@ export function Transcript({ base, session, view, origin, sourceMessage, trace, 
     node?.focus({ preventScroll: true }); node?.scrollIntoView({ block: 'center' })
   }
   async function dispatch() {
-    if (!files.canSend(draft) || !result || closed || blocked || readOnlySource || archived) return
+    if (!files.canSend(draft) || !result || closed || blocked || readOnlySource || archived || activeEdit) return
     const sent = draft
     following.current = true
     if (paged.hasNewer) void paged.toLatest()
@@ -307,9 +313,9 @@ export function Transcript({ base, session, view, origin, sourceMessage, trace, 
       {result?.issue && <div className="v2-source-status" role="status">{result.issue}</div>}
       {result && sourceMessage && !anchoredId && !paged.jumping && <p className="v2-source-status" role="status">{origin ? '这条工单原话当前不可读。' : '这条原话当前不可读。'}</p>}
       {!result && !transcript.error && <p role="status" className="v2-quiet">正在读取会话…</p>}
-      {result && !messages.length && !result.issue && <div className="v2-empty"><strong>这场会话还没有可读的发言</strong><p>{closed ? '会话已关闭。' : archived ? ARCHIVED_NOTE : '在下方发出第一句话。'}</p></div>}
+      {result && !displayedMessages.length && !result.issue && <div className="v2-empty"><strong>这场会话还没有可读的发言</strong><p>{closed ? '会话已关闭。' : archived ? ARCHIVED_NOTE : '在下方发出第一句话。'}</p></div>}
       {result && <OlderEdge edge={top} hasOlder={paged.hasOlder} loading={paged.older === 'loading'} error={paged.olderError} count={messages.length} load={loadOlder}/>}
-      {messages.length > 0 && <ol className="v2-turns" aria-label="会话发言">{messages.map((m, i) => {
+      {displayedMessages.length > 0 && <ol className="v2-turns" aria-label="会话发言">{displayedMessages.map((m, i) => {
         const day = dayTime(m.at), quoted = m.replyTo && byId.get(m.replyTo)
         const orderId = messageWorkOrder(session, m)
         // A group tags every line said for an order (except on that order's own page, where all of them are).
@@ -317,22 +323,35 @@ export function Transcript({ base, session, view, origin, sourceMessage, trace, 
         const orderTag = m.workOrderDeletedAt ? <small className="v2-quiet v2-order-tag">工单已删除</small>
           : messageOrder && <button className="v2-link v2-order-tag" onClick={() => openDelegation(messageOrder.id)}>{group && <V2Icon name="work"/>}{messageOrder.title}</button>
         const clock = new Date(m.at).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',hour12:false})
-        const dateLine = (i === 0 || day !== dayTime(messages[i-1]!.at)) && <div className="v2-date">{day}</div>
+        const dateLine = (i === 0 || day !== dayTime(displayedMessages[i-1]!.at)) && <div className="v2-date">{day}</div>
         if (m.kind === 'event') return <li key={m.id} id={prefix + m.id} data-message-id={m.id} data-event={m.event} className="v2-group-event" tabIndex={-1}>
           {dateLine}<p><time dateTime={m.at}>{clock}</time><span>{m.text}</span></p>
           {orderTag}</li>
         const member = m.speakerId ? memberBySpeaker.get(m.speakerId) : undefined
         const progress = m.kind === 'progress'
+        const editing = activeEdit?.message.id === m.id ? activeEdit : undefined
         return <li key={m.id} id={prefix + m.id} data-message-id={m.id} data-kind={m.kind} className={m.id === anchoredId ? 'v2-source-turn' : undefined} tabIndex={-1}>
           {dateLine}
           <div className={'v2-turn ' + (m.role === 'user' ? 'mine' : '') + (progress ? ' progress' : '')}><ChatAvatar portrait={m.speakerId ? result?.portraits?.[m.speakerId] : undefined}/>
-            <div className="v2-message"><div className="v2-byline"><strong>{m.author}</strong>{member && <MemberBadges member={member}/>}
-              {progress && <span className="v2-progress-tag">进行中</span>}<time dateTime={m.at}>{clock}</time>
-              {m.role === 'user' && m.canEdit && result?.activeTraceId && !closed && !archived && !readOnlySource &&
-                <button type="button" className="v2-link v2-edit-message" disabled={write.busy}
-                  aria-label="编辑历史消息" onClick={() => setRevision({id:m.id, text:m.text, traceId:result.activeTraceId!, attachments:m.inputAttachments})}>编辑</button>}</div>
+            <div className="v2-message"><div className="v2-byline">
+              {!activeEdit && m.role === 'user' && m.canEdit && activeTraceId && !closed && !archived && !readOnlySource &&
+                <MessageEditButton disabled={write.busy} open={() => { following.current = false; setRevision({message:m, traceId:activeTraceId}) }}/>}
+              <strong>{m.author}</strong>{member && <MemberBadges member={member}/>}
+              {progress && <span className="v2-progress-tag">进行中</span>}<time dateTime={m.at}>{clock}</time></div>
               {orderTag}
-              <div className="v2-bubble">
+              {editing ? <MessageEditor base={path} sessionId={session.id} maxLength={64000}
+                edit={{id:editing.message.id, text:editing.message.text, traceId:editing.traceId, attachments:editing.message.inputAttachments}}
+                close={() => setRevision(undefined)} saved={receipt => {
+                  setRevision(undefined)
+                  setAttachment(undefined)
+                  if ((sourceMessage || trace) && currentTrace) currentTrace()
+                  else {
+                    following.current = true
+                    setSavedMessage({id:receipt.messageId, traceId:receipt.traceId})
+                    void paged.toLatest()
+                  }
+                  void changed()
+                }}/> : <div className="v2-bubble">
                 {quoted ? <button className="v2-quote" onClick={() => focusMessage(quoted.id)}>回复{quoted.author} · {quoted.text}</button>
                   : m.replyTo && (paged.hasOlder ? <button className="v2-quote" onClick={() => locate(m.replyTo!)}>回复更早的一条发言 · 查看</button>
                     : <small className="v2-quote">被回复的原话当前不可读</small>)}
@@ -341,7 +360,7 @@ export function Transcript({ base, session, view, origin, sourceMessage, trace, 
                 <MessageInputAttachments scope={scope} target={{...inputTarget, workOrderId:orderId}} attachments={m.inputAttachments}/>
                 {m.quote && <details className="v2-relay-quote"><summary>{m.quote.label}</summary><div className="v2-relay-text">{m.quote.text}</div></details>}
                 {m.attachments?.map(ref => <button key={ref.id} className="v2-link v2-attachment" onClick={() => setAttachment({message:m.id,traceId:m.traceId ?? result?.traceId,ref})}><V2Icon name="box"/>{ref.label}</button>)}
-              </div>
+              </div>}
               {m.delivery && <small className="v2-delivery-note" data-delivery={m.delivery}>{deliveryNote[m.delivery]}</small>}
               {group && <GroupDeliveries deliveries={m.deliveries} members={group.members}/>}
               {m.held && <small className="v2-delivery-note v2-held-note" data-held={m.held}>{heldNote[m.held]}</small>}
@@ -381,10 +400,10 @@ export function Transcript({ base, session, view, origin, sourceMessage, trace, 
       <Issue text={stopWait.error}/>
       <div className="v2-mention-field">
         {mention.open && <MentionMenu id={mention.listId} options={mention.options} active={mention.active} portraits={result?.portraits} pick={mention.pick}/>}
-        <ChatComposer draft={files} text={draft} sending={write.busy} disabled={!result || !!blocked}
+        <ChatComposer draft={files} text={draft} sending={write.busy} disabled={!result || !!blocked || !!activeEdit}
           status={blocked ? job.title + ' · ' + (job.status === 'done' ? '工单已完成，重新打开后可继续' : job.status === 'closed' ? '工单已关闭' : job.paused ? '工单已暂停' : '本次额度已用完') : undefined}>
           <textarea ref={mention.field} rows={1} aria-label="发言" placeholder={group ? '在群里说点什么，输入 @ 叫人…' : session.kind === 'group' ? '在群里说点什么…' : '对 ' + executorName[session.executor] + ' 说…'}
-            value={draft} disabled={!result || !!blocked} maxLength={64000}
+            value={draft} disabled={!result || !!blocked || !!activeEdit} maxLength={64000}
             {...group && {'aria-autocomplete': 'list' as const, 'aria-controls': mention.open ? mention.listId : undefined, 'aria-activedescendant': mention.activeId}}
             onChange={event => { edit(event.target.value); mention.track(event.currentTarget) }}
             onSelect={event => mention.track(event.currentTarget)} onBlur={mention.close}
@@ -418,18 +437,6 @@ export function Transcript({ base, session, view, origin, sourceMessage, trace, 
       }}>确认关闭</button></V2Dialog>}
     {attachment && anchored && <V2AttachmentDialog path={attachmentResource(base, {sessionId:session.id, messageId:attachment.message, traceId:attachment.traceId, attachment:attachment.ref})}
       reference={attachment.ref} context={session.title} close={() => setAttachment(undefined)}/>}
-    {revision && !archived && <MessageEditor base={path} sessionId={session.id} edit={revision} maxLength={64000} close={() => setRevision(undefined)}
-      saved={receipt => {
-        setRevision(undefined)
-        setAttachment(undefined)
-        if ((sourceMessage || trace) && currentTrace) currentTrace()
-        else {
-          following.current = true
-          setSavedMessage({id:receipt.messageId, traceId:receipt.traceId})
-          void paged.toLatest()
-        }
-        void changed()
-      }}/>}
   </section>
 }
 
