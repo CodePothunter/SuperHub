@@ -202,6 +202,30 @@ const allCases = [
       if (turn.roster.some(card => card.name === args(row).name)) return '全局名册里也出现了这位幕僚'
       if (createdTicket(turn) || turn.newRooms || turn.workOrders.length) return '额外建了工单或讨论'
     } },
+  { id: 'workspace-staff-executor', needs: ['workspace-create'], said: '给字节 Landing 加一个写落地页代码的工程师，用 Codex 执行', group: true,
+    expect: 'chief_staff create 带 workspace=字节 Landing 与 executor=codex，该区出现由 Codex 执行的专属幕僚',
+    judge: turn => {
+      const row = calls(turn, 'chief_staff', r => args(r).action === 'create' && succeeded(r)).at(-1)
+      if (!row) return '没有成功创建幕僚'
+      if (args(row).workspace !== '字节 Landing') return `没有把 workspace 填为字节 Landing（${args(row).workspace ?? '未填'}）`
+      if (args(row).executor !== 'codex') return `没有把 executor 填为 codex（${args(row).executor ?? '未填'}）`
+      const workspace = turn.workspaces.find(space => space.name === '字节 Landing')
+      if (!turn.staff.some(member => member.homeWorkspaceId === workspace?.id && member.name === args(row).name && member.executor === 'codex')) return '该工作区没有出现由 Codex 执行的专属幕僚'
+      if (turn.roster.some(card => card.name === args(row).name)) return '全局名册里也出现了这位幕僚'
+      if (createdTicket(turn) || turn.newRooms || turn.workOrders.length) return '额外建了工单或讨论'
+    } },
+  { id: 'workspace-staff-switch', needs: ['workspace-staff-local'], said: '把字节 Landing 里刚加的那位盯竞品的幕僚改成用 Claude Code 执行', group: true,
+    expect: 'chief_staff update 带 workspace=字节 Landing 与 executor=claude-code，原专属幕僚改为 Claude Code，不新建',
+    judge: turn => {
+      const row = calls(turn, 'chief_staff', r => args(r).action === 'update' && succeeded(r)).at(-1)
+      if (!row) return '没有成功修改幕僚'
+      if (calls(turn, 'chief_staff', r => args(r).action === 'create' && succeeded(r)).length) return '新建了幕僚而不是修改原来的'
+      if (args(row).workspace !== '字节 Landing') return `没有把 workspace 填为字节 Landing（${args(row).workspace ?? '未填'}）`
+      if (args(row).executor !== 'claude-code') return `没有把 executor 填为 claude-code（${args(row).executor ?? '未填'}）`
+      const workspace = turn.workspaces.find(space => space.name === '字节 Landing')
+      if (!turn.staff.some(member => member.homeWorkspaceId === workspace?.id && member.executor === 'claude-code')) return '该工作区没有由 Claude Code 执行的专属幕僚'
+      if (createdTicket(turn) || turn.newRooms || turn.workOrders.length) return '额外建了工单或讨论'
+    } },
   { id: 'workspace-calendar', said: '这天我有哪些安排？', group: true, calendar: true, expect: '核对当前所选日期的真实日程并说出会议名称',
     judge: turn => {
       if (turn.calendarDate !== calendarDay || turn.currentSurface) return '当前会话没有收到正确的日历日期'

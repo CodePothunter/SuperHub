@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { Staff } from '../core/model.ts'
-import type { StaffContext, StaffImpact, StaffMember, StaffMemory, StaffShare, StaffView } from '../core/workspace-staff.ts'
+import { isStaffMemberExecutor, type StaffContext, type StaffImpact, type StaffMember, type StaffMemory, type StaffShare, type StaffView } from '../core/workspace-staff.ts'
 import { EXPERIENCE_EVIDENCE_LIMIT, matchesExperiencePurpose, relevantExperience, type ExperienceDelivery, type ExperienceDeliveryTarget,
   type ExperienceEntry, type ExperienceEvidence, type ExperienceFeedback, type ExperienceMemory, type ExperienceQuery,
   type ExperienceMaintenance, type ExperienceRef, type ExperienceSelection, type ExperienceSupport } from '../core/workspace-experience.ts'
@@ -41,6 +41,35 @@ function field(value: unknown, label: string, max: number) {
 }
 function optional(value: unknown, label: string, max: number) {
   return value === undefined || value === '' ? undefined : field(value,label,max)
+}
+/**
+ * The run settings a create or edit carries: `undefined` for a field leaves it, `null` clears it. DSH is the default,
+ * so it is stored as no executor. A model is a catalog reference the route has already checked.
+ */
+function runSettings(body: Body) {
+  const given = (key: string) => body[key] !== undefined
+  if (given('executor') && body.executor !== null && body.executor !== '' && !isStaffMemberExecutor(body.executor)) {
+    return workspaceError(400,'执行器只能是 DSH、Codex 或 Claude Code')
+  }
+  const text = (key: string, label: string, max: number) => !given(key) ? undefined : body[key] === null || body[key] === '' ? null : field(body[key],label,max)
+  const model = text('model','模型',200)
+  if (model && !/^[^/\s]+\/\S+$/.test(model)) return workspaceError(400,'模型需要写成“厂商/模型”')
+  const effort = text('reasoningEffort','思考深度',80)
+  const executor = !given('executor') ? undefined : body.executor === 'dsh' || body.executor === null || body.executor === '' ? null : body.executor as 'codex' | 'claude-code'
+  return {executor, model, effort, given: ['executor','model','reasoningEffort'].some(given)}
+}
+function applyRunSettings(member: StaffMember, settings: ReturnType<typeof runSettings>) {
+  if (settings.executor === null) delete member.executor
+  else if (settings.executor) member.executor = settings.executor
+  if (settings.model === null) { delete member.model; delete member.reasoningEffort }
+  else if (settings.model) {
+    if (settings.model !== member.model) delete member.reasoningEffort
+    member.model = settings.model
+  }
+  if (settings.effort === null) delete member.reasoningEffort
+  else if (settings.effort) member.reasoningEffort = settings.effort
+  // A refusal here discards the whole change: `apply` saves only a completed change.
+  if (member.reasoningEffort && !member.model) workspaceError(400,'指定思考深度前请先选择模型')
 }
 function object(value: unknown): Body | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Body : undefined
@@ -529,10 +558,13 @@ export class WorkspaceStaffStore {
       if (body.uniqueName === true && workspaceId && activeMembers(db,workspaceId).some(m => m.homeWorkspaceId === workspaceId && m.name === name)) {
         return workspaceError(409,'本工作区已有专属幕僚「' + name + '」，未重复创建')
       }
+      const settings = runSettings(body)
       const role = {id:randomUUID(),name,brief}
       const roster = activeMembers(db,workspaceId).map(member => memberPortraits(member).portrait)
       const defaultPortrait = recommendStaffPortrait(role,roster,body.portraitShape ?? undefined)
-      db.members.push({...role,portrait,defaultPortrait,homeWorkspaceId:workspaceId,memberships:workspaceId ? [{workspaceId,duty:''}] : []})
+      const member: StaffMember = {...role,portrait,defaultPortrait,homeWorkspaceId:workspaceId,memberships:workspaceId ? [{workspaceId,duty:''}] : []}
+      applyRunSettings(member,settings)
+      db.members.push(member)
       return
     }
     const staff = memberIn(db,body.staffId,action==='join' ? undefined : workspaceId)
@@ -544,8 +576,13 @@ export class WorkspaceStaffStore {
     }
     if (action === 'edit') {
       if (staff.homeWorkspaceId !== workspaceId) return workspaceError(403,'请在这位幕僚的所属范围修改角色')
-      staff.name = field(body.name,'幕僚姓名',80)
-      staff.brief = field(body.brief,'职责',3000)
+      const settings = runSettings(body)
+      if (settings.given && this.roster().some(row => row.id === staff.id)) {
+        return workspaceError(409,'这位幕僚以全局角色卡为准，请在设置的幕僚卡里修改执行器和模型')
+      }
+      staff.name = body.name === undefined ? staff.name : field(body.name,'幕僚姓名',80)
+      staff.brief = body.brief === undefined ? staff.brief : field(body.brief,'职责',3000)
+      applyRunSettings(staff,settings)
       advance(db,staff.id)
       return
     }

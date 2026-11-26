@@ -9,7 +9,16 @@ export interface StaffMember {
   defaultPortrait?: SpeakerPortrait
   homeWorkspaceId?: string
   memberships: { workspaceId: string; duty: string }[]
+  /** How a member without a global role card runs in group chats. Absent: DSH with the liaison's model. */
+  executor?: StaffMemberExecutor
+  /** provider/model for a DSH member, checked against the DSH catalog. */
+  model?: string
+  reasoningEffort?: string
 }
+export const STAFF_MEMBER_EXECUTORS = ['dsh', 'codex', 'claude-code'] as const
+export type StaffMemberExecutor = typeof STAFF_MEMBER_EXECUTORS[number]
+export const isStaffMemberExecutor = (value: unknown): value is StaffMemberExecutor =>
+  STAFF_MEMBER_EXECUTORS.some(item => item === value)
 export interface StaffMemory extends Omit<ExperienceMemory, 'audience' | 'staffId' | 'status'> {
   audience?: 'staff'
   staffId: string

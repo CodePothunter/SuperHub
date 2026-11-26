@@ -27,7 +27,7 @@ import { inboxDispatchState, LIAISON_HISTORY_MAX, LIAISON_PROMPT, LiaisonChat, o
 import { chatAttachmentError, ChatAttachments } from './chat-attachments.ts'
 import { registerCodexApprovals, type CodexApprovalConfig } from './codex-approvals.ts'
 import { contextTokens, handoffText, hasRawConnectorHistory, liaisonGuard, LiaisonToolVisibility, mergeHistory, nextPartId, rotateLine, SteerCutter, type LiaisonToolStatus } from './liaison.ts'
-import { applySelection, contextWindow, liaisonSelection } from './models.ts'
+import { applySelection, canonicalSelection, contextWindow, liaisonSelection } from './models.ts'
 import { Worklines } from './worklines.ts'
 import { NativeRooms, roomTools } from './rooms.ts'
 import { executorOnly, staffForMember, teammateSelection, type ModelDefaults } from './staff-models.ts'
@@ -54,7 +54,7 @@ import { createV2DialogueSource } from './workspace-v2-dialogue.ts'
 import { executable } from './workspace-v2-coding.ts'
 import { DshMemberRunner } from './workspace-group-dsh-member.ts'
 import { CodingMemberRunner } from './workspace-group-coding-member.ts'
-import { groupRoster, LIAISON_MEMBER_ID } from './workspace-group-members.ts'
+import { groupRoster, LIAISON_MEMBER_ID, memberRunCard } from './workspace-group-members.ts'
 import { WorkspaceGroupHost } from './workspace-group-host.ts'
 import { GROUP_LEDGER_FILE, memberCompletionEvidenceId, readGroupLedger } from './workspace-group-ledger.ts'
 import { LIAISON_AUTHOR } from '../core/workspace-v2.ts'
@@ -875,7 +875,9 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
       },
       model(id) {
         const native = brain.staff().find(s=>s.id===id)
-        return native?.executor === 'dsh' ? teammateSelection(native,modelDefaults()) : modelDefaults().liaison
+        const member = native ? undefined : staffStore.view().members.find(row=>row.id===id)
+        const card = member ? memberRunCard(member) : native
+        return card?.executor === 'dsh' ? teammateSelection(card,modelDefaults()) ?? modelDefaults().liaison : modelDefaults().liaison
       },
     } })
     releases.push(() => dialogue.dispose())
@@ -897,7 +899,7 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
       roster: workspaceId => groupRoster({ workspaceId, staff: staffStore.view(workspaceId).members, native: brain.staff(), defaults: modelDefaults(),
         context: id => staffStore.context(workspaceId, id), liaisonName: LIAISON_AUTHOR }) })
     releases.push(() => groupHost.dispose())
-    const v2Routes = workspaceV2Routes({ staff:staffStore, store: workspaceStore, source: dialogue, timeZone, approvals: gate, groups: groupHost, inputAttachments, learning, learningProblem,
+    const v2Routes = workspaceV2Routes({ staff:staffStore, store: workspaceStore, canonicalModel: (wanted, saved) => canonicalSelection(ctx.get('llm'), wanted, saved), source: dialogue, timeZone, approvals: gate, groups: groupHost, inputAttachments, learning, learningProblem,
       coordinate: llmEngagementCoordinator(() => ctx.get('llm'), liaisonModel),
       // The liaison reviews new results with its own model, and reminds the owner when an order still falls short.
       review: llmAcceptanceReviewer(() => ctx.get('llm'), liaisonModel),

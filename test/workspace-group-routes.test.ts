@@ -1408,3 +1408,39 @@ describe('分页不隐藏等主人选择的消息', () => {
     expect((await f.call<Paged>(path + '?limit=40')).data.pinned).toBeUndefined()
   })
 })
+
+describe('专属幕僚的执行器与模型', () => {
+  it('专属幕僚按自己的执行器进群：Codex 走编程工具，改回 DSH 后换新会话并用指定模型；全局角色卡的幕僚不接受专属设置', async () => {
+    const f = fixture()
+    const ws = await f.workspace(), session = await f.group(ws)
+    const staffCall = (body: Record<string, unknown>) => f.call<StaffView>('/' + ws.id + '/staff', {requestId: f.id(), ...body})
+    const created = await staffCall({action: 'create', name: '六爻卦师', brief: '依据六爻引擎排盘并解卦。', executor: 'codex'})
+    expect(created.status).toBe(200)
+    const member = created.data.members.find(row => row.name === '六爻卦师')!
+    expect(member).toMatchObject({executor: 'codex', homeWorkspaceId: ws.id})
+    await f.say(session, '@六爻卦师 起一卦')
+    await vi.waitFor(() => expect(f.codex.count(member.id)).toBe(1))
+    expect(f.codex.last(member.id).call.member).toMatchObject({kind: 'codex'})
+    f.codex.answer(member.id, '已起卦。', false)
+
+    const edited = await staffCall({action: 'edit', staffId: member.id, executor: 'dsh', model: 'openai-codex/gpt-6.1-sol', reasoningEffort: 'high'})
+    expect(edited.status).toBe(200)
+    const saved = edited.data.members.find(row => row.id === member.id)!
+    expect(saved).toMatchObject({model: 'openai-codex/gpt-6.1-sol', reasoningEffort: 'high', name: '六爻卦师', brief: '依据六爻引擎排盘并解卦。'})
+    expect(saved).not.toHaveProperty('executor')
+    await f.say(session, '@六爻卦师 再起一卦')
+    await vi.waitFor(() => expect(f.dsh.count(member.id)).toBe(1))
+    expect(f.dsh.last(member.id).call.member).toMatchObject({kind: 'dsh', model: {provider: 'openai-codex', model: 'gpt-6.1-sol', reasoningEffort: 'high'}})
+    expect(f.codex.count(member.id)).toBe(1)
+
+    // Clearing the model clears its effort; a malformed value or another executor is refused without a change.
+    expect((await staffCall({action: 'edit', staffId: member.id, executor: 'remote'})).status).toBe(400)
+    expect((await staffCall({action: 'edit', staffId: member.id, model: 'gpt-6.1-sol'})).status).toBe(400)
+    const cleared = await staffCall({action: 'edit', staffId: member.id, model: ''})
+    expect(cleared.data.members.find(row => row.id === member.id)).not.toHaveProperty('reasoningEffort')
+    expect((await staffCall({action: 'edit', staffId: member.id, reasoningEffort: 'high'})).status).toBe(400)
+
+    const global = await f.call<{error: string}>('/staff', {requestId: f.id(), action: 'edit', staffId: 'engineer', executor: 'dsh'}, true)
+    expect(global).toMatchObject({status: 409, data: {error: expect.stringContaining('以全局角色卡为准')}})
+  })
+})

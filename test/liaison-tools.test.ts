@@ -48,7 +48,7 @@ const settings: Settings = { timeZone: 'Asia/Shanghai', concurrency: 2, mobile: 
 /** 周三上午 10 点（上海）：定时安排的回执按这个时刻算下一次。 */
 const SCHEDULE_NOW = new Date('2026-11-25T02:00:00Z')
 
-function host(options: { groups?: boolean; push?: boolean } = {}) {
+function host(options: { groups?: boolean; push?: boolean; llm?: unknown } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'chief-liaison-tools-'))
   cleanup.push(() => rmSync(directory, { recursive: true, force: true }))
   const root = join(directory, 'brain')
@@ -89,7 +89,7 @@ function host(options: { groups?: boolean; push?: boolean } = {}) {
   const registered = new Map<string, Definition>()
   const admissions = new Map<string, NonNullable<Parameters<Tools['register']>[1]>>()
   const ctx = {
-    get: (name: string) => name === 'agentTeams' ? teams : name === 'sessionQuery' ? sessionQuery : undefined,
+    get: (name: string) => name === 'agentTeams' ? teams : name === 'sessionQuery' ? sessionQuery : name === 'llm' ? options.llm : undefined,
     workspaceRegistry: { create: async () => ({ id: 'workspace' }) },
     sessionController: {
       resolveAgent: async (id: string) => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } },
@@ -1106,16 +1106,16 @@ describe('已归档的工作区与接口人', () => {
     await expect(f.call('chief_staff', card, f.liaison(f.ownerTurn('加一个盯竞品的幕僚', 'staff-unnamed')))).rejects.toThrow('主人原话里没有工作区「字节 Landing」')
     await expect(f.call('chief_staff', {...card, workspace: '不存在的项目'}, f.liaison(f.ownerTurn('给不存在的项目加个人', 'staff-missing')))).rejects.toThrow('没有名为「不存在的项目」的工作区')
     await expect(f.call('chief_staff', {...card, workspace: '旧项目'}, f.liaison(f.ownerTurn('给旧项目加一个盯竞品的幕僚', 'staff-closed')))).rejects.toThrow('「旧项目」已归档，请先在工作区页恢复')
-    for (const extra of [{executor: 'codex'}, {verifier: 'reviewer'}, {model: 'zhipu/glm-5.3'}, {reasoning_effort: 'high'}]) {
-      await expect(f.call('chief_staff', {...card, ...extra}, auth)).rejects.toThrow('专属幕僚使用默认执行器，需要指定执行器或模型请建全局幕僚')
-    }
+    await expect(f.call('chief_staff', {...card, verifier: 'reviewer'}, auth)).rejects.toThrow('专属幕僚由接口人在群里验收，不设 verifier')
+    await expect(f.call('chief_staff', {...card, executor: 'remote'}, auth)).rejects.toThrow('专属幕僚的 executor 只能是 dsh、codex 或 claude-code')
+    await expect(f.call('chief_staff', {...card, model: 'zhipu/glm-5.3'}, auth)).rejects.toThrow('没有模型目录')
     await expect(f.call('chief_staff', {...card, brief: '太短'}, auth)).rejects.toThrow('角色卡太短')
-    await expect(f.call('chief_staff', {...card, action: 'update', id: 'researcher'}, auth)).rejects.toThrow('workspace 只用于 create')
+    await expect(f.call('chief_staff', {...card, action: 'retire', id: 'researcher'}, auth)).rejects.toThrow('workspace 只用于 create 和 update')
     expect(local()).toEqual([])
     expect(f.staffStore.view(closed.id).members).toEqual([])
 
     const created = plain(await f.call('chief_staff', {...card, portrait_shape: 'lighthouse', id: 'ignored-id'}, auth))
-    expect(created).toMatchObject({workspace: {id: space.id, name: '字节 Landing'}, staff: {name: '竞品观察员'}, message: '已在「字节 Landing」加入专属幕僚「竞品观察员」。下一张工单起生效。'})
+    expect(created).toMatchObject({workspace: {id: space.id, name: '字节 Landing'}, staff: {name: '竞品观察员', executor: 'dsh'}, message: '已在「字节 Landing」加入专属幕僚「竞品观察员」，由 DSH 执行。下一张工单起生效。'})
     expect(local()).toEqual([expect.objectContaining({name: '竞品观察员', brief: card.brief, defaultPortrait: expect.objectContaining({shape: 'lighthouse'}),
       memberships: [{workspaceId: space.id, duty: ''}]})])
     expect(refresh).toHaveBeenCalledWith(space.id)
@@ -1129,9 +1129,53 @@ describe('已归档的工作区与接口人', () => {
     const earlier = f.ownerTurn('给字节 Landing 加个做访谈的幕僚', 'staff-ask'), end = {type: 'turn/end', seq: 3, time: 3, data: {}}
     const confirmed = await f.call('chief_staff', {...card, name: '访谈员', brief: '安排并主持用户访谈，整理成访谈纪要与关键发现。'},
       f.liaison([...earlier, end, ...f.ownerTurn('好，就这样', 'staff-confirm')]))
-    expect(confirmed).toMatchObject({message: '已在「字节 Landing」加入专属幕僚「访谈员」。下一张工单起生效。'})
+    expect(confirmed).toMatchObject({message: '已在「字节 Landing」加入专属幕僚「访谈员」，由 DSH 执行。下一张工单起生效。'})
     expect(local().map(m => m.name)).toEqual(['竞品观察员', '访谈员'])
     expect(f.staffStore.view(closed.id).members).toEqual([])
+  })
+
+  it('chief_staff 带 workspace 给专属幕僚指定执行器与模型：create 照填、update 只改点名的项，全局幕僚与未点名都被拒', async () => {
+    const llm = {
+      listProviders: () => [{id: 'openai-codex', name: 'OpenAI Codex'}],
+      listModels: async () => [{id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol'}],
+      resolveModelInfo: async () => ({reasoning: {efforts: [{id: 'medium', name: 'Medium'}, {id: 'high', name: 'High'}]}}),
+    }
+    const f = host({groups: true, llm})
+    const space = archived(f, '命运')
+    const local = () => f.staffStore.view(space.id).members.filter(m => m.homeWorkspaceId === space.id)
+    const brief = '依据六爻解卦原则解读卦象，先调用六爻引擎排盘，再区分盘面与解读。'
+    const created = plain(await f.call('chief_staff', {action: 'create', workspace: '命运', name: '六爻卦师', brief, model: 'gpt-6.1-sol', reasoning_effort: 'High'},
+      f.liaison(f.ownerTurn('在命运里创建一个幕僚叫六爻卦师，模型设置为 gpt 6.1 sol high', 'liuyao-create'))))
+    expect(created).toMatchObject({staff: {name: '六爻卦师', executor: 'dsh', model: 'openai-codex/gpt-6.1-sol', reasoningEffort: 'high',
+      effectiveModel: 'openai-codex/gpt-6.1-sol', effectiveReasoningEffort: 'high', modelSource: '专属幕僚配置'}})
+    await expect(f.call('chief_staff', {action: 'create', workspace: '命运', name: '工程师', brief: '编写合适的程序，读懂现有代码后再动手，跑通测试再交付。', reasoning_effort: 'ultra', model: 'gpt-6.1-sol'},
+      f.liaison(f.ownerTurn('给命运加个工程师', 'engineer-bad')))).rejects.toThrow('没有思考深度 ultra')
+    plain(await f.call('chief_staff', {action: 'create', workspace: '命运', name: '工程师', brief: '编写合适的程序，读懂现有代码后再动手，跑通测试再交付。'},
+      f.liaison(f.ownerTurn('给命运加个工程师', 'engineer-create'))))
+    expect(local().find(m => m.name === '工程师')).not.toHaveProperty('executor')
+
+    const toCodex = f.liaison(f.ownerTurn('把命运工作区的工程师改成 Codex', 'engineer-codex'))
+    await expect(f.call('chief_staff', {action: 'update', workspace: '命运', name: '工程师'}, toCodex)).rejects.toThrow('update 需要至少一项要改的内容')
+    await expect(f.call('chief_staff', {action: 'update', workspace: '命运', name: '不存在'}, toCodex)).rejects.toThrow('「命运」里没有幕僚「不存在」。本区现有：六爻卦师、工程师')
+    await expect(f.call('chief_staff', {action: 'update', workspace: '命运', name: '工程师', executor: 'codex'},
+      f.liaison(f.ownerTurn('把工程师改成 Codex', 'engineer-unnamed')))).rejects.toThrow('主人原话里没有工作区「命运」')
+    const updated = plain(await f.call('chief_staff', {action: 'update', workspace: '命运', name: '工程师', executor: 'codex'}, toCodex))
+    expect(updated).toMatchObject({staff: {name: '工程师', executor: 'codex', modelSource: 'Codex 配置'}, message: '已更新「命运」的专属幕僚「工程师」，由 Codex 执行。下次在群里叫它时生效。'})
+    expect(await f.call('chief_staff', {action: 'update', workspace: '命运', name: '工程师', executor: 'codex'}, toCodex)).toEqual(updated)
+    expect(local().find(m => m.name === '工程师')).toMatchObject({executor: 'codex', brief: '编写合适的程序，读懂现有代码后再动手，跑通测试再交付。'})
+    // Only the named field changes: the brief stays, the model of 六爻卦师 keeps its effort.
+    plain(await f.call('chief_staff', {action: 'update', workspace: '命运', name: '六爻卦师', executor: 'dsh'},
+      f.liaison(f.ownerTurn('命运的六爻卦师继续用 DSH', 'liuyao-dsh'))))
+    expect(local().find(m => m.name === '六爻卦师')).toMatchObject({model: 'openai-codex/gpt-6.1-sol', reasoningEffort: 'high', brief})
+    expect(local().find(m => m.name === '六爻卦师')).not.toHaveProperty('executor')
+
+    f.staffStore.apply(space.id, {action: 'join', staffId: 'researcher', duty: '', requestId: 'join-researcher'})
+    await expect(f.call('chief_staff', {action: 'update', workspace: '命运', name: 'researcher', executor: 'codex'},
+      f.liaison(f.ownerTurn('把命运里的 researcher 改成 Codex', 'researcher-codex')))).rejects.toThrow('是全局幕僚，以全局角色卡为准')
+    await f.intake.submit({scope, text: '看看这里有哪些幕僚', requestId: 'list-staff', context: {surface: 'workspace', selectedId: space.id}}, {channel: 'chat'})
+    const listed = plain(await f.call('chief_workspace', {action: 'list_staff'}, f.liaison(f.ownerTurn('看看这里有哪些幕僚', 'list-staff')))) as {members: {name: string}[]}
+    expect(listed.members).toEqual(expect.arrayContaining([expect.objectContaining({name: '工程师', executor: 'codex'}),
+      expect.objectContaining({name: '六爻卦师', executor: 'dsh', effectiveModel: 'openai-codex/gpt-6.1-sol'})]))
   })
 })
 
