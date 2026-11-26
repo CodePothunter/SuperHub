@@ -125,6 +125,11 @@ export interface WorkspaceExperiencePort {
   selectExperience(query: ExperienceQuery): ExperienceSelection
   assertExperienceCurrent(selection: ExperienceSelection): void
   recordExperienceDelivery(selection: ExperienceSelection, target: ExperienceDeliveryTarget, entries?: readonly ExperienceEntry[]): void
+  /**
+   * The member's own staff versions currently valid in this workspace (local and global), excluding shares from other
+   * workspaces, purpose-bound delegations and retired or superseded versions. The liaison may read results built on them.
+   */
+  staffOwnExperience?(workspaceId: string, staffId: string): ExperienceRef[]
 }
 
 export const EXPERIENCE_EVIDENCE_LIMIT = 8

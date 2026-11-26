@@ -202,6 +202,7 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
         behavior: confirmedWorkBehavior({me: brainDocument('me.md'), agents: brainDocument('AGENTS.md')})}),
       assertExperienceCurrent: selection => staffStore.assertExperienceCurrent(selection),
       recordExperienceDelivery: (selection, target, entries) => staffStore.recordExperienceDelivery(selection, target, entries),
+      staffOwnExperience: (workspaceId, staffId) => staffStore.staffOwnExperience(workspaceId, staffId),
     }
     const nativeExperience = new NativeExperience(experience, learningProblem)
     releases.push(() => workspaceStore.dispose())

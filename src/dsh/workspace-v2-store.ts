@@ -1100,6 +1100,16 @@ export class WorkspaceV2Store {
     })
   }
 
+  /** The latest owner message that answered an item of this order generation, as its ledger sequence. */
+  lastOwnerAnswerSeq(orderId: string, generation: number): number | undefined {
+    this.current()
+    const seqs = Object.values(this.board.ownerActions ?? {}).flatMap(row => {
+      const seq = row.resolved && row.orderId === orderId && row.generation === generation ? /^g-(\d+)$/.exec(row.answerMessageId ?? '')?.[1] : undefined
+      return seq ? [Number(seq)] : []
+    })
+    return seqs.length ? Math.max(...seqs) : undefined
+  }
+
   engagementCheckpoints(orderId: string, generation: number) {
     this.current()
     const prefix = 'checkpoint:' + generation + ':'

@@ -101,8 +101,9 @@ describe('组装成员可见的经验和群历史', () => {
     restricted.sink.finished(restricted.call.callId,{text:'专属资料摘录及其结论',toolCalls:0,status:'completed'})
     expect(t.engine.ledger.all().find(line=>line.text==='专属资料摘录及其结论')?.experienceRefs)
       .toEqual(expect.arrayContaining(local.map(({id,version})=>({id,version}))))
+    // The liaison reads a member's result built on that member's own staff experience; other members stay isolated.
     expect(t.engine.projectLiaisonHistory(t.engine.ledger.all(),t.engine.ledger.lastSeq,'w').map(line=>line.text))
-      .not.toContain('专属资料摘录及其结论')
+      .toContain('专属资料摘录及其结论')
 
     t.engine.ownerSay('@新成员 检查缓存路径', {workOrderId:'w'})
     const first = t.dsh.last(teammate.id)
@@ -120,6 +121,91 @@ describe('组装成员可见的经验和群历史', () => {
     expect(current.recap?.()).toContain('可传递的普通团队回报')
     expect(current.recap?.()).not.toContain('共享经验衍生成果')
     expect(current.recap?.()).not.toContain('专属资料摘录及其结论')
+    // The shared version is retired: neither result is readable to the liaison any more, each stays as a host note.
+    const gaps = reopened.engine.projectLiaisonGaps(reopened.engine.ledger.all(),reopened.engine.ledger.lastSeq,'w')
+    expect(gaps.lines.map(line=>line.text)).not.toContain('专属资料摘录及其结论')
+    expect(gaps.lines.map(line=>line.text)).not.toContain('共享经验衍生成果')
+    expect(gaps.gaps).toEqual([expect.objectContaining({author:'研究员',reason:'retired'}),expect.objectContaining({author:'新成员',reason:'retired'})])
+  })
+
+  it('接口人读成员本人专属成果并派活给他人，派活不带专属标记；停用、改版和他区共享的成果换成宿主说明', async () => {
+    const dir = temp()
+    const native = [{id:'bazi',name:'八字',brief:'八字命理',executor:'dsh' as const},{id:'ziwei',name:'紫微',brief:'紫微斗数',executor:'dsh' as const}]
+    const store = new WorkspaceStaffStore(dir,'brain',()=>native,()=>{})
+    for (const ws of ['w1','w2']) for (const {id} of native) store.apply(ws,{action:'join',staffId:id,duty:'命理',requestId:ws+id})
+    store.apply('w1',{action:'learn',staffId:'bazi',text:'命理分析先列结论再列依据',requestId:'own'})
+    const [own] = store.experienceMemories('w1').filter(row=>row.staffId==='bazi')
+    expect(store.staffOwnExperience('w1','bazi')).toEqual([{id:own!.id,version:own!.version}])
+    expect(store.staffOwnExperience('w1','ziwei')).toEqual([])
+    const roster: GroupRosterMember[] = [ROSTER[0]!,{id:'bazi',name:'八字',kind:'dsh'},{id:'ziwei',name:'紫微',kind:'dsh'}]
+    const t = setup({dir,roster,experience:store})
+    await t.engine.start()
+    t.engine.ownerSay('@八字 做命理分析', {workOrderId:'w'})
+    const bazi = t.dsh.last('bazi')
+    expect(bazi.call.experience?.entries.map(row=>row.id)).toEqual([own!.id])
+    bazi.sink.finished(bazi.call.callId,{text:'八字结论：宜十二月入职',toolCalls:0,status:'completed'})
+    const result = t.engine.ledger.all().find(line=>line.text==='八字结论：宜十二月入职')!
+    expect(result.experienceRefs).toEqual([{id:own!.id,version:own!.version}])
+    const all = () => t.engine.ledger.all()
+    expect(t.engine.projectLiaisonHistory(all(),t.engine.ledger.lastSeq,'w')).toContainEqual(result)
+    expect(t.engine.canUseLiaisonExperience(result.experienceRefs!,t.engine.ledger.lastSeq,'w')).toBe(true)
+    expect(t.engine.liaisonExperienceRefs(all(),t.engine.ledger.lastSeq,'w')).toEqual([])
+
+    // The liaison's own turn reads the result; its hand-over to another member carries no member-private version.
+    t.engine.ownerSay('请汇总命理结果', {workOrderId:'w'})
+    const liaison = t.dsh.last('liaison')
+    expect(liaison.call.prompt).toContain('八字结论：宜十二月入职')
+    liaison.sink.finished(liaison.call.callId,{text:'先请紫微补充',toolCalls:0,status:'completed'})
+    const refs = t.engine.liaisonExperienceRefs(all(),t.engine.ledger.lastSeq,'w')
+    const handoff = t.engine.dispatchEngagement('handoff-1',['ziwei'],'紫微参考八字的结论补充分析','w',{experienceRefs:refs})
+    expect(handoff.experienceRefs).toEqual([])
+    const ziwei = t.dsh.last('ziwei').call
+    expect(ziwei.prompt).toContain('紫微参考八字的结论补充分析')
+    expect(ziwei.prompt).not.toContain('八字结论：宜十二月入职')
+    t.dsh.last('ziwei').sink.finished(ziwei.callId,{text:'紫微结论：同意',toolCalls:0,status:'completed'})
+
+    // A share from another workspace to the member is not the member's own: the liaison gets a host note.
+    store.apply('w2',{action:'learn',staffId:'bazi',text:'吠陀旁证核对',requestId:'other'})
+    const [source] = store.experienceMemories('w2').filter(row=>row.staffId==='bazi')
+    store.apply('w2',{action:'share',staffId:'bazi',memoryId:source!.id,sourceVersion:source!.version,targetWorkspaceId:'w1',
+      targetAudience:'staff',targetStaffId:'bazi',text:'吠陀旁证核对',requestId:'grant'})
+    // A private version derived from that share is not the member's own either.
+    const grant = store.selectExperience({workspaceId:'w1',staffId:'bazi',task:''}).authorized.find(ref=>ref.id!==own!.id)!
+    store.apply('w1',{action:'learn',staffId:'bazi',text:'吠陀旁证的本区整理',dependencies:[grant],requestId:'derived'})
+    const derived = store.experienceMemories('w1').find(row=>row.text==='吠陀旁证的本区整理')!
+    expect(store.selectExperience({workspaceId:'w1',staffId:'bazi',task:''}).authorized).toContainEqual({id:derived.id,version:derived.version})
+    expect(store.staffOwnExperience('w1','bazi')).toEqual([{id:own!.id,version:own!.version}])
+    store.apply('w1',{action:'retire',staffId:'bazi',memoryId:derived.id,version:derived.version,requestId:'derived-off'})
+    t.engine.ownerSay('@八字 用吠陀旁证核对', {workOrderId:'w'})
+    const shared = t.dsh.last('bazi')
+    expect(shared.call.experience?.entries.some(row=>row.shareId)).toBe(true)
+    shared.sink.finished(shared.call.callId,{text:'吠陀旁证：一致',toolCalls:0,status:'completed'})
+    const sharedLine = all().find(line=>line.text==='吠陀旁证：一致')!
+    let view = t.engine.projectLiaisonGaps(all(),t.engine.ledger.lastSeq,'w')
+    expect(view.lines.map(line=>line.text)).toContain('八字结论：宜十二月入职')
+    expect(view.lines.map(line=>line.text)).not.toContain('吠陀旁证：一致')
+    expect(view.gaps).toEqual([{seq:sharedLine.seq,speakerId:'bazi',author:'八字',reason:'shared'}])
+    const note = view.lines.find(line=>line.seq===sharedLine.seq)!
+    expect(note).toMatchObject({speakerId:'bazi',author:'八字',workOrderId:'w'})
+    expect(note.experienceRefs).toBeUndefined()
+    expect(note.text).toContain('他区共享或临时转交')
+    expect(note.text).toContain('不要向主人索要授权')
+    expect(note.text).not.toContain('未获准读取')
+
+    // Revising the member's own version: the old result is no longer readable; the next liaison turn shows the note.
+    store.apply('w1',{action:'revise',staffId:'bazi',memoryId:own!.id,version:own!.version,text:'命理分析先列依据再列结论',requestId:'revise'})
+    view = t.engine.projectLiaisonGaps(all(),t.engine.ledger.lastSeq,'w')
+    expect(view.lines.map(line=>line.text)).not.toContain('八字结论：宜十二月入职')
+    expect(view.gaps.map(gap=>[gap.seq,gap.reason])).toEqual([[result.seq,'retired'],[sharedLine.seq,'shared']])
+    expect(view.lines.find(line=>line.seq===result.seq)?.text).toContain('八字在这里交回了结果，但它依据的经验已停用或已更新')
+    expect(t.engine.canUseLiaisonExperience(result.experienceRefs!,t.engine.ledger.lastSeq,'w')).toBe(false)
+    const calls = t.dsh.count('liaison')
+    t.engine.ownerSay('再汇总一次命理结果', {workOrderId:'w'})
+    expect(t.dsh.count('liaison')).toBe(calls + 1)
+    const recap = t.dsh.last('liaison').call.recap?.() ?? ''
+    expect(recap).not.toContain('八字结论：宜十二月入职')
+    expect(recap).toContain('（宿主说明）八字在这里交回了结果')
+    expect(recap).toContain('紫微结论：同意')
   })
 
   it('使用主人来源判断共享用途，成员交接文本不能代替授权', async () => {

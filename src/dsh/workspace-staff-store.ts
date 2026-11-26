@@ -994,6 +994,15 @@ export class WorkspaceStaffStore {
       authorized:entries.map(({id,version})=>({id,version})),scope:this.scope,authority}
   }
 
+  staffOwnExperience(workspaceId: string, staffId: string): ExperienceRef[] {
+    const db = this.read()
+    if (!activeMembers(db,workspaceId).some(member=>member.id===staffId)) return []
+    // A version derived from a share the liaison could not use itself (e.g. one granted to this member alone) is not the member's own.
+    return this.authorizedExperience(db,{workspaceId,staffId,task:''})
+      .filter(entry=>entry.staffId===staffId && !entry.shareId && entry.purpose===undefined
+        && this.permitsDependencyUse(db,entry,{workspaceId,task:''})).map(({id,version})=>({id,version}))
+  }
+
   assertExperienceCurrent(selection: ExperienceSelection) {
     if (selection.scope!==this.scope) return workspaceError(409,'经验归属已经变化')
     const current = this.selectExperience(selection.query)

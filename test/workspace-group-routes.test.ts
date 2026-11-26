@@ -24,7 +24,7 @@ import { workspaceV2Routes, type GroupMessage, type GroupMemberState, type Group
 import { appendCommandLog } from '../src/dsh/workspace-command-log.ts'
 import { WorkspaceV2Store } from '../src/dsh/workspace-v2-store.ts'
 import type { OrderResultNotice, ResultNoticeList } from '../src/core/workspace-notices.ts'
-import type { EngagementCoordinator, EngagementDecision, OwnerAction } from '../src/core/workspace-engagement.ts'
+import type { EngagementCoordinator, EngagementDecision, EngagementInput, OwnerAction } from '../src/core/workspace-engagement.ts'
 import type { ExperienceEvidence } from '../src/core/workspace-experience.ts'
 import { createExperienceLearning, type ExperienceLearning } from '../src/dsh/workspace-experience-learning.ts'
 import type { Llm } from '../src/dsh/ports.ts'
@@ -361,6 +361,98 @@ describe('工作交接', () => {
     f.restart()
     expect(await notices()).toHaveLength(reporting === 'final' ? 1 : expected)
     expect(f.codex.count('engineer')).toBe(expected)
+  })
+
+  it('接口人读得到成员用本人专属经验写的成果并汇总附件，派活不带成员专属标记', async () => {
+    const inputs: EngagementInput[] = []
+    const f = fixture({turnLimit: 20, coordinate: async input => {
+      inputs.push(structuredClone(input))
+      if (input.turn === 'liaison' && input.source.text === '请工程师先分析') return {kind: 'continue', text: '工程师先做命理分析', memberIds: ['engineer']}
+      if (input.turn === 'member' && input.source.text.startsWith('工程师结论')) {
+        return {kind: 'continue', text: '研究员参考工程师结论补充命理分析', memberIds: ['researcher']}
+      }
+      if (input.turn === 'member' && input.source.text.startsWith('研究员结论')) return {kind: 'deliver', text: '命理汇总：宜十二月入职。', final: true}
+      return {kind: 'none'}
+    }})
+    const ws = await f.workspace(), session = await f.group(ws)
+    for (const [staffId, text] of [['engineer', '命理分析先列结论再列依据'], ['researcher', '命理分析注明出处']]) {
+      f.staff().apply(ws.id, {action: 'learn', staffId, text, requestId: f.id()})
+    }
+    const own = (staffId: string) => f.staff().experienceMemories(ws.id).filter(row => row.staffId === staffId).map(({id, version}) => ({id, version}))
+    f.route().assign('assign-fate', '请几位做命理分析，最后由接口人汇总。', undefined, ws.id, session.id, {title: '命理分析', promise: '命理分析汇总'})
+    await waitFor(() => expect(f.dsh.count('liaison')).toBe(1))
+    f.dsh.answer('liaison', '请工程师先分析', false)
+    await waitFor(() => expect(f.codex.count('engineer')).toBe(1))
+    expect(f.codex.last('engineer').call.experience?.entries.map(({id, version}) => ({id, version}))).toEqual(own('engineer'))
+    writeFileSync(join(f.host().workDir(session), '命盘.md'), '# 命盘\n\n十二月入职。\n')
+    const result = '工程师结论：宜十二月入职。[命盘](命盘.md)'
+    f.codex.answer('engineer', result, false)
+    await waitFor(() => expect(f.dsh.count('researcher')).toBe(1))
+    const ledger = () => f.host().loaded(session.id)!.ledger.all()
+    expect(ledger().find(line => line.text === result)?.experienceRefs).toEqual(own('engineer'))
+    const read = inputs.find(input => input.turn === 'member' && input.source.text.startsWith('工程师结论'))!
+    expect(read.source).toMatchObject({text: result, author: '工程师', attachments: [expect.objectContaining({label: '命盘'})]})
+    expect(JSON.stringify(read)).not.toMatch(/未获准读取|宿主说明/)
+    // The hand-over carries only the liaison's own versions: the researcher sees it, not the engineer's private result.
+    const handoff = ledger().find(line => line.text === '研究员参考工程师结论补充命理分析')!
+    expect(handoff.experienceRefs).toEqual([])
+    const researcher = f.dsh.last('researcher').call
+    expect(researcher.prompt).toContain('研究员参考工程师结论补充命理分析')
+    expect(researcher.prompt).not.toContain('工程师结论：宜十二月入职')
+    f.dsh.answer('researcher', '研究员结论：同意，出处见命盘。', false)
+    const notices = async () => (await f.call<ResultNoticeList>('/notices', undefined, true)).data.items
+    await waitFor(async () => expect(await notices()).toHaveLength(1))
+    const [notice] = await notices()
+    expect(notice!.attachments.map(file => file.label)).toEqual(['命盘'])
+    const report = ledger().find(line => line.text.startsWith('命理汇总'))!
+    expect(report.text).toContain('工程师')
+    expect(report.experienceRefs).toEqual([])
+  })
+
+  it('读不到的成员成果显示为宿主说明，主人答复后接口人再问同一障碍不再新建待回应', async () => {
+    const inputs: EngagementInput[] = []
+    const question = '请主人授权接口人读取工程师的经验来源'
+    const f = fixture({turnLimit: 20, coordinate: async input => {
+      inputs.push(structuredClone(input))
+      if (input.turn === 'liaison' && input.source.text === '请工程师先分析') return {kind: 'continue', text: '工程师先做命理分析', memberIds: ['engineer']}
+      if (input.turn === 'member' && input.source.speakerId === 'engineer') return {kind: 'ask', text: question}
+      if (input.turn === 'liaison' && input.source.text === '还需要授权') return {kind: 'ask', text: question + '（再次）'}
+      return {kind: 'none'}
+    }})
+    const ws = await f.workspace(), other = await f.workspace(), session = await f.group(ws)
+    // The engineer works from a share another workspace gave it: not its own staff experience here.
+    f.staff().apply(other.id, {action: 'learn', staffId: 'engineer', text: '命理分析先列结论再列依据', requestId: f.id()})
+    const [source] = f.staff().experienceMemories(other.id).filter(row => row.staffId === 'engineer')
+    f.staff().apply(other.id, {action: 'share', staffId: 'engineer', memoryId: source!.id, sourceVersion: source!.version, targetWorkspaceId: ws.id,
+      targetAudience: 'staff', targetStaffId: 'engineer', text: '命理分析先列结论再列依据', requestId: f.id()})
+    const pending = async () => (await f.call<{items: OwnerAction[]}>('/owner-actions', undefined, true)).data.items
+    f.route().assign('assign-fate-gap', '请几位做命理分析，最后由接口人汇总。', undefined, ws.id, session.id, {title: '命理分析', promise: '命理分析汇总'})
+    await waitFor(() => expect(f.dsh.count('liaison')).toBe(1))
+    f.dsh.answer('liaison', '请工程师先分析', false)
+    await waitFor(() => expect(f.codex.count('engineer')).toBe(1))
+    expect(f.codex.last('engineer').call.experience?.entries.some(row => row.shareId)).toBe(true)
+    f.codex.answer('engineer', '工程师结论：宜十二月入职。', false)
+    await waitFor(async () => expect(await pending()).toHaveLength(1))
+    const read = inputs.find(input => input.turn === 'member' && input.source.speakerId === 'engineer')!
+    expect(read.source.text).toContain('（宿主说明）工程师在这里交回了结果，但它依据的是他区共享或临时转交的经验')
+    expect(read.source.text).not.toContain('工程师结论')
+    expect(JSON.stringify(read)).not.toContain('未获准读取')
+    // The first ask stands; the owner answers it once.
+    const [action] = await pending()
+    expect((await f.call('/owner-actions/' + action!.id + '/reply', {requestId: f.id(), text: '全部授权'}, true)).status).toBe(200)
+    await waitFor(() => expect(f.dsh.count('liaison')).toBe(2))
+    const liaison = f.dsh.last('liaison').call
+    expect(liaison.prompt).toContain('全部授权')
+    expect(liaison.recap?.(false)).toContain('（宿主说明）工程师在这里交回了结果')
+    expect(liaison.recap?.(false)).not.toContain('工程师结论')
+    // Asking again about the same obstacle: no new owner item, one host note listing the gap instead.
+    f.dsh.answer('liaison', '还需要授权', false)
+    const note = async () => (await f.view(session)).data.messages.find(row => row.text.startsWith('（宿主说明）以下成员交回的结果'))
+    await waitFor(async () => expect(await note()).toBeDefined())
+    expect((await note())!.text).toContain('工程师（群消息 #')
+    expect((await note())!.text).toContain('他区共享或临时转交')
+    expect(await pending()).toEqual([])
+    expect((await f.view(session)).data.messages.map(row => row.text)).not.toContain(question + '（再次）')
   })
 
   it('并行工作中的一个分支等待主人时，另一分支继续并保留其交付证据', async () => {
