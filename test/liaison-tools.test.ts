@@ -23,7 +23,7 @@ import { inTurnOwnerMessages, NativeRooms, roomTools } from '../src/dsh/rooms.ts
 import { Roster } from '../src/dsh/roster.ts'
 import { publicSettings, type Settings } from '../src/dsh/settings.ts'
 import { SuperhubIntake } from '../src/dsh/superhub.ts'
-import { registerTools } from '../src/dsh/tools.ts'
+import { registerTools, type GroupTurn } from '../src/dsh/tools.ts'
 import { workspaceHistoryRoutes } from '../src/dsh/workspace-history.ts'
 import { mutationKey, WorkspaceV2Store } from '../src/dsh/workspace-v2-store.ts'
 import { WorkspaceStaffStore } from '../src/dsh/workspace-staff-store.ts'
@@ -49,6 +49,7 @@ const settings: Settings = { timeZone: 'Asia/Shanghai', concurrency: 2, mobile: 
 const SCHEDULE_NOW = new Date('2026-11-25T02:00:00Z')
 
 function host(options: { groups?: boolean; push?: boolean; llm?: unknown } = {}) {
+  const groupTurns = new Map<string, GroupTurn>()
   const directory = mkdtempSync(join(tmpdir(), 'chief-liaison-tools-'))
   cleanup.push(() => rmSync(directory, { recursive: true, force: true }))
   const root = join(directory, 'brain')
@@ -147,7 +148,7 @@ function host(options: { groups?: boolean; push?: boolean; llm?: unknown } = {})
     control: { show: () => ({ ...publicSettings(settings), dev: false, git: true, mobile: { ...publicSettings(settings).mobile, running: false, addresses: [] } }), update: async () => '已保存' },
     importer: { prompt: '把你对我的了解写出来', submit: submitImport },
     exporter: { build: () => ({ empty: true }) as never },
-    superhub, workspaceStore, staffStore, ...(groups && {groups}), orderFollowup:workspaceRoutes.followup, assign:workspaceRoutes.assign, follow:workspaceRoutes.follow, modelDefaults: () => defaults,
+    superhub, workspaceStore, staffStore, ...(groups && {groups}), groupTurn: (id: string) => groupTurns.get(id), orderFollowup:workspaceRoutes.followup, assign:workspaceRoutes.assign, follow:workspaceRoutes.follow, modelDefaults: () => defaults,
   } as unknown as Parameters<typeof registerTools>[1])
 
   /** 主人本轮原话：宿主确认的人类 RPC 输入。 */
@@ -171,7 +172,7 @@ function host(options: { groups?: boolean; push?: boolean; llm?: unknown } = {})
     const agent = agents.get(session)!
     agent.events.push({ type: 'user/message', seq: agent.events.length + 1, time: Date.now(), data: { id: `a-${agent.events.length + 1}`, source: { kind: 'agent-message', senderSessionId: 'member' }, content: [{ type: 'text', text }] } })
   }
-  return { schedules, memberCalls, groups, root, brain, store, workspaceStore, staffStore, workspaceRoutes, messages, history, engine, intake: superhub, rooms, registered, admissions, call, liaison, ownerTurn, leadOf, ownerSays, endTurn, memberSays, requestRoomExecution, outbox, teammates, submitImport }
+  return { groupTurns, schedules, memberCalls, groups, root, brain, store, workspaceStore, staffStore, workspaceRoutes, messages, history, engine, intake: superhub, rooms, registered, admissions, call, liaison, ownerTurn, leadOf, ownerSays, endTurn, memberSays, requestRoomExecution, outbox, teammates, submitImport }
 }
 
 const plain = (value: unknown) => {
@@ -1176,6 +1177,38 @@ describe('已归档的工作区与接口人', () => {
     const listed = plain(await f.call('chief_workspace', {action: 'list_staff'}, f.liaison(f.ownerTurn('看看这里有哪些幕僚', 'list-staff')))) as {members: {name: string}[]}
     expect(listed.members).toEqual(expect.arrayContaining([expect.objectContaining({name: '工程师', executor: 'codex'}),
       expect.objectContaining({name: '六爻卦师', executor: 'dsh', effectiveModel: 'openai-codex/gpt-6.1-sol'})]))
+  })
+
+  it('群里主人原话授权接口人给本群工作区加人、改执行方式；没有主人来源、别的工作区和全局写都被拒', async () => {
+    const llm = {
+      listProviders: () => [{id: 'openai-codex', name: 'OpenAI Codex'}],
+      listModels: async () => [{id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol'}],
+      resolveModelInfo: async () => ({reasoning: {efforts: [{id: 'high', name: 'High'}]}}),
+    }
+    const f = host({groups: true, llm})
+    const space = archived(f, '命运'), other = archived(f, '字节 Landing')
+    const local = () => f.staffStore.view(space.id).members.filter(m => m.homeWorkspaceId === space.id)
+    const member = (id: string, turn: GroupTurn) => { f.groupTurns.set(id, turn); return {agent: {id, session: {snapshotEvents: () => []}}, signal: new AbortController().signal} as never }
+    const said = '接口人你创建一个幕僚 叫做六爻卦师 给他一些六爻解卦原则 模型设置为 gpt 的 6.1 sol high'
+    const owner = member('group-liaison', {workspaceId: space.id, owner: {requestId: 'owner-14', text: said}})
+    const card = {action: 'create', name: '六爻卦师', brief: '依据六爻解卦原则解读卦象，先调用六爻引擎排盘，区分盘面与解读。', model: 'gpt-6.1-sol', reasoning_effort: 'high'}
+
+    await expect(f.call('chief_staff', card, member('group-review', {workspaceId: space.id}))).rejects.toThrow('群里只有主人亲口提出、正由接口人接手的这一回合')
+    await expect(f.call('chief_staff', {...card, workspace: '字节 Landing'}, owner)).rejects.toThrow('在「命运」的群里只能管本工作区的幕僚')
+    await expect(f.call('chief_staff', {action: 'retire', id: 'researcher'}, owner)).rejects.toThrow('群里不能让全局幕僚退休或改全局角色卡')
+    expect(local()).toEqual([])
+    const created = plain(await f.call('chief_staff', card, owner))
+    expect(created).toMatchObject({workspace: {id: space.id}, staff: {name: '六爻卦师', model: 'openai-codex/gpt-6.1-sol', reasoningEffort: 'high'}})
+    expect(await f.call('chief_staff', {...card, workspace: '命运'}, owner)).toEqual(created)
+    expect(local()).toHaveLength(1)
+    expect(f.staffStore.view(other.id).members).toEqual([])
+
+    const confirm = member('group-liaison', {workspaceId: space.id, owner: {requestId: 'owner-17', text: '六爻卦师改用 Codex'}})
+    plain(await f.call('chief_staff', {action: 'update', name: '六爻卦师', executor: 'codex'}, confirm))
+    expect(local()).toEqual([expect.objectContaining({name: '六爻卦师', executor: 'codex'})])
+    // A group session outside a running call has no workspace and no owner words.
+    await expect(f.call('chief_staff', {action: 'update', name: '六爻卦师', executor: 'dsh'}, member('idle-member', {}))).rejects.toThrow('群里只有主人亲口提出')
+    expect(local()).toEqual([expect.objectContaining({executor: 'codex'})])
   })
 })
 

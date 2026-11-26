@@ -141,6 +141,12 @@ export class WorkspaceGroupHost {
   /** An engine already built for this group (not necessarily started). */
   loaded(sessionId: string): GroupEngine | undefined { return this.engines.get(sessionId)?.engine }
 
+  /** The host-recorded owner words a running liaison call in this group acts on (`GroupEngine.ownerSourceOf`). */
+  ownerTurn(groupId: string, callId: string) {
+    const held = this.engines.get(groupId)
+    return held && !held.readOnly ? held.engine.ownerSourceOf(callId) : undefined
+  }
+
   /**
    * On host start: every roster group that still has work in flight (running, queued or parked calls, open batches,
    * a delivered call) gets its engine now, so members mid-call are gated again and their turns resumed.

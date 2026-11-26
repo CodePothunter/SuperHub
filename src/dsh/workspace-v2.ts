@@ -1005,7 +1005,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         })
       }
     } else if (job.turn === 'owner' && decision.resolved?.length && decision.kind === 'none') {
-      if (!order || order.remainingTurns) engine.dispatchEngagement(job.id, [LIAISON_MEMBER_ID], '主人已答复待回应事项：' + line.text, routed.orderId)
+      if (!order || order.remainingTurns) engine.dispatchEngagement(job.id, [LIAISON_MEMBER_ID], '主人已答复待回应事项：' + line.text, routed.orderId, {replyTo: line.seq})
     } else if (job.turn === 'owner' && !decision.resolved?.length && decision.kind === 'none') {
       engine.forwardEngagementOwner(job.id, line)
     } else if (!routed.orderId && job.turn !== 'owner' && decision.kind === 'none' && (line.mentions.length || line.all)) {

@@ -376,6 +376,14 @@ export class DshMemberRunner implements MemberRunner {
     return true
   }
 
+  /** The group call this DSH session is running now; none once its turn has ended or been cancelled. */
+  callOf(sessionId: string): { callId: string; workspaceId: string; groupId: string; memberId: string } | undefined {
+    const tracker = this.bySession.get(sessionId)
+    if (!tracker || tracker.cancelled || this.byCall.get(tracker.call.callId) !== tracker) return
+    const { callId, group, member } = tracker.call
+    return { callId, workspaceId: group.workspaceId, groupId: group.groupId, memberId: member.id }
+  }
+
   dispose() {
     this.disposed = true
     for (const tracker of this.byCall.values()) tracker.lease?.close()
