@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from 'react'
-import type { StaffMember, StaffView } from '../core/workspace-staff.ts'
+import type { StaffMember, StaffMemberExecutor, StaffView } from '../core/workspace-staff.ts'
+import { ModelPicker } from './model-select.tsx'
 import type { ExperienceEvidence, ExperienceMemory } from '../core/workspace-experience.ts'
 import { workspaceArchived, type V2Workspace, type V2WorkspaceView } from '../core/workspace-v2.ts'
 import { ARCHIVED_NOTE, Issue, readableTime, useArchived, V2Dialog, V2Icon } from './workspace-v2-elements.tsx'
@@ -32,6 +33,13 @@ type Save = (body:Record<string,unknown>,message:string,path?:string)=>Promise<b
 
 function formData(event:FormEvent<HTMLFormElement>) { event.preventDefault(); return new FormData(event.currentTarget) }
 const field = (data:FormData,key:string) => String(data.get(key) ?? '').trim()
+const EXECUTORS: Record<StaffMemberExecutor,string> = {dsh:'DSH', codex:'Codex', 'claude-code':'Claude Code'}
+/** 「执行：Codex」或「执行：DSH · 模型（思考深度）」；没指定模型时沿用接口人的模型。 */
+export function runLabel(member: Pick<StaffMember,'executor'|'model'|'reasoningEffort'>) {
+  const executor = member.executor ?? 'dsh'
+  if (executor !== 'dsh') return '执行：' + EXECUTORS[executor] + '（模型以它自己的配置为准）'
+  return '执行：DSH · ' + (member.model ? member.model + (member.reasoningEffort ? '（思考深度 ' + member.reasoningEffort + '）' : '') : '沿用接口人的模型')
+}
 
 function expiryDay(expiresAt: string, timeZone?: string) {
   const last = new Date(Date.parse(expiresAt) - 1)
@@ -182,6 +190,7 @@ export function StaffBoard(props:Props) {
         <header className="v2-section-head"><div className="v2-staff-identity"><ChatAvatar portrait={member.portrait ?? defaultStaffPortrait(member.id)}/><div><small>{member.homeWorkspaceId ? label(member.homeWorkspaceId)+'专属' : '全局幕僚'}</small><h2>{member.name}</h2></div></div>
           {assign && !readOnly && <button className="v2-button primary" onClick={()=>assign(member)}>交给这位幕僚</button>}</header>
         <p className="v2-staff-brief">{member.brief}</p>
+        {member.homeWorkspaceId && <p className="v2-quiet">{runLabel(member)}</p>}
         {workspaceId === member.homeWorkspaceId ? !readOnly && <div className="v2-actions">
           <button className="v2-link" onClick={()=>{setShowError(false);setMessage('');setOperation('portrait')}}>更换头像</button>
           <button className="v2-link" onClick={()=>open('edit')}>编辑职责</button></div>
@@ -334,7 +343,7 @@ function ExperienceVersions({memory,editable,sharedOnly,restore,openEvidence,tim
   </details>
 }
 
-interface FormProps {
+export interface FormProps {
   operation:Operation
   member?:StaffMember
   view:StaffView
@@ -348,7 +357,7 @@ interface FormProps {
 }
 const formTitles = {create:'创建幕僚',invite:'邀请幕僚',join:'加入工作区',duty:'调整本区职责',edit:'编辑职责',leave:'移出本区',learn:'添加经验',revise:'更正经验',share:'共享经验',reset:'重置记忆'}
 
-function StaffForm(props:FormProps) {
+export function StaffForm(props:FormProps) {
   const {operation:{action,memory,shared},workspace,member,spaces,view,path,save,busy,error,close} = props
   const workspaceId = workspace?.workspace.id
   const sourceOrders = workspace?.orders.filter(order=>shared || order.staffId === member?.id) ?? []
@@ -366,11 +375,17 @@ function StaffForm(props:FormProps) {
   const targetName = spaces.find(w=>w.id === destination)?.name
   const resetScope = workspace ? workspace.workspace.name : '所有工作区和通用经验'
   const originalExpiryDay = memory?.expiresAt ? expiryDay(memory.expiresAt,view.timeZone) : ''
+  // Only a workspace's own member runs on settings kept here; global members follow their role card.
+  const runnable = action === 'create' ? !!workspace : action === 'edit' && !!member?.homeWorkspaceId
+  const editing = action === 'edit' ? member : undefined
+  const [executor,setExecutor] = useState<StaffMemberExecutor>(editing?.executor ?? 'dsh')
+  const [run,setRun] = useState({model:editing?.model ?? '',effort:editing?.reasoningEffort ?? ''})
   const submit = (event:FormEvent<HTMLFormElement>) => {
     const data = formData(event)
     const identity = shared ? {audience:'shared'} : {staffId:member?.id}
     if (action === 'create' || action === 'edit') {
-      void save({action,...(action === 'edit' && identity),name:field(data,'name'),brief:field(data,'brief')},action === 'edit' ? '已更新职责。' : '已创建幕僚。')
+      const settings = runnable ? {executor,...(executor === 'dsh' && {model:run.model,reasoningEffort:run.effort})} : {}
+      void save({action,...(action === 'edit' && identity),name:field(data,'name'),brief:field(data,'brief'),...settings},action === 'edit' ? '已更新职责。' : '已创建幕僚。')
     } else if (action === 'join' || action === 'duty' || action === 'invite') {
       const id = action === 'invite' ? field(data,'member') : member?.id
       void save({action:'join',staffId:id,duty:field(data,'duty')},action === 'duty' ? '已保存本区职责。' : '幕僚已加入工作区。',action === 'join' ? staffPath(field(data,'workspace')) : path)
@@ -401,7 +416,13 @@ function StaffForm(props:FormProps) {
     <form onSubmit={submit}>
       {(action === 'create' || action === 'edit') && <>
         <label>名称<input name="name" required maxLength={80} defaultValue={action === 'edit' ? member?.name : ''}/></label>
-        <label>职责<textarea name="brief" required maxLength={3000} defaultValue={action === 'edit' ? member?.brief : ''}/></label></>}
+        <label>职责<textarea name="brief" required maxLength={3000} defaultValue={action === 'edit' ? member?.brief : ''}/></label>
+        {runnable && <>
+          <label>由谁执行<select value={executor} onChange={event=>setExecutor(event.target.value as StaffMemberExecutor)}>
+            {Object.entries(EXECUTORS).map(([id,name])=><option key={id} value={id}>{name}</option>)}</select></label>
+          {executor === 'dsh' ? <ModelPicker layout="form" label="模型" effortLabel="思考深度" value={run} onChange={setRun} disabled={busy}/>
+            : <p className="v2-quiet">在群里由 {EXECUTORS[executor]} 执行，模型和思考深度以 {EXECUTORS[executor]} 自己的配置为准。</p>}
+        </>}</>}
       {action === 'invite' && <label>选择幕僚<select required name="member" defaultValue=""><option value="" disabled>选择全局幕僚</option>
         {view.available.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}</select></label>}
       {action === 'join' && <label>选择工作区<select name="workspace" required defaultValue=""><option value="" disabled>选择工作区</option>

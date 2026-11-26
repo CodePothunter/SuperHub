@@ -1,10 +1,10 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import { afterEach, expect, it, vi } from 'vitest'
 import { StaffPortraitPicker } from '../src/client/workspace-staff-portrait.tsx'
-import { StaffBoard } from '../src/client/workspace-staff.tsx'
+import { runLabel, StaffBoard, StaffForm } from '../src/client/workspace-staff.tsx'
 import { isExperienceVersion, isSharedExperienceVersion, isStaffImpact, isStaffView, staffPath } from '../src/client/workspace-staff-response.ts'
 import * as api from '../src/client/workspace-v2-api.ts'
-import type { StaffView } from '../src/core/workspace-staff.ts'
+import type { StaffMember, StaffView } from '../src/core/workspace-staff.ts'
 import type { ExperienceEvidence, ExperienceMaintenance } from '../src/core/workspace-experience.ts'
 import type { V2WorkspaceView } from '../src/core/workspace-v2.ts'
 
@@ -124,4 +124,24 @@ it('offers the approved ten objects and seven colors with a static saved portrai
   expect(picker.match(/type="radio"/g)).toHaveLength(17)
   expect(picker.match(/checked=""/g)).toHaveLength(2)
   for(const label of ['折扇','指南针','双叶书签','纸飞机','钴蓝','莓红','鸢紫','恢复默认头像','保存头像','预览动效']) expect(picker).toContain(label)
+})
+
+it('shows and edits how a workspace member runs; global members keep their role card',()=>{
+  const own: StaffMember = {...member,id:'liuyao',name:'六爻卦师',homeWorkspaceId:space.id,model:'openai-codex/gpt-6.1-sol',reasoningEffort:'high'}
+  expect(runLabel(own)).toBe('执行：DSH · openai-codex/gpt-6.1-sol（思考深度 high）')
+  expect(runLabel({executor:'codex'})).toBe('执行：Codex（模型以它自己的配置为准）')
+  expect(runLabel({})).toBe('执行：DSH · 沿用接口人的模型')
+  const staff:StaffView = {...local,members:[own,member]}
+  vi.spyOn(api,'useV2Read').mockImplementation((path,valid)=>({data:path && valid(staff,path) ? staff : undefined,refresh:async()=>{},error:undefined}))
+  const detail = renderToStaticMarkup(<StaffBoard selected={own.id} workspace={view} spaces={[space]} select={()=>{}} openOrder={()=>{}} openMembership={()=>{}}/>)
+  expect(detail).toContain('执行：DSH · openai-codex/gpt-6.1-sol（思考深度 high）')
+  const form = (action:'create'|'edit',who:StaffMember=own) => renderToStaticMarkup(<StaffForm operation={{action}} member={who} view={staff} spaces={[space]} workspace={view}
+    path={staffPath(space.id)} busy={false} close={()=>{}} save={async()=>true}/>)
+  for (const html of [form('create'),form('edit')]) {
+    expect(html).toContain('由谁执行')
+    expect(html).toContain('>Codex</option>')
+    expect(html).toContain('aria-label="模型"')
+  }
+  expect(form('edit',{...own,executor:'claude-code'})).toContain('在群里由 Claude Code 执行，模型和思考深度以 Claude Code 自己的配置为准。')
+  expect(form('edit',member)).not.toContain('由谁执行')
 })

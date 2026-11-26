@@ -172,6 +172,15 @@ export function toolDetail(input: unknown): string | undefined {
 // 名册
 
 /**
+ * 成员按哪张卡运行：有全局角色卡的以角色卡为准；没有的（SuperHub 里建的幕僚）用自己存的执行器与模型，都没写时为 DSH 默认。
+ */
+export function memberRunCard(member: Pick<StaffMember, 'executor' | 'model' | 'reasoningEffort'>,
+  native?: Pick<Staff, 'executor' | 'model' | 'reasoningEffort'>): Pick<Staff, 'executor' | 'model' | 'reasoningEffort'> {
+  return native ?? { executor: member.executor ?? 'dsh', ...member.model && { model: member.model },
+    ...member.model && member.reasoningEffort && { reasoningEffort: member.reasoningEffort } }
+}
+
+/**
  * 本工作区群聊的名册：接口人当管理员排第一，其后是本区幕僚（按幕僚资料里的顺序）。名字叫不到（含 `@`、是全员词……）
  * 或与前面的人同名（不分大小写）的跳过，远程幕僚跳过，总数不超过 12。
  */
@@ -196,12 +205,12 @@ export function groupRoster(input: {
     if (!membership || member.id === LIAISON_MEMBER_ID) continue
     const name = member.name.trim()
     if (nameProblem(name) || taken.has(name.toLowerCase())) continue
-    const native = input.native.find(row => row.id === member.id)
-    if (native?.executor === 'remote') continue
-    const kind: GroupMemberKind = native?.executor === 'codex' ? 'codex' : native?.executor === 'claude-code' ? 'claude-code' : 'dsh'
+    const card = memberRunCard(member, input.native.find(row => row.id === member.id))
+    if (card.executor === 'remote') continue
+    const kind: GroupMemberKind = card.executor === 'codex' ? 'codex' : card.executor === 'claude-code' ? 'claude-code' : 'dsh'
     let context: StaffContext | undefined
     try { context = input.context?.(member.id) } catch { context = undefined }
-    const model = kind === 'dsh' ? (native ? teammateSelection({ ...native, executor: 'dsh' }, input.defaults) : undefined) ?? input.defaults.liaison : undefined
+    const model = kind === 'dsh' ? teammateSelection({ ...card, executor: 'dsh' }, input.defaults) ?? input.defaults.liaison : undefined
     const duty = context?.duty ?? membership.duty
     roster.push({ id: member.id, name, kind, brief: context?.brief ?? member.brief, ...duty && { duty },
       ...context?.memories.length && { memories: context.memories.map(row => row.text) }, ...model && { model }, ...context && { token: context.token } })

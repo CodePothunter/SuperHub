@@ -45,6 +45,8 @@ import { BRIEF_GUIDE } from './workspace-order-brief.ts'
 import type { V2Workspace } from '../core/workspace-v2.ts'
 import { HANDOFF_LIMIT, archivedRefusal, mutationKey, type WorkspaceV2Store } from './workspace-v2-store.ts'
 import type { WorkspaceStaffStore } from './workspace-staff-store.ts'
+import { isStaffMemberExecutor, type StaffMember } from '../core/workspace-staff.ts'
+import { memberRunCard } from './workspace-group-members.ts'
 import type { ExperienceLearning } from './workspace-experience-learning.ts'
 import type { RoomExperienceGrant, RoomExperienceScope } from './rooms.ts'
 import type { WorkspaceGroupHost } from './workspace-group-host.ts'
@@ -219,37 +221,80 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
   } }, options)
   const privateLiaison = { when: ({ agent }: { agent: { id: string } }) => deps.isLiaison(agent.id) }
   /**
-   * `chief_staff create` with `workspace`: a staff member of that workspace only (the same as 「创建专属幕僚」 on its
-   * page). The workspace must be named in the owner's words; nothing is saved on any refusal. A retry of the same owner
-   * turn returns the same member.
+   * `chief_staff create`/`update` with `workspace`: a staff member of that workspace only (the same as 「创建专属幕僚」 on
+   * its page), with its own executor and model when the owner names them. The workspace must be named in the owner's
+   * words; nothing is saved on any refusal. A retry of the same owner turn returns the same result.
    */
-  const createWorkspaceStaff = (args: Record<string, unknown>, execution: ToolExecution) => {
-    const { source, events } = ownerSource(execution, '给工作区加专属幕僚需要本轮接口人会话中经宿主确认的主人原话。这次调用不在主人本轮消息之内，未创建。请等主人亲自提出。')
+  const ownerWorkspace = (args: Record<string, unknown>, execution: ToolExecution, refusal: string) => {
+    const { source, events } = ownerSource(execution, refusal)
     const named = str(args.workspace)
-    if (!named) throw new Error('workspace 需要是主人点名的工作区名称；主人没提工作区时不填，建全局幕僚。')
+    if (!named) throw new Error('workspace 需要是主人点名的工作区名称；主人没提工作区时不填，改的是全局幕僚。')
     if (!ownerWordsOf(source, events).some(text => text.normalize('NFC').includes(named.normalize('NFC')))) {
-      throw new Error('主人原话里没有工作区「' + named + '」，未创建。只在主人点名要给某个工作区加人时填写 workspace，并照录工作区名称。')
+      throw new Error('主人原话里没有工作区「' + named + '」，未改动。只在主人点名某个工作区的幕僚时填写 workspace，并照录工作区名称。')
     }
     const matches = deps.workspaceStore.list().filter(row => row.name.normalize('NFC') === named.normalize('NFC'))
-    if (matches.length !== 1) throw new Error((matches.length ? '有多个' : '没有') + '名为「' + named + '」的工作区，未创建。请用 chief_workspace list 核对名称。')
+    if (matches.length !== 1) throw new Error((matches.length ? '有多个' : '没有') + '名为「' + named + '」的工作区，未改动。请用 chief_workspace list 核对名称。')
     const space = matches[0]!
     if (workspaceArchived(space)) throw new Error(archivedRefusal(space.name))
-    const given = (key: string) => args[key] !== undefined && args[key] !== null && args[key] !== ''
-    if (['executor', 'verifier', 'model', 'reasoning_effort'].some(given)) throw new Error('专属幕僚使用默认执行器，需要指定执行器或模型请建全局幕僚。未创建。')
-    if (!deps.staffStore) throw new Error('当前宿主无法为工作区加幕僚。')
+    if (!deps.staffStore) throw new Error('当前宿主无法管理工作区幕僚。')
+    return { source, space, store: deps.staffStore }
+  }
+  /** Executor, model and effort as given by the liaison, the model checked against the DSH catalog. */
+  const workspaceRunSettings = async (args: Record<string, unknown>, saved: { model?: string; effort?: string } = {}) => {
+    const given = (key: string) => args[key] !== undefined && args[key] !== null
+    if (given('verifier') && args.verifier !== '') throw new Error('专属幕僚由接口人在群里验收，不设 verifier。未改动。')
+    if (given('executor') && !isStaffMemberExecutor(args.executor)) {
+      throw new Error('专属幕僚的 executor 只能是 dsh、codex 或 claude-code；远程幕僚请建全局幕僚。未改动。')
+    }
+    const wanted = { ...typeof args.model === 'string' && { model: args.model }, ...typeof args.reasoning_effort === 'string' && { effort: args.reasoning_effort } }
+    const chosen = Object.keys(wanted).length ? await canonicalSelection(ctx.get('llm'), wanted, saved) : undefined
+    return { ...given('executor') && { executor: args.executor as string },
+      ...chosen && { model: chosen.model, reasoningEffort: chosen.effort } }
+  }
+  const runView = (member: StaffMember, defaults: ModelDefaults) => {
+    const effective = effectiveModel(memberRunCard(member), defaults)
+    return { executor: member.executor ?? 'dsh', ...member.model && { model: member.model }, ...member.reasoningEffort && { reasoningEffort: member.reasoningEffort },
+      ...effective.model && { effectiveModel: effective.model }, ...effective.reasoningEffort && { effectiveReasoningEffort: effective.reasoningEffort },
+      modelSource: effective.source === '幕僚卡' ? '专属幕僚配置' : effective.source }
+  }
+  const executorName = (executor?: string) => ({ codex: 'Codex', 'claude-code': 'Claude Code' } as Record<string, string>)[executor ?? ''] ?? 'DSH'
+  const createWorkspaceStaff = async (args: Record<string, unknown>, execution: ToolExecution) => {
+    const { source, space, store } = ownerWorkspace(args, execution, '给工作区加专属幕僚需要本轮接口人会话中经宿主确认的主人原话。这次调用不在主人本轮消息之内，未创建。请等主人亲自提出。')
     const name = str(args.name)
     if (!name || name.length > 80) throw new Error('专属幕僚需要 name：不超过 80 字的中文称呼。')
     const brief = str(args.brief) ?? ''
     if (brief.length < 20) throw new Error('角色卡太短：第一行写职责，后面写做事方式')
     const shape = args.portrait_shape
     if (shape !== undefined && shape !== null && shape !== '' && !isStaffAvatarShape(shape)) throw new Error('请选择素材库中可用于幕僚的头像造型')
+    const settings = await workspaceRunSettings(args)
     // The same owner turn, workspace and name are one creation: a retried call is answered from the store's receipt.
     const requestId = createHash('sha256').update(JSON.stringify(['staff-workspace', space.id, source.requestId, name])).digest('hex')
-    const view = deps.staffStore.apply(space.id, { action: 'create', name, brief, uniqueName: true, requestId, ...(isStaffAvatarShape(shape) && { portraitShape: shape }) })
+    const view = store.apply(space.id, { action: 'create', name, brief, uniqueName: true, requestId, ...settings, ...(isStaffAvatarShape(shape) && { portraitShape: shape }) })
     deps.groups?.refresh(space.id)
     const member = view.members.find(row => row.homeWorkspaceId === space.id && row.name === name)
-    return { workspace: { id: space.id, name: space.name }, ...(member && { staff: { id: member.id, name: member.name, brief: member.brief } }),
-      message: `已在「${space.name}」加入专属幕僚「${name}」。下一张工单起生效。` }
+    const defaults = deps.modelDefaults?.() ?? { liaisonPinned: false }
+    return { workspace: { id: space.id, name: space.name }, ...(member && { staff: { id: member.id, name: member.name, brief: member.brief, ...runView(member, defaults) } }),
+      message: `已在「${space.name}」加入专属幕僚「${name}」，由 ${executorName(member?.executor)} 执行。下一张工单起生效。` }
+  }
+  const updateWorkspaceStaff = async (args: Record<string, unknown>, execution: ToolExecution) => {
+    const { source, space, store } = ownerWorkspace(args, execution, '修改工作区专属幕僚需要本轮接口人会话中经宿主确认的主人原话。这次调用不在主人本轮消息之内，未改动。请等主人亲自提出。')
+    const wanted = str(args.id) ?? str(args.name)
+    const members = store.view(space.id).members
+    const member = members.find(row => row.id === wanted) ?? members.find(row => row.name.normalize('NFC') === wanted?.normalize('NFC'))
+    if (!wanted || !member) throw new Error('「' + space.name + '」里没有幕僚「' + (wanted ?? '') + '」。本区现有：' + (members.map(row => row.name).join('、') || '（没有）') + '。name 照录称呼。')
+    if (member.homeWorkspaceId !== space.id) throw new Error('「' + member.name + '」是全局幕僚，以全局角色卡为准：不带 workspace、用它的 id 调用 update。未改动。')
+    const brief = str(args.brief)
+    if (brief !== undefined && brief.length < 20) throw new Error('角色卡太短：brief 要给改完后的全文')
+    const settings = await workspaceRunSettings(args, { model: member.model, effort: member.reasoningEffort })
+    if (brief === undefined && !Object.keys(settings).length) throw new Error('update 需要至少一项要改的内容：brief、executor、model 或 reasoning_effort。')
+    const change = { ...brief !== undefined && { brief }, ...settings }
+    const requestId = createHash('sha256').update(JSON.stringify(['staff-workspace-update', space.id, source.requestId, member.id, change])).digest('hex')
+    const view = store.apply(space.id, { action: 'edit', staffId: member.id, requestId, ...change })
+    deps.groups?.refresh(space.id)
+    const saved = view.members.find(row => row.id === member.id) ?? member
+    const defaults = deps.modelDefaults?.() ?? { liaisonPinned: false }
+    return { workspace: { id: space.id, name: space.name }, staff: { id: saved.id, name: saved.name, brief: saved.brief, ...runView(saved, defaults) },
+      message: `已更新「${space.name}」的专属幕僚「${saved.name}」，由 ${executorName(saved.executor)} 执行。下次在群里叫它时生效。` }
   }
   return [
     ...(inputAttachments ? [register({
@@ -335,7 +380,15 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
         }
         if (args.action === 'list_staff') {
           if (!shown || !deps.staffStore) throw new Error('请从目标工作区打开接口人，以核对可接单的幕僚。')
-          return {members:deps.staffStore.view(shown.workspace.id).members.map(({id,name,brief,memberships})=>({id,name,brief,duty:memberships[0]?.duty}))}
+          const defaults = deps.modelDefaults?.() ?? { liaisonPinned: false }
+          const cards = brain.staff()
+          return {members:deps.staffStore.view(shown.workspace.id).members.map(member => {
+            const native = cards.find(card => card.id === member.id)
+            const effective = native && effectiveModel(native, defaults)
+            return {id:member.id,name:member.name,brief:member.brief,duty:member.memberships[0]?.duty,
+              ...native && effective ? {executor:native.executor,...effective.model && {effectiveModel:effective.model},modelSource:'全局角色卡 · '+effective.source}
+                : runView(member, defaults)}
+          })}
         }
         if (args.action === 'remember_experience') {
           if (archivedHere) refuseArchived(archivedHere)
@@ -1037,7 +1090,8 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
         '查看或调整幕僚团。改动只在主人明确要求时用。',
         'action=list 看现有幕僚：每位的执行器、幕僚卡配置的模型，以及实际生效的模型 effectiveModel、思考深度 effectiveReasoningEffort 和来源 modelSource（幕僚卡 / DSH 默认 / 跟随接口人 / Codex 配置 / 远程，未知）。主人问「谁用什么模型」时用它和 chief_settings show 直接回答，不用建单或开讨论；读不到的如实说读不到；',
         'create 加一位：主人往往只说一句"加个盯竞品的"，由你把角色卡写完整——id（小写英文短横线，如 competitor-watch）、name（中文称呼）、brief（第一行一句话职责，后面 3 到 6 条做事方式，写具体：查什么、产出什么、什么时候该停下来问主人）、executor（dsh 默认；写代码用 claude-code）、verifier（默认 reviewer）；',
-        '主人要给某个工作区加人时（「给 X 工作区加一个…」），create 带 workspace（照录主人本轮原话里的工作区名称），建的是只属于该工作区的专属幕僚：不进全局名册，只填 name、brief、portrait_shape，使用默认执行器与模型，不能填 id、executor、verifier、model、reasoning_effort。主人没提工作区时不填 workspace，照常建全局幕僚。已归档的工作区不能加人；',
+        '主人要给某个工作区加人时（「给 X 工作区加一个…」），create 带 workspace（照录主人本轮原话里的工作区名称），建的是只属于该工作区的专属幕僚：不进全局名册，填 name、brief、portrait_shape；主人点名执行方式或模型时照填 executor（dsh、codex、claude-code）、model、reasoning_effort，不点名就不填（DSH 加默认模型）；不填 id、verifier。主人没提工作区时不填 workspace，照常建全局幕僚。已归档的工作区不能加人；',
+        '改某个工作区的专属幕僚（「把 X 工作区的工程师改成 Codex」）用 update 带 workspace 和 name（照录称呼；找不到时回执列出本区现有幕僚），只给要改的 brief、executor、model、reasoning_effort；全局幕僚不带 workspace、用 id 改；',
         `创建时按主要职责选择 portrait_shape：${staffAvatarGuidance}。多个造型同样贴切时，优先选名册里容易区分的轮廓，list 可查 defaultPortrait。不确定时留空，由系统推荐。配色由系统分配，主人已经手选的头像优先显示。`,
         'update 改一位：给 id 和要改的字段（brief 要给改完后的全文）；model（厂商/模型，空串表示用默认）和 reasoning_effort（思考深度，取该模型支持的档位，空串表示模型默认）只在主人点名时填；',
         'retire 让一位退休：给 id。研判官（chief）和审查官（reviewer）不能退休。',
@@ -1051,7 +1105,7 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
           id: { type: 'string' }, name: { type: 'string' }, brief: { type: 'string' },
           executor: { type: 'string', enum: ['dsh', 'claude-code', 'codex', 'remote'] }, verifier: { type: 'string' }, model: { type: 'string' }, reasoning_effort: { type: 'string' },
           portrait_shape: { type: 'string', enum: staffAvatarShapes, description: '仅用于创建。选择与主要职责贴切、在名册中易区分的默认头像造型。' },
-          workspace: { type: 'string', description: '仅用于 create：主人要给某个工作区加人时，照录主人本轮原话里的工作区名称，创建该区的专属幕僚（只有 name、brief、portrait_shape）。不提工作区时不填。' },
+          workspace: { type: 'string', description: '用于 create 和 update：主人点名某个工作区的专属幕僚时，照录主人本轮原话里的工作区名称。不提工作区时不填。' },
         },
       },
       output: { schema: OBJECT, render: (_a, v) => textOut(v) },
@@ -1067,8 +1121,9 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
         if (args.action === 'list') return { staff: list() }
         guard(execution)
         if (args.workspace !== undefined && args.workspace !== null && args.workspace !== '') {
-          if (args.action !== 'create') throw new Error('workspace 只用于 create：给工作区加专属幕僚。改或退休专属幕僚请主人在工作区的幕僚卡操作。')
-          return createWorkspaceStaff(args, execution)
+          if (args.action === 'create') return createWorkspaceStaff(args, execution)
+          if (args.action === 'update') return updateWorkspaceStaff(args, execution)
+          throw new Error('workspace 只用于 create 和 update：给工作区加或改专属幕僚。退休专属幕僚请主人在工作区的幕僚卡操作。')
         }
         const id = str(args.id) ?? ''
         const found = brain.staff().find(s => s.id === id)

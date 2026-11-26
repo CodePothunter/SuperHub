@@ -48,6 +48,11 @@ interface Options {
   review?: AcceptanceReviewer
   coordinate?: EngagementCoordinator
   /**
+   * A staff member's model and reasoning effort checked against the DSH catalog (as for global role cards): a field
+   * left out keeps the saved value, an empty string means the default. Absent: only the store's format check applies.
+   */
+  canonicalModel?: (wanted: {model?: string; effort?: string}, saved: {model?: string; effort?: string}) => Promise<{model: string; effort: string}>
+  /**
    * Reminder for the owner in 「一句话交办」 (and push unless `localOnly`), once per key: an order completed, waits for the
    * owner, or stopped short. `order` lets the reminder open the work order.
    */
@@ -162,7 +167,7 @@ export function earlierResults(notices: StoredResult[], orderId: string, turnId:
 }
 
 /** Mounted behind serveApi's authenticated desktop/mobile gateways, under the active brain lock. */
-export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shanghai', now, approvals, review, coordinate, remind, locks = directoryLocks, judge, groups, inputAttachments, learning, learningProblem }: Options) {
+export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shanghai', now, approvals, review, coordinate, canonicalModel, remind, locks = directoryLocks, judge, groups, inputAttachments, learning, learningProblem }: Options) {
   const scope = store.scope
   const flights = new Map<string, InFlight>()
   let disposed = false
@@ -1687,6 +1692,15 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
         if (body.audience !== 'shared' && order.staffId !== body.staffId) return workspaceError(409,'这张工单由其他人负责')
       }
       const {expiresOn, ...operation} = body
+      if (canonicalModel && (operation.action === 'create' || operation.action === 'edit') && (operation.model !== undefined || operation.reasoningEffort !== undefined)) {
+        const saved = operation.action === 'edit' ? staff.view(local).members.find(member => member.id === operation.staffId) : undefined
+        const text = (value: unknown) => value === null ? '' : typeof value === 'string' ? value : workspaceError(400,'请选择有效的模型')
+        const {model, effort} = await canonicalModel({...operation.model !== undefined && {model: text(operation.model)},
+          ...operation.reasoningEffort !== undefined && {effort: text(operation.reasoningEffort)}}, {model: saved?.model, effort: saved?.reasoningEffort})
+          .catch(error => workspaceError(400, error instanceof Error ? error.message : '请选择有效的模型'))
+        operation.model = model
+        operation.reasoningEffort = effort
+      }
       if (expiresOn !== undefined) {
         if (operation.action !== 'learn' && operation.action !== 'revise' && operation.action !== 'restore') {
           return workspaceError(400, '请在编辑或恢复经验时设置有效期')
