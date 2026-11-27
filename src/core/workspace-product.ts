@@ -23,7 +23,9 @@ export const WORKSPACE_TOOL = {
   description: [
     '从「今天」或任一页面直接查找和操作 SuperHub 工作区。list 读取同脑清单，可用 query 按名称、目标、负责人查找。已有区可用主人点名的全名 name，或用 workspace_id 和主人逐字说出的目标线索 target_quote。唯一且能核实就直接办。多个候选时列出目标或负责人的区别，问清一次，收到选择后继续。',
     '「这里」用当前页面。续办且上条主人原话已指明目标时用 target_source=previous，沿用原话中的 name 或 target_quote。「刚才那个」也可用 target_source=receipt，摘录本轮指代并核对上一轮的实际工具回执。主人按上轮候选序号明确选择时使用 target_choice，并带本轮 target_quote。主人这次改了目标时使用新目标。',
+    '主人只描述项目职责时，先用 list 查实际目标，再从原话截取与实际项目资料共有的连续词作为 target_quote。例如「做供应商比价的项目」与实际目标「负责供应商比价与资料核对」共用「供应商比价」。定位失败时按真实清单缩小到共同片段重试。',
     '主人要在工作区开对话并问问题时，直接 start_session，给简洁 title，并把主人的完整问题逐字摘为 question。这个动作创建普通群聊，零工单，带问题时会叫本区成员处理。仅要求建空对话时省略 question。同一问题明确要求再开一场时沿用原问题，并摘录本轮 new_session_quote。要往原对话送话时先用 list_sessions 核实会话，send_session 带 session_id、主人点名的 session_quote 和实际 trace_id。主人打开的会话可沿用本轮选区。',
+    '主人接着说「就启动吧，带工单也行」或问「刚才那场怎么样」，而上次已有普通对话回执时，本轮调用 {"action":"session_status"}。这个读取会重新给出「打开对话」按钮，使用实际群聊的进度。',
     '两轮说的是同一个待办事项时，request_source=previous 带回上条原问题。此前若返回了待选择的工作区候选，request_source=pending 可带回那件事。此前若已完成对话或工单动作，也可用 request_source=receipt 指回该回执的原任务。以本轮主人原话决定是开始、改口、继续等候还是取消。主人改了问题时，从本轮取得新问题。「你帮我做就行，带工单也行，你就启动吧」优先用 start_session 继续上轮的普通对话，沿用已指明的项目和原问题，无需重新点名。已收到对话回执时回到原对话。确实未能送达并且主人允许工单备用时，assign 带 order_mode=fallback 和本轮 order_quote。主人明确改用工单时用 explicit 并照录本轮授权。',
     '建工作区用 create，name 用原名，主人已经给了 goal 或 directory 时可一并写入。改已有工作区名称或目标用 update_workspace，只给明确要改的新名称 new_name 或 goal。清空目标填空字符串和 clear_goal_quote。改绑目录用 set_directory，directory 照录主人给的绝对路径，解除时填空字符串。查询本区幕僚用 list_staff，创建和配置专属幕僚用 chief_staff。归档工作区只读，可从实际工作区页面恢复。',
     '主人明确托付一份新成果时用 assign，title 概括主题，promise 说明交付约定。负责人按群聊分工由接口人 @，不再选择执行者，executor 不用填。主人本轮点名某位幕僚时可先 list_staff 核实，staff_name 照录称呼，交办会直接 @ 此人。只提 Codex、Claude Code 等工具名时不用填 staff_name。主人本轮原话为这一单明确写出目录时，directory 按原话设置。handoff 写你的交办说明，宿主会附上主人的原话。从已选群聊交办通常沿用该群。从「今天」交办且没有指定项目时进入「我的交办」。',

@@ -13,7 +13,7 @@ const ORIGIN_META = 'dsh-chief/workspace-origin'
 
 export const workspaceTargetProperties = {
   workspace_id: { type: 'string', maxLength: 160, description: '同脑工具返回的工作区 ID。提交写操作时，同时使用主人原话中的目标线索、当前选区或一条可核对的上轮回执。' },
-  target_quote: { type: 'string', maxLength: 240, description: '主人原话中逐字摘录的项目名、目标、负责人或已有回执的指代短语。用一段能区分候选的线索。' },
+  target_quote: { type: 'string', maxLength: 240, description: '逐字摘录主人原话和实际项目名称、目标或负责人共有的连续词，例如从「做供应商比价的项目」摘「供应商比价」。沿用已有回执时摘录本轮指代。' },
   target_source: { type: 'string', enum: ['current', 'previous', 'receipt', 'page'], description: '核对目标线索的位置。默认 current。previous 用紧邻上条主人原话，receipt 用上一轮工具回执并摘录本轮指代，page 用主人本轮实际打开的位置。' },
   target_choice: { type: 'integer', minimum: 1, description: '主人按次序选择项目时，使用工具上一轮展示的候选序号，并在 target_quote 摘录本轮的选择原话。' },
 } as const

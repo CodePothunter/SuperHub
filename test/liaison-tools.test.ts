@@ -211,6 +211,7 @@ describe('从接口人查找工作区并执行日常操作', () => {
     await vi.waitFor(() => expect(f.memberCalls).toEqual(['liaison']))
     expect(await f.call('chief_workspace', {...args, title: '不同的标题'}, f.liaison(firstTurn))).toEqual(opened)
     const secondTurn = f.liaison([...firstTurn, ...metadata(f, args, opened, 'start-result'), end, ...f.ownerTurn(confirmation, 'destiny-continue')])
+    expect(await f.call('chief_workspace', {action:'session_status'}, secondTurn)).toEqual(opened)
     const repeated = plain(await f.call('chief_workspace', {action: 'assign', name: space.name, request_source: 'previous', order_mode: 'fallback',
       order_quote: '带工单也行', title: '供应商报价', promise: '输出分析'}, secondTurn))
     expect(repeated).toEqual(opened)

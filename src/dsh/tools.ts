@@ -124,7 +124,7 @@ function liaisonDialogueReceipt({ workspace, session, state, traceId, sourceMess
     sent: '原问题已发到' + target + '。' + (reason ? '后续处理遇到问题，可打开查看。' : '可打开查看后续回复。'),
     replied: target + '已收到本区成员回复，可以打开查看。',
     failed: target + '已保留。' + (reason ? '这次未能送达，原因是' + reason + '。' : '这次未能送达。'),
-    cancelled: target + '尚未投递的请求已取消，可以打开原对话核对。',
+    cancelled: target + '已停止补发。' + (reason ? reason + '。' : '') + '可以打开原对话核对。',
   }[state]
   return {workspace: {id: workspace.id, name: workspace.name}, session: {id: session.id, title: session.title},
     state, traceId, sourceMessageId, reason, workspaceActionOrigin: {originalRequestId, actionRequestId: requestId}, message: explanation}
@@ -229,7 +229,8 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
     const origin = deps.superhub?.ownerTurnOrigin(turn.source)
     const previous = original !== turn.source ? original : history.previous
     const previousOrigin = previous && deps.superhub?.ownerTurnOrigin(previous)
-    const space = args.action === 'cancel_session_request' && !hasWorkspaceTarget(args) ? undefined
+    const useSavedTarget = (args.action === 'session_status' || args.action === 'cancel_session_request') && !hasWorkspaceTarget(args)
+    const space = useSavedTarget ? undefined
       : workspaceTarget(deps.workspaceStore, args, {source: turn.source, history, original, context: origin?.context,
           previousContext: previousOrigin?.context, priorName}, required)
     const actionRequestId = args.request_source === 'receipt' ? history.actionRequestId ?? original.requestId : original.requestId
@@ -419,7 +420,7 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
     register({
       ...WORKSPACE_TOOL,
       parameters: { type: 'object', required: ['action'], properties: {
-        action: { type: 'string', enum: ['list', 'list_sessions', 'start_session', 'send_session', 'cancel_session_request', 'create', 'update_workspace', 'set_directory', 'assign', 'list_staff', 'remember_staff', 'remember_experience', 'list_orders', 'read_order', 'follow_order'] },
+        action: { type: 'string', enum: ['list', 'list_sessions', 'session_status', 'start_session', 'send_session', 'cancel_session_request', 'create', 'update_workspace', 'set_directory', 'assign', 'list_staff', 'remember_staff', 'remember_experience', 'list_orders', 'read_order', 'follow_order'] },
         ...workspaceTargetProperties,
         name: { type: 'string', description: '主人点名的工作区全名。create 用它命名。其他操作用它定位已有区。改名时新名称另用 new_name。' },
         query: { type: 'string', maxLength: 240, description: 'list 可用名称、目标或负责人的一段文字缩小范围。省略读取工作区清单。' },
@@ -503,6 +504,14 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
             sessions: sessions.slice(offset, offset + 40).map(session => ({id: session.id, title: session.title,
               traceId: store.assertActiveTrace(session), closed: session.closed, orderIds: session.delegationIds})),
             ...(offset + 40 < sessions.length && {nextOffset: offset + 40}), message: `「${space!.name}」有 ${sessions.length} 场对话。`}
+        }
+        if (args.action === 'session_status') {
+          const {space, original, actionRequestId} = workspaceSelection({...args,request_source:args.request_source ?? 'receipt'}, turn, false)
+          const recorded = await deps.workspaceDialogueStatus?.(actionRequestId)
+          assertCurrentOwner()
+          if (!recorded) return {message:'这项请求还没有普通对话回执。'}
+          if (space && space.id !== recorded.workspace.id) throw new Error('工作区与原请求回执不一致，请核对要打开的对话。')
+          return liaisonDialogueReceipt(recorded, original.requestId)
         }
         if (args.action === 'list_staff') {
           const {space} = workspaceSelection(args, turn, true)

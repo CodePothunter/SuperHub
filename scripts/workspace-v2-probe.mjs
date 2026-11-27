@@ -186,10 +186,11 @@ function response({ messages, sessionId, tools, system }) {
     const prior = messages.filter(m => m.role === 'user' && m.source?.kind === 'user').at(-2)
     const legacy = said(prior ?? {}).includes('补充材料最晚哪天交')
     const id = legacy ? 'resume-held-project-dialogue' : 'reuse-project-dialogue'
+    if (!legacy && !done(id)) return call(id,'chief_workspace',{action:'session_status'})
     if (!done(id)) return call(id,'chief_workspace',{
-      action:'start_session',name:'字节 Landing',title:legacy ? '补充材料核对' : '交接资料核对',
+      action:'start_session',name:'字节 Landing',title:'补充材料核对',
       request_source:'previous',target_source:'previous',
-      question:legacy ? '补充材料最晚哪天交？' : '交接前需要核对哪两项？',
+      question:'补充材料最晚哪天交？',
     })
     return text(toolMessage(id) ?? '会话未能续办。')
   }
