@@ -26,10 +26,10 @@ SuperHub 是 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 
 ### 1. 安装 SuperHub
 
-下载 `SuperHub-0.3.0.tgz`。在运行 DSH 的机器上，将命令里的路径换成安装包的实际位置。[SuperHub 0.3.0](https://github.com/CodePothunter/SuperHub/releases/tag/v0.3.0)
+下载 `SuperHub-0.3.1.tgz`。在运行 DSH 的机器上，将命令里的路径换成安装包的实际位置。[SuperHub 0.3.1](https://github.com/CodePothunter/SuperHub/releases/tag/v0.3.1)
 
 ```sh
-dsh plugin --profile web add /absolute/path/to/SuperHub-0.3.0.tgz
+dsh plugin --profile web add /absolute/path/to/SuperHub-0.3.1.tgz
 dsh web
 ```
 
