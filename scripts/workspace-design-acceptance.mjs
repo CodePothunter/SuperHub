@@ -213,6 +213,53 @@ async function checkLiveMotion(page,base,hash) {
   } finally { await page.unroute(sessionRead) }
 }
 
+export async function checkWorkspaceIconPicker({page,host,scope,custom,picture}) {
+  await page.bringToFront()
+  await button(navigation(page),'今天').click()
+  await button(page,'创建工作区').click()
+  const dialog = page.getByRole('dialog',{name:'创建工作区'})
+  const preview = dialog.locator('[data-workspace-icon-preview] img')
+  const expectIcon = async icon => {
+    await dialog.locator('[data-workspace-icon-preview] img[data-workspace-icon="'+icon+'"]').waitFor()
+    assert.deepEqual(await imageFacts(preview),{local:true,visible:true})
+  }
+  const name = custom ? '品牌Landing' : '新计划'
+  const goal = custom ? '跟进展示页的交付' : '整理每周睡眠和体检数据'
+  await expectIcon('project')
+  await dialog.getByLabel('工作区名称').fill(name)
+  await dialog.getByLabel('当前目标').fill(goal)
+  const auto = custom ? 'landing' : 'health'
+  await expectIcon(auto)
+  await button(dialog,'选择头像').click()
+  const avatars = dialog.locator('.v2-portrait-choices img')
+  assert.equal(await avatars.count(),14,'13 个独立图案及自动推荐')
+  assert.ok((await Promise.all((await avatars.all()).map(imageFacts))).every(item=>item.local && item.visible))
+  const chosen = dialog.getByRole('radio',{name:'预算与财务',exact:true})
+  await chosen.check()
+  await expectIcon('finance')
+  await dialog.getByLabel('当前目标').fill('记录每周招聘进度')
+  await expectIcon('finance')
+  await dialog.getByLabel('当前目标').fill(goal)
+  const automatic = dialog.getByRole('radio',{name:'自动推荐',exact:true})
+  await automatic.check()
+  // Radio selection also moves and updates the preview from the keyboard.
+  await automatic.focus()
+  await page.keyboard.press('ArrowRight')
+  assert.ok(await dialog.getByRole('radio',{name:'网页与设计',exact:true}).isChecked())
+  await expectIcon('landing')
+  if (custom) await chosen.check()
+  else await automatic.check()
+  const icon = custom ? 'finance' : auto
+  await expectIcon(icon)
+  await picture(page,custom ? 'workspace-avatar-choices' : 'mobile-workspace-avatar-choices')
+  await button(dialog,'创建并进入').click()
+  await title(page,name).waitFor()
+  const id = new URLSearchParams(new URL(page.url()).hash.slice(4)).get('workspace')
+  const {workspace} = await host.api('/v2/workspaces/' + id + '?scope=' + encodeURIComponent(scope))
+  assert.deepEqual([workspace.icon,workspace.iconMode],[icon,custom?'manual':'auto'])
+  return workspace
+}
+
 export async function checkWorkspaceDesign({desktop,mobile,host,scope,password,project,groupHash,codingHash,picture}) {
   const projects = [{...project,icon:'prototype'}]
   const longName = '跨团队交付与反馈的长期项目 ' + 'LongProjectName'.repeat(4)
@@ -228,6 +275,11 @@ export async function checkWorkspaceDesign({desktop,mobile,host,scope,password,p
   if (await login.isVisible()) {
     await login.fill(password)
     await button(mobile,'进入').click()
+  }
+  await desktop.setViewportSize({width:1440,height:900})
+  await mobile.setViewportSize({width:320,height:740})
+  for (const [page,custom] of [[desktop,true],[mobile,false]]) {
+    projects.push(await checkWorkspaceIconPicker({page,host,scope,custom,picture}))
   }
   let firstIcons,firstAvatars
   for (const [page,base,width,height] of [[desktop,host.base,1440,900],[desktop,host.base,850,900],

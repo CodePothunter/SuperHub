@@ -7,7 +7,8 @@ import type { ScheduleRow } from '../dsh/schedules.ts'
 import type { FollowupView } from '../core/workspace-followup.ts'
 import type { V2OrderOriginal } from '../core/workspace-v2.ts'
 import { isSpeakerId, isSpeakerPortraits } from '../core/workspace-avatars.ts'
-import { CODING_PERMISSIONS, DIRECTORY_SOURCE_LABEL, V2_DELIVERIES, V2_HELD, WORKSPACE_ICONS, type V2DirectorySuggestions, type V2MessageAction, type V2WorkDirectory } from '../core/workspace-v2.ts'
+import { isWorkspaceIcon } from '../core/workspace-icons.ts'
+import { CODING_PERMISSIONS, DIRECTORY_SOURCE_LABEL, V2_DELIVERIES, V2_HELD, type V2DirectorySuggestions, type V2MessageAction, type V2WorkDirectory } from '../core/workspace-v2.ts'
 
 type Row = Record<string, unknown>
 /** `personalWorkspaceId`: 「我的交办」, the liaison's default workspace (it cannot be archived); an older host leaves it out. */
@@ -19,7 +20,8 @@ const optionalText = (value: unknown) => value === undefined || typeof value ===
 
 function workspace(value: unknown): value is V2Workspace {
   return record(value) && strings(value, 'id', 'name', 'goal', 'owner', 'createdAt')
-    && (value.icon === undefined || WORKSPACE_ICONS.some(icon => icon === value.icon))
+    && (value.icon === undefined || isWorkspaceIcon(value.icon))
+    && (value.iconMode === undefined || value.iconMode === 'auto' || value.iconMode === 'manual')
     && optionalText(value.projectDirectory) && optionalText(value.projectDirectoryChangedAt) && optionalText(value.archivedAt)
 }
 export function workDirectory(value: unknown): value is V2WorkDirectory {

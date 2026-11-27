@@ -126,14 +126,14 @@ function seeded() {
 describe('下线旧工单', () => {
   it('打开工作区即隐藏旧单，正常保存仍保有后续清理的来源', () => {
     const f = seeded()
-    const before = f.read(f.boardPath)
+    const before = f.json<Record<string, unknown> & {workspaces: Array<Record<string,unknown>>}>(f.boardPath)
     const board = new WorkspaceV2Store(f.root,f.scope)
     expect(board.view(f.workspaceId).orders.map(order => order.id)).toEqual(['v2-open','v2-closed'])
     expect(board.view(f.workspaceId).sessions.map(session => session.id)).toEqual([f.sessionId])
     expect(board.session(f.workspaceId,f.sessionId).delegationIds).toEqual(['v2-open','v2-closed'])
     expect(() => board.delegation(f.workspaceId,'T-0001')).toThrow('没有这张工单')
     expect(board.receipt({id:'old',key:'req-old',hash:'old'})).toBeUndefined()
-    expect(f.read(f.boardPath)).toBe(before)
+    expect(f.json(f.boardPath)).toEqual({...before,workspaces:before.workspaces.map(workspace=>({...workspace,icon:'project',iconMode:'auto'}))})
     board.setSessionClosed(mutationKey(['test','close'],{requestId:'close'}),f.workspaceId,f.sessionId,true)
     expect(new WorkspaceV2Store(f.root,f.scope).session(f.workspaceId,f.sessionId).closed).toBe(true)
     expect(cleanupLegacyOrders(f.root).ticketIds).toEqual(['T-0001','T-0042'])

@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { orderEnded, workspaceArchived, type V2Acceptance, type V2Delegation, type V2Session, type V2Workspace, type V2WorkspaceView } from '../core/workspace-v2.ts'
+import { recommendWorkspaceIcon, type WorkspaceIcon as WorkspaceIconId } from '../core/workspace-icons.ts'
 import { historyItemId } from '../core/workspace-history.ts'
 import { SUPERHUB_SURFACES, type SuperhubSurface } from '../core/workspace-product.ts'
 import type { Scoped } from './superhub-api.ts'
 import { WorkspaceMark } from './workspace-brand.tsx'
-import { WorkspaceIcon } from './workspace-icon.tsx'
+import { WorkspaceIcon, WorkspaceIconPicker } from './workspace-icon.tsx'
 import hubEmblem from './artwork/hub-fold.webp'
 import { clearV2PrivateCache, resourceQuery, segment, useV2Read, useV2Write, V2Client, V2_ROOT } from './workspace-v2-api.ts'
 import { ArchivedWorkspace, delegationState, Issue, readableTime, sessionKind, useArchived, V2Dialog, V2Icon } from './workspace-v2-elements.tsx'
@@ -410,7 +411,7 @@ export function V2Brand({home}: {home: () => void}) {
 
 function WorkspaceRow({space, open}: {space: V2Workspace; open: (id: string) => void}) {
   return <button type="button" className="v2-space-card" data-workspace-id={space.id} onClick={() => open(space.id)}>
-    <WorkspaceIcon workspace={space}/>
+    <WorkspaceIcon icon={space.icon ?? recommendWorkspaceIcon(space.name, space.goal)}/>
     <span className="v2-space-description"><strong>{space.name}</strong>{space.goal && <small>{space.goal}</small>}
       {space.archivedAt && <small>已归档 · {archivedTime(space.archivedAt)}</small>}</span>
     <span className="v2-open">进入工作区<V2Icon name="next"/></span>
@@ -629,12 +630,19 @@ const field = (data: FormData, key: string) => String(data.get(key) ?? '').trim(
 
 function CreateSpace({ close, done }: { close: () => void; done: (id: string) => Promise<void> }) {
   const write = useV2Write()
+  const [name,setName] = useState('')
+  const [goal,setGoal] = useState('')
+  const [icon,setIcon] = useState<WorkspaceIconId>()
   return <V2Dialog title="创建工作区" close={close}><form onSubmit={async event => {
     const data = values(event)
-    const result = await write.post<Scoped & { workspace: V2Workspace }>(V2_ROOT, { name: field(data,'name'), goal: field(data,'goal'), owner: field(data,'owner') })
+    const result = await write.post<Scoped & { workspace: V2Workspace }>(V2_ROOT, {
+      name: field(data,'name'), goal: field(data,'goal'), owner: field(data,'owner'), ...(icon && {icon}),
+    })
     if (result) await done(result.workspace.id)
-  }}><label>工作区名称<input name="name" required maxLength={160} placeholder="例如，产品研发"/></label>
-    <label>当前目标（选填）<textarea name="goal" maxLength={4000} placeholder="你希望团队达成什么结果？"/></label>
+  }}><label>工作区名称<input name="name" required maxLength={160} placeholder="例如，产品研发" value={name} onChange={event=>setName(event.target.value)}/></label>
+    <label>当前目标（选填）<textarea name="goal" maxLength={4000} placeholder="你希望团队达成什么结果？"
+      value={goal} onChange={event=>setGoal(event.target.value)}/></label>
+    <WorkspaceIconPicker recommendation={recommendWorkspaceIcon(name,goal)} selected={icon} choose={setIcon} disabled={write.busy}/>
     <label>负责人<input name="owner" required maxLength={160} defaultValue="我"/></label><Issue text={write.error}/>
     <button className="v2-button primary" disabled={write.busy}>{write.busy ? '正在创建…' : '创建并进入'}</button></form></V2Dialog>
 }

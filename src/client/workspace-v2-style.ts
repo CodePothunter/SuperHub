@@ -109,6 +109,14 @@ body[data-ds-dark-theme]:not([data-chief-standalone]) .wv2 { ${darkPalette} }
 .wv2 .v2-space-grid { display:grid; grid-template-columns:minmax(0,1fr); }
 .wv2 .v2-space-card { display:grid; grid-template-columns:38px minmax(0,1fr) auto; align-items:center; gap:12px; width:100%; min-height:64px; padding:12px 2px; text-align:left; border-bottom:1px solid var(--v-soft); }
 .wv2 .v2-tile-mark { display:block; width:38px; height:40px; object-fit:contain; }
+.wv2 .v2-space-icon-preview { display:flex; align-items:center; gap:10px; padding:3px 0; }
+.wv2 .v2-space-icon-preview>div { flex:1; min-width:0; }
+.wv2 .v2-space-icon-preview strong,.wv2 .v2-space-icon-preview small { display:block; }
+.wv2 .v2-space-icon-preview small { color:var(--v-muted); font-size:12px; }
+.wv2 .v2-space-icon-preview .v2-link { flex:none; }
+.wv2 .v2-space-icon-picker .v2-portrait-choices { margin-top:8px; }
+.wv2 .v2-space-icon-picker .v2-portrait-choices label { font-size:12px; text-align:center; }
+.wv2 .v2-space-icon-picker .v2-portrait-choices .v2-tile-mark { width:31px; height:32px; }
 .wv2 .v2-space-description { min-width:0; overflow-wrap:anywhere; }
 .wv2 .v2-space-description strong { display:block; font:630 16px/1.5 var(--v-font); }
 .wv2 .v2-space-description small { display:block; margin-top:2px; color:var(--v-muted); font-size:13px; }

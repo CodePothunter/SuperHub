@@ -3,13 +3,11 @@ import type { EngagementReporting } from './workspace-engagement.ts'
 import type { SpeakerPortraits } from './workspace-avatars.ts'
 import type { ChatInputAttachment } from './chat-attachments.ts'
 import type { SavedOrderResults } from './workspace-notices.ts'
+import type { WorkspaceIcon } from './workspace-icons.ts'
 
 /** Public SuperHub 2.0 objects. Native handles and filesystem paths stay with the source. */
 export type V2Executor = 'codex' | 'claude-code' | 'dsh'
 export type V2DelegationAction = 'pause' | 'resume' | 'narrow' | 'cancel' | 'complete' | 'reopen'
-
-export const WORKSPACE_ICONS = ['prototype', 'recorder', 'report'] as const
-export type WorkspaceIcon = typeof WORKSPACE_ICONS[number]
 
 export interface V2Workspace {
   id: string
@@ -18,6 +16,8 @@ export interface V2Workspace {
   owner: string
   createdAt: string
   icon?: WorkspaceIcon
+  /** Older boards only have the icon assigned by the original three-image catalogue. */
+  iconMode?: 'auto' | 'manual'
   /**
    * Absolute, resolved project directory where this workspace's Codex and Claude Code orders run by default. Absent: the
    * SuperHub working directory of each session (older workspaces included). A change applies from the next turn.
@@ -47,18 +47,6 @@ export interface V2DirectorySuggestion { path: string; name: string; bindable: b
 export interface V2DirectorySuggestions { parent: string; home: string; entries: V2DirectorySuggestion[]; more: boolean; issue?: string }
 /** A coding turn waits for another turn using the same project directory (`title` names that order or conversation). */
 export interface V2DirectoryWait { workOrderId?: string; sessionId: string; title: string }
-
-/** Choose once when the workspace is created or an older board is opened. */
-export function defaultWorkspaceIcon(id: string, name: string): WorkspaceIcon {
-  switch (name.trim()) {
-    case '产品研发': return 'prototype'
-    case '客户访谈': return 'recorder'
-    case '研究周报': return 'report'
-  }
-  let hash = 0
-  for (const character of id) hash = (Math.imul(31, hash) + character.codePointAt(0)!) >>> 0
-  return WORKSPACE_ICONS[hash % WORKSPACE_ICONS.length]!
-}
 
 export interface V2Delegation {
   /** Stable identity of a staff member entrusted with this order. */

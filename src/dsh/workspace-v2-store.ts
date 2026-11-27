@@ -4,7 +4,8 @@ import type { ChatInputAttachment } from '../core/chat-attachments.ts'
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { V2Acceptance, V2CodingPermission, V2Decision, V2Delegation, V2DialogueSource, V2DirectorySuggestions, V2DirectoryWait, V2Executor, V2Held, V2Message, V2MessageAction, V2OrderOriginal, V2PermissionChange, V2Session, V2WorkDirectory, V2Workspace, V2WorkspaceView } from '../core/workspace-v2.ts'
-import { CODING_PERMISSIONS, WORKSPACE_ARCHIVED, codingPermission, defaultWorkspaceIcon, messageWorkOrder, orderEnded, workspaceArchived } from '../core/workspace-v2.ts'
+import { CODING_PERMISSIONS, WORKSPACE_ARCHIVED, codingPermission, messageWorkOrder, orderEnded, workspaceArchived } from '../core/workspace-v2.ts'
+import { isWorkspaceIcon, recommendWorkspaceIcon, type WorkspaceIcon } from '../core/workspace-icons.ts'
 import { nextSlot } from '../core/clock.ts'
 import type { IntakeContext } from '../core/superhub-intake.ts'
 import { workspaceError, workspaceFingerprint } from './superhub-goals.ts'
@@ -571,9 +572,18 @@ function assignmentId(action: 'assign' | 'signup' | 'staff', sourceId: string) {
   return createHash('sha256').update(action + ':' + sourceId).digest('hex')
 }
 
-function newWorkspace(name: string, goal: string, owner: string, projectDirectory?: string): V2Workspace {
+const needsWorkspaceIcon = (space: V2Workspace) =>
+  !isWorkspaceIcon(space.icon) || (space.iconMode !== 'auto' && space.iconMode !== 'manual')
+
+function recommendIcon(space: V2Workspace) {
+  space.icon = recommendWorkspaceIcon(space.name, space.goal)
+  space.iconMode = 'auto'
+}
+
+function newWorkspace(name: string, goal: string, owner: string, projectDirectory?: string, icon?: WorkspaceIcon): V2Workspace {
   const id = randomUUID(), at = now()
-  return { id, name, goal, owner, createdAt: at, icon: defaultWorkspaceIcon(id, name), ...(projectDirectory && {projectDirectory, projectDirectoryChangedAt: at}) }
+  return { id, name, goal, owner, createdAt: at, icon: icon ?? recommendWorkspaceIcon(name, goal), iconMode: icon ? 'manual' : 'auto',
+    ...(projectDirectory && {projectDirectory, projectDirectoryChangedAt: at}) }
 }
 const CODING_ONLY = '项目目录只用于 Codex 或 Claude Code 的编程工单'
 const GROUP_DIRECTORY = '本单的项目目录只能在开新群时指定：群里的成员共用一个目录，请新开一张工单（不选现有会话）'
@@ -686,12 +696,21 @@ export class WorkspaceV2Store {
     this.rules = {brainRoot: root, internal: options.internal ?? [], ...options.directoryRules}
     this.file = join(root, workspaceBoardFile(scope))
     this.board = existsSync(this.file) ? parseBoard(readFileSync(this.file, 'utf8')) : newBoard()
+    // An artwork-only write must not persist the filtered view of legacy orders.
+    if (this.board.workspaces.some(needsWorkspaceIcon)) this.commit(board => {
+      for (const space of board.workspaces) if (needsWorkspaceIcon(space)) recommendIcon(space)
+      for (const receipt of Object.values(board.receipts)) {
+        if (receipt.kind === 'mutation' && 'workspace' in receipt.result) {
+          const snapshot = receipt.result.workspace
+          if (typeof snapshot.name === 'string' && typeof snapshot.goal === 'string' && needsWorkspaceIcon(snapshot)) recommendIcon(snapshot)
+        }
+      }
+    })
     const retired = retireLegacyOrders(this.board,scope)
     this.retiredOrderIds = new Set(retired.orders.map(order => order.id))
     const unfinished = Object.values(this.board.receipts).some(r => r.kind === 'turn' && r.state === 'pending' || r.kind === 'interject' && r.state === 'steering')
-    if (unfinished || this.board.schema === 1 || this.board.workspaces.some(space => !space.icon)) this.commit(board => {
+    if (unfinished || this.board.schema === 1) this.commit(board => {
       if (board.schema === 1) migrateBoard(board)
-      for (const space of board.workspaces) space.icon ??= defaultWorkspaceIcon(space.id, space.name)
       for (const receipt of Object.values(board.receipts)) {
         if (receipt.kind === 'turn' && receipt.state === 'pending') {
           this.settle(board, receipt, 'unknown')
@@ -1792,6 +1811,8 @@ export class WorkspaceV2Store {
   createWorkspace(mutation: Mutation, body: Body, reuseName = false) {
     return this.write(mutation, board => {
       const name = field(body.name, '工作区名称', 160)
+      const icon = body.icon
+      if (icon !== undefined && !isWorkspaceIcon(icon)) return workspaceError(400, '请选择可用的工作区头像')
       if (reuseName) {
         const matches = board.workspaces.filter(space => space.name.normalize('NFC') === name.normalize('NFC'))
         if (matches.length > 1) return workspaceError(409, '已有多份同名工作区，请先列出工作区，请主人按目标或负责人选择。')
@@ -1800,7 +1821,8 @@ export class WorkspaceV2Store {
       }
       const goal = body.goal === '' || body.goal === undefined ? '' : field(body.goal, '工作区目标', 4000)
       const requested = directoryInput(body.directory)
-      const workspace = newWorkspace(name, goal, field(body.owner, '负责人', 160, '工作区负责人'), requested === undefined ? undefined : this.checkDirectory(requested))
+      const workspace = newWorkspace(name, goal, field(body.owner, '负责人', 160, '工作区负责人'),
+        requested === undefined ? undefined : this.checkDirectory(requested), icon)
       if (workspace.projectDirectory) (board.directoryChanges ??= []).push({workspaceId: workspace.id, at: workspace.createdAt, to: workspace.projectDirectory})
       board.workspaces.push(workspace)
       return reuseName ? { workspace, outcome: 'created' } : { workspace }
@@ -1822,6 +1844,7 @@ export class WorkspaceV2Store {
         if (expected?.goal !== undefined && workspace.goal !== expected.goal) return workspaceError(409, '工作区目标刚刚已变更，请核对当前目标')
         workspace.goal = body.goal === '' ? '' : field(body.goal, '工作区目标', 4000)
       }
+      if (workspace.iconMode !== 'manual') recommendIcon(workspace)
       return { workspace }
     })
   }
