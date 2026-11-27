@@ -56,10 +56,20 @@ export async function checkConversationEdits({host, desktop, mobile, scope, work
   const address = mobile.url()
   const anchor = mobile.locator(anchorSelector)
   const pencil = button(anchor,'编辑历史消息')
-  await pencil.waitFor()
-  const target = await pencil.boundingBox()
-  assert.ok(target.width >= 44 && target.height >= 44)
-  await pencil.click()
+  const mobileSize = mobile.viewportSize()
+  for (const width of [320, mobileSize.width]) {
+    await mobile.setViewportSize({...mobileSize,width})
+    await pencil.waitFor()
+    const target = await pencil.boundingBox()
+    const bubble = await anchor.locator('.v2-bubble').boundingBox()
+    assert.ok(target.width >= 44 && target.height >= 44)
+    const gap = bubble.x - target.x - target.width
+    assert.ok(gap >= 0 && gap <= 8 && Math.abs(bubble.y - target.y) <= 2,
+      `${width}px 下编辑按钮应贴着消息气泡左上边，间距 ${gap}px`)
+  }
+  await pencil.scrollIntoViewIfNeeded()
+  await picture?.(mobile,'mobile-edit-button')
+  await pencil.tap()
   const editor = messageEditor(anchor)
   const field = editor.getByLabel('消息正文')
   assert.equal(await field.inputValue(), before)
