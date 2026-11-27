@@ -34,6 +34,14 @@ describe('workspace engagement decisions', () => {
       .toMatchObject({kind: 'wait', reason: '等材料'})
   })
 
+  it('accepts only owner questions or no action for an ordinary group completion', () => {
+    const check = (value: object) => parseEngagement(JSON.stringify(value), {...input, ownerQuestionCheck: true})
+    expect(check({kind: 'ask', text: '用哪个版本？', sourceSeq: 5})).toMatchObject({kind: 'ask', sourceSeq: 5})
+    expect(check({kind: 'none'})).toEqual({kind: 'none'})
+    expect(check({kind: 'continue', memberIds: ['reviewer'], text: '校对全文'})).toBeUndefined()
+    expect(check({kind: 'deliver', text: '汇报草案'})).toBeUndefined()
+  })
+
   it('gives the liaison model only scoped evidence and accepts chunked decisions', async () => {
     const stream = vi.fn<Llm['stream'] & {}>(async function* () {
       yield {type: 'text-delta', text: '{"kind":"continue",'}

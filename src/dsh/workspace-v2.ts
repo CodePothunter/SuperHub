@@ -962,6 +962,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
   }
   groups?.attach({
     holdOrderWakes: !!review,
+    checkOwnerQuestions: !!coordinate,
     ...(coordinate && {engage: (session: V2Session, orderId: string | undefined, memberId?: string) => {
       if (!orderId) return memberId === LIAISON_MEMBER_ID ? {} : undefined
       try {
@@ -1035,12 +1036,12 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     if (last <= from) return
     const active = store.traceState(session).active
     const jobs = lines.flatMap((line): EngagementJob[] => {
-      if (line.seq <= from || !line.engagement || (line.traceId ?? INITIAL_WORKSPACE_TRACE) !== active) return []
+      if (line.seq <= from || (!line.engagement && !line.ownerQuestionCheck) || (line.traceId ?? INITIAL_WORKSPACE_TRACE) !== active) return []
       const source = line.engagement
       return [{id: 'handoff-' + workspaceFingerprint([session.id,line.seq]).slice(0, 40), workspaceId: session.workspaceId,
-        sessionId: session.id, traceId: active, seq: line.seq, orderId: line.workOrderId, generation: source.generation,
-        triggerSeq: source.triggerSeq, turn: line.speakerId === OWNER_ID ? 'owner' : line.speakerId === LIAISON_MEMBER_ID ? 'liaison' : 'member',
-        answerTo: source.answerTo, memberId: source.memberId}]
+        sessionId: session.id, traceId: active, seq: line.seq, orderId: line.workOrderId, generation: source?.generation,
+        triggerSeq: source?.triggerSeq ?? line.replyTo, turn: line.speakerId === OWNER_ID ? 'owner' : line.speakerId === LIAISON_MEMBER_ID ? 'liaison' : 'member',
+        answerTo: source?.answerTo, memberId: source?.memberId ?? (line.ownerQuestionCheck ? line.speakerId : undefined)}]
     })
     store.queueEngagement(jobs)
     engagementScanned.set(session.id, last)
@@ -1087,6 +1088,8 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     if (!store.engagementActive(job.id)) { store.closeEngagement(job.id); return }
     const line = engine.ledger.get(job.seq)
     if (!line) { store.closeEngagement(job.id); return }
+    const ownerQuestionCheck = line.ownerQuestionCheck
+    if (ownerQuestionCheck && job.decision) { store.closeEngagement(job.id); return }
     const triggerSeq = job.triggerSeq ?? job.seq
     let routed = job
     if (!job.decision) {
@@ -1096,6 +1099,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       const {lines: history, gaps} = engine.projectLiaisonGaps(engine.ledger.all().filter(row => row.kind !== 'progress' &&
         (row.workOrderId === job.orderId || row.seq === job.triggerSeq)), triggerSeq, job.orderId)
       const visibleLine = history.find(row => row.seq === line.seq)
+      if (ownerQuestionCheck && (!visibleLine || gaps.some(gap => gap.seq === line.seq))) { store.closeEngagement(job.id); return }
       const source = visibleLine ?? {...line, text: '（宿主说明）这条发言依据的经验已停用、已更新或无法核对，接口人不能读取原文。这不是主人能在群里授权解除的限制。',
         attachments: undefined, inputAttachments: undefined, quote: undefined}
       // Re-checked after the model call; the liaison's own lines carry only the versions it may use itself.
@@ -1107,17 +1111,19 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       const sourceLine = engagementMessage(session, source, visibleLine ? evidence : new Map())
       const recent = history.slice(-16)
       const earlier = history.slice(0, -16).filter(row => row.seq === job.triggerSeq || order &&
-        (row.engagement || row.speakerId === OWNER_ID || row.quote || evidence.has(lineId(row.seq)))).slice(-64)
-      const pending = store.ownerActions(session.id, job.orderId)
+        (row.engagement || row.speakerId === OWNER_ID || row.quote || evidence.has(lineId(row.seq))) ||
+        ownerQuestionCheck && (row.speakerId === OWNER_ID || row.quote)).slice(-64)
+      const pending = store.ownerActions(session.id, job.orderId).filter(row => !ownerQuestionCheck || row.orderId === undefined)
       // The owner chose this item to answer: the reply settles it, the model only picks the next step.
       const answered = job.turn === 'owner' && job.answerTo ? pending.find(row => row.id === job.answerTo) : undefined
       const activeMembers = engine.workInFlight()
-      const latestOwnerSeq = () => engine.ledger.all().findLast(row => row.speakerId === OWNER_ID && row.workOrderId === job.orderId)?.seq
+      const latestOwnerSeq = () => engine.ledger.all().findLast(row => row.workOrderId === job.orderId &&
+        (row.speakerId === OWNER_ID || ownerQuestionCheck && row.speakerId === LIAISON_MEMBER_ID && row.quote))?.seq
       const ownerSeen = latestOwnerSeq()
       let decision: EngagementDecision
       try {
         const signal = AbortSignal.any([reviews.signal, AbortSignal.timeout(ACCEPTANCE_TIMEOUT_MS)])
-        decision = await coordinate!({turn: job.turn, source: sourceLine,
+        decision = await coordinate!({turn: job.turn, ...ownerQuestionCheck && {ownerQuestionCheck}, source: sourceLine,
           messages: [...earlier.map(row => engagementMessage(session, row, evidence, false)), ...recent.map(row => engagementMessage(session, row, evidence))],
           ...(order && {order: {id: order.id, title: order.title, promise: order.promise, original: original || order.promise, reporting: order.reporting,
             generation: order.generation, remainingTurns: order.remainingTurns}}),
@@ -1131,6 +1137,16 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
       }
       if (disposed || !store.engagementActive(job.id) || (job.turn !== 'owner' && ownerSeen !== latestOwnerSeq())) return
       if (!engine.canUseLiaisonExperience(readableRefs, triggerSeq, job.orderId)) return
+      if (ownerQuestionCheck) {
+        // Ordinary group scheduling already handled the mentions. Check only the owner's question, anchored to the member's reply.
+        if (!engine.projectLiaisonHistory([line], triggerSeq, job.orderId).length) { store.closeEngagement(job.id); return }
+        const text = decision.kind === 'ask' && decision.text?.trim()
+        const alreadyPending = pending.some(row => decision.sourceSeq !== undefined && row.messageId === lineId(decision.sourceSeq))
+        if (text && !alreadyPending) store.recordEngagement(job, {kind: 'ask', text, experienceRefs}, line)
+        else store.recordEngagement(job, {kind: 'none'})
+        store.closeEngagement(job.id)
+        return
+      }
       // Only the liaison's own question can repeat an unreadable-result obstacle; the host's quota and loop questions stand.
       const modelAsk = decision.kind === 'ask' ? decision : undefined
       const selected = new Set(engine.members().map(member => member.id))

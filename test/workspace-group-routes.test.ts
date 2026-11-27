@@ -229,6 +229,205 @@ describe('群成员的成长记录', () => {
 
 describe('工作交接', () => {
   const waitFor = (check: () => void | Promise<void>) => vi.waitFor(check, {timeout: 3000, interval: 15})
+  const samplingQuestion = '请确认采样的时间范围和区县。'
+  const samplingReport = '阶段回报\n已核对来源目录。继续计算前需要主人确认采样的时间范围和区县。'
+  const globalPending = async (f: ReturnType<typeof fixture>) =>
+    (await f.call<{items: OwnerAction[]}>('/owner-actions', undefined, true)).data.items
+
+  it.each(['接口人从私聊转交', '主人直接点名', '幕僚接力'])('%s时，幕僚的两个缺项合在一条待回应里', async entry => {
+    const coordinate = vi.fn<EngagementCoordinator>(async ({source}) =>
+      source.text === samplingReport ? {kind: 'ask', text: samplingQuestion} : {kind: 'none'})
+    const f = fixture({coordinate})
+    const ws = await f.workspace()
+    const original = {requestId: 'check-sampling', messageId: 'private-check-sampling', text: '请研究员核对采样目录。'}
+    const session = entry === '接口人从私聊转交'
+      ? (await f.route().liaisonDialogue({mode: 'start', workspaceId: ws.id, staffId: 'researcher', title: '采样目录',
+        original, source: original, conversationId: 'private-liaison', question: original.text})).session
+      : await f.group(ws)
+    if (entry === '主人直接点名') await f.say(session, '@研究员 请核对采样目录')
+    if (entry === '幕僚接力') {
+      await f.say(session, '@工程师 请协调核对采样目录')
+      await waitFor(() => expect(f.codex.count('engineer')).toBe(1))
+      f.codex.answer('engineer', '@研究员 请核对采样目录。', false)
+    }
+    await waitFor(() => expect(f.dsh.count('researcher')).toBe(1))
+    expect(f.dsh.last('researcher').call.workOrderId).toBeUndefined()
+    f.dsh.answer('researcher', samplingReport, false)
+    await waitFor(async () => expect(await globalPending(f)).toHaveLength(1))
+
+    const [action] = await globalPending(f)
+    expect(action).toMatchObject({sessionId: session.id, workspaceId: ws.id, question: samplingQuestion})
+    expect(action!.orderId).toBeUndefined()
+    expect((await f.view(session)).data.messages.filter(row => row.kind === 'message' && row.author === '研究员'))
+      .toEqual([expect.objectContaining({id: action!.messageId, text: samplingReport})])
+    expect(coordinate.mock.calls.filter(([input]) => input.source.text === samplingReport)).toHaveLength(1)
+    expect(f.store().view(ws.id).orders).toEqual([])
+
+    f.restart()
+    expect(await globalPending(f)).toEqual([action])
+    const reply = {requestId: 'confirm-sampling', text: '上周五 8 到 9 点，在云州区。'}
+    const path = '/owner-actions/' + action!.id + '/reply'
+    expect((await f.call(path, reply, true)).status).toBe(200)
+    await waitFor(async () => expect(await globalPending(f)).toEqual([]))
+    expect((await f.call(path, reply, true)).status).toBe(200)
+    expect((await f.view(session)).data.messages.filter(row => row.text === reply.text)).toHaveLength(1)
+  })
+
+  it.each([true, false])('同文进度和终稿里的同事只接力一次（还需主人答复 %s）', async needsOwner => {
+    const teammateRequest = '@工程师 请核实计算方法。'
+    const report = needsOwner ? teammateRequest + '\n' + samplingReport : teammateRequest
+    const coordinate = vi.fn<EngagementCoordinator>(async () => needsOwner ? {kind: 'ask', text: samplingQuestion} :
+      {kind: 'continue', text: '再派同事一次', memberIds: ['engineer']})
+    const f = fixture({coordinate})
+    const ws = await f.workspace(), session = await f.group(ws)
+    await f.say(session, '@研究员 请核对采样目录')
+    await waitFor(() => expect(f.dsh.count('researcher')).toBe(1))
+    const {call, sink} = f.dsh.last('researcher')
+    sink.stepped(call.callId, report)
+    await waitFor(() => expect(f.codex.count('engineer')).toBe(1))
+    expect(coordinate).not.toHaveBeenCalled()
+    expect(await globalPending(f)).toEqual([])
+    f.dsh.answer('researcher', report, false)
+    await waitFor(() => expect(coordinate).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(f.store().pendingEngagement()).toEqual([]))
+
+    const ledger = f.host().loaded(session.id)!.ledger.all()
+    const source = ledger.find(row => row.kind === 'message' && row.memberCallId === call.callId)!
+    expect(source).toMatchObject({ownerQuestionCheck: true, memberCompleted: true, text: report})
+    expect(coordinate.mock.calls[0]![0]).toMatchObject({ownerQuestionCheck: true, source: {seq: source.seq}})
+    expect(await globalPending(f)).toEqual(needsOwner ?
+      [expect.objectContaining({messageId: 'g-' + source.seq, question: samplingQuestion})] : [])
+    expect(f.codex.count('engineer')).toBe(1)
+    expect((await f.view(session)).data.group.members.find(row => row.id === 'engineer')?.queued).toBe(0)
+  })
+
+  it('主人在判断期间答了问题时复核最新原话，已解决的问题不登记', async () => {
+    const ownerAnswer = '上周五 8 到 9 点，在云州区。'
+    const stale = Promise.withResolvers<EngagementDecision>()
+    const coordinate = vi.fn<EngagementCoordinator>(async input => {
+      if (!input.ownerQuestionCheck) return {kind: 'none'}
+      return input.messages.some(row => row.speakerId === 'owner' && row.text === ownerAnswer) ? {kind: 'none'} : stale.promise
+    })
+    const f = fixture({coordinate})
+    const ws = await f.workspace(), session = await f.group(ws)
+    await f.say(session, '@研究员 核对来源目录')
+    await waitFor(() => expect(f.dsh.count('researcher')).toBe(1))
+    f.dsh.answer('researcher', samplingReport, false)
+    await waitFor(() => expect(coordinate).toHaveBeenCalledTimes(1))
+    expect((await f.say(session, ownerAnswer)).status).toBe(200)
+    expect(await globalPending(f)).toEqual([])
+    stale.resolve({kind: 'ask', text: samplingQuestion})
+    await waitFor(() => expect(coordinate).toHaveBeenCalledTimes(2))
+    expect(coordinate.mock.calls[1]![0].messages).toContainEqual(expect.objectContaining({speakerId: 'owner', text: ownerAnswer}))
+    await waitFor(() => expect(f.store().pendingEngagement()).toEqual([]))
+    expect(await globalPending(f)).toEqual([])
+  })
+
+  it('重启补判已入账但未入队的新回报，跳过旧回报和未完成的提问', async () => {
+    const coordinate = vi.fn<EngagementCoordinator>(async ({source}) => ({kind: 'ask', text: source.text}))
+    const f = fixture({coordinate})
+    const ws = await f.workspace(), session = await f.group(ws)
+    const engine = await f.host().engine(session)
+    const old = engine.ledger.say({kind: 'message', speakerId: 'researcher', author: '研究员',
+      text: '旧报告需要补充采样时间。', memberCallId: 'pre-upgrade', memberCompleted: true})
+    const statuses = ['cancelled', 'failed', 'completed'] as const
+    for (const [index, status] of statuses.entries()) {
+      await f.say(session, '@研究员 核对来源目录')
+      await waitFor(() => expect(f.dsh.count('researcher')).toBe(index + 1))
+      const {call, sink} = f.dsh.last('researcher')
+      sink.stepped(call.callId, samplingReport)
+      sink.finished(call.callId, {status, text: '', toolCalls: 0})
+    }
+    expect(coordinate).not.toHaveBeenCalled()
+    expect(engine.ledger.all().some(row => row.ownerQuestionCheck)).toBe(false)
+    await f.say(session, '@研究员 核对下一批目录')
+    await waitFor(() => expect(f.dsh.count('researcher')).toBe(statuses.length + 1))
+    vi.spyOn(f.store(), 'queueEngagement').mockImplementationOnce(() => { throw new Error('账本追加后一时无法写入队列') })
+    f.dsh.answer('researcher', samplingReport, false)
+    const source = engine.ledger.all().find(row => row.ownerQuestionCheck)!
+    expect(source.seq).toBeGreaterThan(old.seq)
+    expect(f.store().pendingEngagement()).toEqual([])
+    f.restart()
+    await waitFor(async () => expect(await globalPending(f)).toEqual([expect.objectContaining({messageId: 'g-' + source.seq})]))
+    expect(coordinate).toHaveBeenCalledTimes(1)
+    f.restart()
+    expect(await globalPending(f)).toEqual([expect.objectContaining({messageId: 'g-' + source.seq})])
+    expect(coordinate).toHaveBeenCalledTimes(1)
+  })
+
+  it('接口人读不到的普通群回报不进入提问判断', async () => {
+    const coordinate = vi.fn<EngagementCoordinator>(async () => ({kind: 'ask', text: samplingQuestion}))
+    const f = fixture({coordinate})
+    const ws = await f.workspace(), other = await f.workspace(), session = await f.group(ws)
+    f.staff().apply(other.id, {action: 'learn', staffId: 'engineer', text: '采样先核对时间范围和所属区县', requestId: f.id()})
+    const [experience] = f.staff().experienceMemories(other.id).filter(row => row.staffId === 'engineer')
+    f.staff().apply(other.id, {action: 'share', staffId: 'engineer', memoryId: experience!.id, sourceVersion: experience!.version,
+      targetWorkspaceId: ws.id, targetAudience: 'staff', targetStaffId: 'engineer', text: experience!.text, requestId: f.id()})
+    await f.say(session, '@工程师 核对采样时间范围和所属区县')
+    await waitFor(() => expect(f.codex.count('engineer')).toBe(1))
+    expect(f.codex.last('engineer').call.experience?.entries.some(row => row.shareId)).toBe(true)
+    f.codex.answer('engineer', samplingReport, false)
+    expect(f.host().loaded(session.id)!.ledger.all().find(row => row.ownerQuestionCheck)?.text).toBe(samplingReport)
+    await waitFor(() => expect(f.store().pendingEngagement()).toEqual([]))
+    expect(coordinate).not.toHaveBeenCalled()
+    expect(await globalPending(f)).toEqual([])
+  })
+
+  it('同群的工单问题和普通群问题各自登记，同范围的已有问题复用原事项', async () => {
+    const repeatReport = '复核后的第二次阶段汇报：同样需要确认采样时间和区县。'
+    const coordinate = vi.fn<EngagementCoordinator>(async ({source, pending}) => {
+      if (source.text === samplingReport) return {kind: 'ask', text: samplingQuestion}
+      if (source.text === repeatReport) return {kind: 'ask', text: '时间和区县该用哪个？',
+        sourceSeq: Number(pending[0]?.messageId.slice(2))}
+      return {kind: 'none'}
+    })
+    const f = fixture({coordinate})
+    const ws = await f.workspace(), session = await f.group(ws)
+    const {delegation} = f.route().assign('check-candidate-sampling', '核对归档的采样记录', undefined, ws.id, session.id,
+      {title: '归档检查', promise: '核实采样记录'}, 'engineer')
+    await waitFor(() => expect(f.codex.count('engineer')).toBe(1))
+    f.codex.answer('engineer', samplingReport, false)
+    await waitFor(async () => expect(await globalPending(f)).toMatchObject([{orderId: delegation.id, question: samplingQuestion}]))
+    expect(coordinate.mock.calls[0]![0].ownerQuestionCheck).toBeUndefined()
+
+    for (const [index, report] of [samplingReport, repeatReport].entries()) {
+      const original = {requestId: 'ordinary-sampling-' + index, messageId: 'private-ordinary-' + index, text: '请研究员另核对一批记录。'}
+      await f.route().liaisonDialogue({mode: 'send', workspaceId: ws.id, sessionId: session.id, staffId: 'researcher',
+        original, source: original, conversationId: 'private-liaison', question: original.text})
+      await waitFor(() => expect(f.dsh.count('researcher')).toBe(index + 1))
+      f.dsh.answer('researcher', report, false)
+      await waitFor(() => expect(coordinate).toHaveBeenCalledTimes(index + 2))
+      await waitFor(() => expect(f.store().pendingEngagement()).toEqual([]))
+    }
+    const [scoped, ordinary] = await globalPending(f)
+    expect(await globalPending(f)).toHaveLength(2)
+    expect(scoped!.orderId).toBe(delegation.id)
+    expect(ordinary!.orderId).toBeUndefined()
+    expect(ordinary!.question).toBe(samplingQuestion)
+    expect(coordinate.mock.calls[1]![0]).toMatchObject({ownerQuestionCheck: true, pending: []})
+    expect(coordinate.mock.calls[2]![0]).toMatchObject({ownerQuestionCheck: true, pending: [ordinary]})
+    const reply = {requestId: 'confirm-ordinary-sampling', text: '这批采用上周五 8 到 9 点，在云州区。'}
+    expect((await f.call('/owner-actions/' + ordinary!.id + '/reply', reply, true)).status).toBe(200)
+    await waitFor(async () => expect(await globalPending(f)).toEqual([scoped]))
+  })
+
+  it('同一群的两批采样即使缺项文案相同，也各有一条待回应', async () => {
+    const f = fixture({coordinate: async () => ({kind: 'ask', text: samplingQuestion})})
+    const ws = await f.workspace(), session = await f.group(ws)
+    const reports = ['甲批采样', '乙批采样'].map(batch => batch + '。' + samplingReport)
+    for (const [index, report] of reports.entries()) {
+      const original = {requestId: 'sampling-batch-' + index, messageId: 'private-sampling-batch-' + index, text: '请研究员核对第 ' + (index + 1) + ' 批采样。'}
+      await f.route().liaisonDialogue({mode: 'send', workspaceId: ws.id, sessionId: session.id, staffId: 'researcher',
+        original, source: original, conversationId: 'private-liaison', question: original.text})
+      await waitFor(() => expect(f.dsh.count('researcher')).toBe(index + 1))
+      f.dsh.answer('researcher', report, false)
+      await waitFor(() => expect(f.store().pendingEngagement()).toEqual([]))
+    }
+    const messages = (await f.view(session)).data.messages
+    const actions = await globalPending(f)
+    expect(actions.map(action => action.question)).toEqual([samplingQuestion, samplingQuestion])
+    expect(actions.map(action => messages.find(message => message.id === action.messageId)?.text)).toEqual(reports)
+  })
 
   it('无工单问题跨页面、跨重启保留，关联到有效答复之后解除', async () => {
     const question = '请确认本次调查采用哪个数据版本？'

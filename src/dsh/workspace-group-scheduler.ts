@@ -222,6 +222,7 @@ export interface GroupSchedulerOptions {
   /** 管理员派出的工单批次落地时先不叫它，由宿主验收（见 `wake` 效果的 `held`）。 */
   holdOrderWakes?: boolean
   engage?: (workOrderId: string | undefined, memberId?: string) => { generation?: number } | undefined
+  checkOwnerQuestions?: boolean
   canPublish?: (call: GroupCall) => boolean
 }
 
@@ -234,6 +235,7 @@ export class GroupScheduler {
   private readonly now: () => number
   private readonly holdOrderWakes: boolean
   private readonly engage: GroupSchedulerOptions['engage']
+  private readonly checkOwnerQuestions: boolean
   private readonly canPublish: GroupSchedulerOptions['canPublish']
   readonly limits: GroupLimits
 
@@ -243,6 +245,7 @@ export class GroupScheduler {
     this.now = options.now ?? Date.now
     this.holdOrderWakes = options.holdOrderWakes === true
     this.engage = options.engage
+    this.checkOwnerQuestions = options.checkOwnerQuestions === true
     this.canPublish = options.canPublish
     this.limits = { ...GROUP_LIMITS, ...options.limits }
     this.state = options.state ? clone(options.state) : emptyGroupSchedulerState()
@@ -581,7 +584,8 @@ export class GroupScheduler {
   }
 
   /** 以成员身份写一行并处理其中的 `@`。 */
-  private post(call: GroupCall, kind: 'message' | 'progress', text: string, effects: GroupEffect[], terminal?: { substantiveReply: boolean }) {
+  private post(call: GroupCall, kind: 'message' | 'progress', text: string, effects: GroupEffect[],
+    terminal?: {substantiveReply: boolean; ownerQuestionCheck: boolean; repeated?: true}) {
     if (this.canPublish && !this.canPublish(call)) return
     const member = this.member(call.memberId)!
     const { ids, all } = parseMentions(text, this.members, { except: member.id })
@@ -592,10 +596,11 @@ export class GroupScheduler {
       ...call.workOrderId !== undefined && { workOrderId: call.workOrderId },
       ...call.batchId !== undefined && { batchId: call.batchId },
       ...terminal?.substantiveReply && { memberCompleted: true as const },
+      ...terminal?.ownerQuestionCheck && { ownerQuestionCheck: true as const },
       ...terminal && call.engagement && { engagement: { callId: call.id, triggerSeq: call.triggerSeq, memberId: call.memberId, by: call.by, ...call.engagement } },
     })
     call.posted.push(line.seq)
-    if (!this.retired && !call.engagement) this.callFrom(call, text, line.seq, effects)
+    if (!this.retired && !call.engagement && !terminal?.repeated) this.callFrom(call, text, line.seq, effects)
     return line
   }
 
@@ -713,9 +718,11 @@ export class GroupScheduler {
     const repeated = reply !== '' && (reply === call.lastLine || (held === '' && reply === call.lastPosted))
     const final = held === '' ? (repeated || isPass(reply) ? '' : reply) : (isPass(reply) || repeated ? held : `${held}\n\n${reply}`)
     const substantiveReply = !isPass(reply) && !promisesWork(reply) && !isIdleRelayText(reply, this.members, [])
-    const terminal = { substantiveReply }
+    const ownerQuestionCheck = this.checkOwnerQuestions && substantiveReply && call.workOrderId === undefined && !call.engagement && !member.admin
+    const terminal = {substantiveReply, ownerQuestionCheck}
     if (final !== '') this.post(call, 'message', final, effects, terminal)
-    else if (call.engagement && !isPass(reply)) this.post(call, 'message', reply, effects, terminal)
+    // A repeated progress line still needs a durable completion, with no second pass through the relay.
+    else if (ownerQuestionCheck || call.engagement && !isPass(reply)) this.post(call, 'message', reply, effects, {...terminal, repeated: true})
     else if (call.engagement?.generation !== undefined) this.event('failed', member.name + ' 本轮没有交回可核实的结果。', effects, call)
     const posted = call.posted.length > 0
     const admin = this.admin

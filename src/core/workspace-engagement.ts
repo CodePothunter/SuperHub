@@ -33,6 +33,8 @@ export interface EngagementMessage {
 
 export interface EngagementInput {
   turn: 'liaison' | 'member' | 'owner'
+  /** The ordinary group scheduler has already handled this member's mentions. */
+  ownerQuestionCheck?: true
   source: EngagementMessage
   messages: readonly EngagementMessage[]
   order?: {

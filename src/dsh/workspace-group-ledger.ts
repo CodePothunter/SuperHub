@@ -63,6 +63,8 @@ export interface GroupLine {
   memberCallId?: string
   /** The reply is the substantive result of a normally completed call. */
   memberCompleted?: true
+  /** A plain group reply to check for a question the owner needs to answer. */
+  ownerQuestionCheck?: true
   /** Versions whose content may have influenced this line. An empty array is a checked, unrestricted line. */
   experienceRefs?: ExperienceRef[]
 }
@@ -112,6 +114,8 @@ function validLine(value: unknown): value is GroupLine {
     && optionalString(line.traceId)
     && optionalString(line.memberCallId)
     && (line.memberCompleted === undefined || line.memberCompleted === true && line.kind === 'message' && !!line.memberCallId)
+    && (line.ownerQuestionCheck === undefined || line.ownerQuestionCheck === true && line.memberCompleted === true &&
+      line.replyTo !== undefined && line.workOrderId === undefined && line.engagement === undefined && line.ref === undefined)
     && validExperienceRefs(line.experienceRefs)
     && (line.all === undefined || line.all === true) && optionalString(line.ref) && optionalString(line.requestId)
     && (line.inputAttachments === undefined || Array.isArray(line.inputAttachments) && line.inputAttachments.every(isChatInputAttachment))
@@ -215,6 +219,7 @@ export class GroupLedger implements GroupSay {
         ...(input.speakerId === 'owner' && input.engagement.triggerSeq === minimum && {triggerSeq: seq}) } },
       ...input.memberCallId && { memberCallId: input.memberCallId },
       ...input.memberCompleted && { memberCompleted: input.memberCompleted },
+      ...input.ownerQuestionCheck && { ownerQuestionCheck: input.ownerQuestionCheck },
       ...input.experienceRefs && { experienceRefs: input.experienceRefs.map(ref => ({...ref})) },
     }
     if (!validLine(line)) throw new Error('群账本的行格式不对。')
