@@ -24,14 +24,14 @@
   <p class="proof-point">红点出现时，访谈还在继续。<strong>何时打开汇报，由你决定。</strong></p>
  </div>
  <div class="attention-principles">
-  <article><span class="principle-verb">交出去</span><h3>给挂念一个落点。</h3><p>一句话说清目标与边界，回执指向原工单。离开执行对话，也知道这件事交给了谁、回来去哪里找。</p><div class="feature-origin">一句话交办 · 工单回执</div></article>
+  <article><span class="principle-verb">交出去</span><h3>给挂念一个落点。</h3><p>一句话说清目标与边界，回执指向对应的工作区对话或工单。离开执行对话，也能从回执接着看。</p><div class="feature-origin">一句话交办 · 工作区回执</div></article>
   <article><span class="principle-verb">专心做</span><h3>让不同的事各归其位。</h3><p>访谈的原话与追问、研发的依据与验证，各在自己的工作区。对话与项目经验有归属，需要复用的方法可以选定内容再共享。</p><div class="feature-origin">工作区 · Context 与经验范围</div></article>
   <article><span class="principle-verb">接回来</span><h3>带着线索，接回决定。</h3><p>红点留住未读，汇报带回结论、缺口和原工单。补一句方向，团队接着处理；回到主线，刚才的对话也还在。</p><div class="feature-origin">未读入口 · 集中汇报 · 原对话</div></article>
  </div>
  <div class="zoom-out"><img src="assets/hub-small.svg" alt=""><div><h3>深入一件事，也留一个看全局的入口。</h3><p>从「今天」选择关注，进入工作区做具体的事，再回到「今天」查看项目与交付、重新决定下一步。</p></div></div>
  <a class="zoom-out design-guide-link" href="superhub-design.html">
   <img src="assets/report.svg" alt="">
-  <div><h3>看七张 SuperHub 机制图</h3><p>看一句话如何变成工单、经验如何自动维护，以及不同成员拥有哪些写入权限。</p></div>
+  <div><h3>看八张 SuperHub 机制图</h3><p>看接口人如何找项目、开对话或工单，项目经验如何维护，以及成员的写入权限。</p></div>
   <span aria-hidden="true">↗</span>
  </a>
  <details class="design-references" id="research"><summary>为什么这样设计？注意力残留、目标记忆与局势感知。</summary><div class="reference-grid">
@@ -42,8 +42,12 @@
 </section>
 <section class="section bound workspace-section" id="workspaces">
  <div class="section-title"><div><div class="kicker">A PLACE FOR EACH PROJECT</div><h2>每个项目，<br>都有自己的工作现场。</h2></div><p>目标、对话、工单和成果围绕同一件事组织。换项目时带上它的背景，回来时沿着原会话接着做。</p></div>
+ <div class="liaison-demo-intro" id="liaison-demo">
+  <h3>试试从「今天」开一场工作区对话</h3>
+  <p>点「一句话交办」发送示例，沿回执到目标工作区看回答。</p>
+ </div>
  <div class="workspace-preview" aria-label="可切换项目、查看概览、执行、产物、幕僚与经验的工作区示意">
-  <div class="workspace-preview-bar"><span class="brand"><img src="assets/hub-small.svg" alt="">SuperHub</span><div><span>今天</span><span class="active">工作区</span><span class="optional">人物</span><span class="optional">日历</span></div><span class="story-say">一句话交办</span></div>
+  <div class="workspace-preview-bar"><span class="brand"><img src="assets/hub-small.svg" alt="">SuperHub</span><div><span>今天</span><span class="active">工作区</span><span class="optional">人物</span><span class="optional">日历</span></div><button class="story-say" id="liaison-demo-open" type="button" aria-haspopup="dialog" disabled>一句话交办</button></div>
   <div class="workspace-preview-page"><div class="workspace-preview-heading"><div><div class="workspace-preview-name"><img src="assets/prototype.svg" alt="" id="workspace-demo-icon"><h3 id="workspace-demo-name">产品研发</h3></div><p id="workspace-demo-goal">把接入问题整理成可验证的修复方案，实际改动由你确认。</p></div><button id="workspace-switch" class="stage-button" aria-haspopup="dialog">切换工作区 <span>⌄</span></button></div>
    <div class="workspace-preview-tabs" role="tablist" aria-label="工作区版面"><button role="tab" id="workspace-tab-overview" aria-controls="workspace-panel" aria-selected="true" data-workspace-panel="overview">概览</button><button role="tab" id="workspace-tab-execution" aria-controls="workspace-panel" aria-selected="false" tabindex="-1" data-workspace-panel="execution">执行</button><button role="tab" id="workspace-tab-outputs" aria-controls="workspace-panel" aria-selected="false" tabindex="-1" data-workspace-panel="outputs">产物</button><button role="tab" id="workspace-tab-staff" aria-controls="workspace-panel" aria-selected="false" tabindex="-1" data-workspace-panel="staff">幕僚</button><button role="tab" id="workspace-tab-experience" aria-controls="workspace-panel" aria-selected="false" tabindex="-1" data-workspace-panel="experience">经验</button></div>
    <div id="workspace-panel" role="tabpanel" aria-labelledby="workspace-tab-overview"><noscript>启用 JavaScript 可切换样例项目，查看会话与工单、产物、本区成员和经验。</noscript></div>
@@ -99,6 +103,17 @@
 <dialog id="report" aria-labelledby="report-title"><h2 id="report-title">接入排查报告</h2><p class="muted">通用演示文稿</p><h3>已知原因</h3><p>发布记录中的接入点已经更换，检查程序仍读取旧配置。因此检查请求指向旧接入点并返回 404。</p><h3>建议改动</h3><p><code>SERVICE_ENDPOINT=endpoint-new</code></p><h3>变更前后如何核对</h3><p>先核实新接入点当前可用，再按发布流程使配置生效。验证实际目标、响应状态和预期内容，保留脱敏记录。</p><h3>仍待确认</h3><p>先确认新接入点当前可用，再决定是否安排变更。</p><button class="button primary" id="close-report">返回对话</button></dialog>
 <dialog id="workspace-picker" aria-labelledby="workspace-picker-title"><div class="ws-dialog-head"><h2 id="workspace-picker-title">切换工作区</h2><button id="workspace-picker-close" aria-label="关闭工作区选择">×</button></div><p class="ws-dialog-note">通用样例 · 切换后查看项目自己的目标、工单与对话。</p><div class="ws-picker-list"><button data-workspace-choice="product" aria-pressed="true"><img src="assets/prototype.svg" alt=""><span><b>产品研发</b><small>整理接入问题的修复与验证方案。</small></span><i>›</i></button><button data-workspace-choice="interviews" aria-pressed="false"><img src="assets/recorder.svg" alt=""><span><b>客户访谈</b><small>核对原话，准备下一轮提纲。</small></span><i>›</i></button><button data-workspace-choice="weekly" aria-pressed="false"><img src="assets/report.svg" alt=""><span><b>研究周报</b><small>汇总发现、出处与待验证问题。</small></span><i>›</i></button></div></dialog>
 <dialog id="workspace-document" aria-labelledby="workspace-document-title"><h2 id="workspace-document-title"></h2><p class="muted">通用演示文稿 · 合成内容</p><p id="workspace-document-copy"></p><button class="button primary" id="workspace-document-close">返回原对话</button></dialog>
+<dialog id="liaison-preview" aria-labelledby="liaison-preview-title">
+ <header class="ws-dialog-head">
+  <div><p class="liaison-demo-context">今天 · 示例对话</p><h2 id="liaison-preview-title">接口人</h2></div>
+  <button type="button" id="liaison-demo-close" aria-label="关闭接口人示例">×</button>
+ </header>
+ <div class="ws-messages" id="liaison-demo-messages" role="log" aria-label="接口人示例消息"></div>
+ <div class="liaison-example-draft" id="liaison-example-draft">
+  <p id="liaison-example-prompt"></p>
+  <button class="button primary" id="liaison-demo-send" type="button">发送示例消息</button>
+ </div>
+</dialog>
 <script src="story.js"></script>
 <script src="workspace-preview.js"></script>
 </body>

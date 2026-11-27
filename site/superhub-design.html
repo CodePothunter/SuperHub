@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SuperHub 设计图解</title>
-<meta name="description" content="用七张图了解 SuperHub 的交办流程、注意力管理、工作区边界、经验记忆和权限。">
+<meta name="description" content="用八张图了解 SuperHub 的跨工作区对话、交办流程、注意力管理、经验和权限。">
 <link rel="icon" href="assets/hub-small.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -113,6 +113,8 @@ figcaption { font-size: 14.5px; line-height: 1.7; max-width: 46em; }
   border-top: 1px dashed var(--line); padding-top: 10px; overflow-wrap: anywhere;
 }
 .src::before { content: "代码出处  "; font-family: var(--sans); letter-spacing: .04em; }
+.src a { color: var(--accent); }
+#workspace-routing { scroll-margin-top: 22px; }
 
 .refs { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
 .refs li { display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 8px; font-size: 14px; line-height: 1.65; }
@@ -166,9 +168,9 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
   <nav aria-label="返回 SuperHub 演示"><a class="demo-back" href="index.html#after-demo">← 返回在线演示</a></nav>
   <div class="eyebrow"><span class="pip" aria-hidden="true"></span>SuperHub 当前 main · DeepSeek Harness 插件</div>
   <h1>SuperHub 设计图解</h1>
-  <p class="lead">你只跟接口人说一句话，事情就落到对应项目里推进。你继续手头的事，有空再从红点接回汇报。下面七张图依次画出整体结构、注意力节奏、工单流程、项目边界、写入权限、经验记忆和命令护栏。</p>
+  <p class="lead">跟接口人说一句话，事情就落到对应项目里推进。你可以继续手头的事，有空再从红点接回汇报。下面八张图画出整体结构、注意力节奏、工单流程、项目边界、写入权限、经验、命令护栏和跨工作区对话。</p>
   <ul class="principles">
-    <li><b>交办有落点</b><span>接口人把目标和边界交到对应工作区，回执带你找到原工单。</span></li>
+    <li><b>交办有落点</b><span>接口人把你的问题或交办送到对应工作区，回执带你找到原对话或工单。</span></li>
     <li><b>过程有归属</b><span>一个项目的对话、材料、决定和成果，都留在它自己的工作区。</span></li>
     <li><b>回来有线索</b><span>红点留住未读汇报。汇报先给结论和待确认项，「今天」页看全局。</span></li>
   </ul>
@@ -180,7 +182,7 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
   <h2><span class="no">图 1</span>一个入口，按项目分流</h2>
   <figure>
     <div class="scroll" tabindex="0" role="region" aria-label="整体结构图">
-      <svg class="dg" viewBox="0 0 960 480" role="img" aria-label="SuperHub 总体结构：你通过接口人一句话交办，接口人开工单派到三个项目工作区；成果交回接口人验收，汇报以红点回到你；「今天」页汇总全部项目，所有记录写入第二大脑。">
+      <svg class="dg" viewBox="0 0 960 480" role="img" aria-label="SuperHub 总体结构。你从一句话交办找到接口人。接口人按目标找到工作区，发起对话或开工单。成果交回接口人验收，汇报以红点回到你。今天页汇总各项目，工作记录写入第二大脑。">
         <defs>
           <marker id="f1n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="mk" d="M0,1 L10,5 L0,9 z"/></marker>
           <marker id="f1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="mk-a" d="M0,1 L10,5 L0,9 z"/></marker>
@@ -204,8 +206,8 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
         <!-- 接口人 -->
         <rect class="box-l" x="290" y="170" width="170" height="110" rx="10"/>
         <text class="tb" x="375" y="204" text-anchor="middle">接口人</text>
-        <text class="ts" x="375" y="230" text-anchor="middle">只开工单、转达汇报</text>
-        <text class="ts" x="375" y="250" text-anchor="middle">没有 shell，不改文件</text>
+        <text class="ts" x="375" y="230" text-anchor="middle">查找工作区、开聊或交办</text>
+        <text class="ts" x="375" y="250" text-anchor="middle">调整本区日常配置</text>
 
         <!-- 你 ↔ 接口人 -->
         <line class="ln-a" x1="172" y1="200" x2="287" y2="200" marker-end="url(#f1a)"/>
@@ -218,7 +220,7 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
         <line class="ln-a" x1="460" y1="212" x2="587" y2="135" marker-end="url(#f1a)"/>
         <line class="ln-a" x1="460" y1="222" x2="587" y2="230" marker-end="url(#f1a)"/>
         <line class="ln-a" x1="460" y1="232" x2="587" y2="325" marker-end="url(#f1a)"/>
-        <text class="tl" x="522" y="208" text-anchor="middle">开工单</text>
+        <text class="tl" x="522" y="208" text-anchor="middle">开聊或开单</text>
         <path class="ln dash" d="M590,352 C 480,352 392,336 382,286" marker-end="url(#f1n)"/>
         <text class="ts" x="482" y="374" text-anchor="middle">成果交回，接口人验收</text>
 
@@ -261,8 +263,8 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
         <text x="40" y="443"><tspan class="tb">第二大脑</tspan><tspan class="ts" dx="12">你选的目录，纯文本 + git：工单记录、会话产出、本人资料、目标、经验</tspan></text>
       </svg>
     </div>
-    <figcaption>一个入口进，项目里做，汇报回到同一个入口。接口人手里没有 shell，也不能直接改文件，所有活都要落成工单，才能被追踪和验收。执行者按成员选，示例里研发用 Codex 和 Claude Code，访谈和周报用 DSH 模型。共同经验在工作区「经验」页，幕僚成长记录在各自的成员卡；记录落在你自己的目录里。</figcaption>
-    <div class="src">src/dsh/liaison.ts（LIAISON_DENY） · src/core/workspace-v2.ts · README.md「数据存放」</div>
+    <figcaption>从同一个入口找接口人，对话和工单都落在对应项目里。开聊时按原问题发起普通群聊，交办时由工单记录约定和验收。执行方式按成员配置选定。共同经验在工作区「经验」页，幕僚成长记录在成员卡，工作记录存入你选定的第二大脑目录。 <a class="demo-back" href="#workspace-routing">查看工作区路由</a></figcaption>
+    <div class="src">src/dsh/tools.ts · src/core/workspace-v2.ts · README.md「数据存放」</div>
   </figure>
 </section>
 
@@ -694,7 +696,84 @@ footer { color: var(--dim); font-size: 13px; border-top: 1px solid var(--line); 
   </figure>
 </section>
 
-<footer>根据 SuperHub 源码、README 和 docs/attention.md 绘制；经验机制依据当前 main 补充。v0.2.0 发布包早于此功能。图中的项目、职责和经验都是示例。<a class="demo-back" href="https://github.com/CodePothunter/SuperHub/pull/1">原六张图解由 @jinbozhan 贡献</a>。</footer>
+<!-- 图 8 -->
+<section id="workspace-routing">
+  <h2><span class="no">图 8</span>接口人如何在工作区代办</h2>
+  <figure>
+    <p class="diagram-hint">向左右滑动查看完整流程。</p>
+    <div class="scroll" tabindex="0" role="region" aria-label="跨工作区请求路由图">
+      <svg class="dg" viewBox="0 0 960 558" role="img" aria-labelledby="workspace-routing-title workspace-routing-description">
+        <title id="workspace-routing-title">从「今天」定位工作区并取得回执</title>
+        <desc id="workspace-routing-description">接口人查找当前第二大脑里的工作区。遇到多个匹配项时列出区别，请你选定。本轮原话决定要执行的操作，同一对话的上文可提供目标与原问题。普通对话送到本区群聊，交办进入本区工单，配置变更写回工作区。回执指向发生变更的对话、工单或工作区。</desc>
+        <defs>
+          <marker id="workspace-route-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="mk-a" d="M0,1 L10,5 L0,9 z"/></marker>
+          <marker id="workspace-route-context" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="mk" d="M0,1 L10,5 L0,9 z"/></marker>
+        </defs>
+
+        <rect class="box" x="24" y="24" width="244" height="78" rx="10"/>
+        <text class="tb" x="146" y="53" text-anchor="middle">你从「今天」发出请求</text>
+        <text class="ts" x="146" y="78" text-anchor="middle">「去产品研发开个对话」</text>
+
+        <rect class="box-l" x="358" y="24" width="244" height="78" rx="10"/>
+        <text class="tb" x="480" y="53" text-anchor="middle">接口人查询工作区</text>
+        <text class="ts" x="480" y="78" text-anchor="middle">按名称、目标或负责人查找</text>
+        <line class="ln-a" x1="268" y1="65" x2="354" y2="65" marker-end="url(#workspace-route-arrow)"/>
+
+        <rect class="box" x="692" y="24" width="244" height="78" rx="10"/>
+        <text class="tb" x="814" y="53" text-anchor="middle">请你选定目标</text>
+        <text class="ts" x="814" y="78" text-anchor="middle">列出匹配的项目和区别</text>
+        <line class="ln dash" x1="602" y1="65" x2="688" y2="65" marker-end="url(#workspace-route-context)"/>
+        <text class="ts" x="646" y="54" text-anchor="middle">多个候选</text>
+
+        <rect class="box" x="24" y="159" width="244" height="79" rx="10"/>
+        <text class="tb" x="146" y="190" text-anchor="middle">同一对话里的上文</text>
+        <text class="ts" x="146" y="214" text-anchor="middle">带回已指定的项目和原问题</text>
+        <line class="ln dash" x1="268" y1="201" x2="354" y2="201" marker-end="url(#workspace-route-context)"/>
+
+        <rect class="box-l" x="358" y="159" width="244" height="79" rx="10"/>
+        <text class="tb" x="480" y="190" text-anchor="middle">核对目标与本轮授权</text>
+        <text class="ts" x="480" y="214" text-anchor="middle">「就启动吧」也能接续上一轮</text>
+        <line class="ln-a" x1="480" y1="103" x2="480" y2="155" marker-end="url(#workspace-route-arrow)"/>
+        <text class="tl" x="492" y="135">唯一目标</text>
+        <path class="ln dash" d="M814,103 V201 H606" marker-end="url(#workspace-route-context)"/>
+        <text class="ts" x="704" y="190">选定后再核对</text>
+
+        <path class="ln-a" d="M480,238 V273 H146 V310" marker-end="url(#workspace-route-arrow)"/>
+        <path class="ln-a" d="M480,273 H814 V310" marker-end="url(#workspace-route-arrow)"/>
+        <line class="ln-a" x1="480" y1="273" x2="480" y2="310" marker-end="url(#workspace-route-arrow)"/>
+
+        <rect class="box-l" x="24" y="314" width="244" height="94" rx="10"/>
+        <text class="tb" x="146" y="343" text-anchor="middle">开聊或续聊</text>
+        <text class="ts" x="146" y="366" text-anchor="middle">原问题进入目标会话</text>
+        <text class="ts" x="146" y="389" text-anchor="middle">普通对话关联 0 张工单</text>
+
+        <rect class="box" x="358" y="314" width="244" height="94" rx="10"/>
+        <text class="tb" x="480" y="343" text-anchor="middle">按授权交办</text>
+        <text class="ts" x="480" y="366" text-anchor="middle">在目标工作区开工单</text>
+        <text class="ts" x="480" y="389" text-anchor="middle">保存原话及交付约定</text>
+
+        <rect class="box" x="692" y="314" width="244" height="94" rx="10"/>
+        <text class="tb" x="814" y="343" text-anchor="middle">修改日常配置</text>
+        <text class="ts" x="814" y="366" text-anchor="middle">名称、目标、项目目录</text>
+        <text class="ts" x="814" y="389" text-anchor="middle">本区专属幕僚</text>
+
+        <path class="ln" d="M146,408 V439 H814 V408"/>
+        <line class="ln" x1="480" y1="408" x2="480" y2="466" marker-end="url(#workspace-route-context)"/>
+        <rect class="box-ok" x="185" y="470" width="590" height="69" rx="10"/>
+        <text class="tb" x="480" y="498" text-anchor="middle">回执打开实际记录</text>
+        <text class="ts" x="480" y="521" text-anchor="middle">打开对话 · 打开工单 · 查看保存的配置</text>
+      </svg>
+    </div>
+    <figcaption>「在产品研发开个对话，不用开工单」会创建一场本区群聊，并把问题交给本区成员。接着说「就启动吧，带工单也行」，仍能沿用目标和原问题。先前已送达时，回执会打开同一场对话。 <a class="demo-back" href="index.html#liaison-demo">试一次开聊</a></figcaption>
+    <div class="src">
+      <a href="https://github.com/CodePothunter/SuperHub/blob/main/src/dsh/tools.ts">src/dsh/tools.ts</a> ·
+      <a href="https://github.com/CodePothunter/SuperHub/blob/main/src/dsh/workspace-v2.ts">src/dsh/workspace-v2.ts</a> ·
+      <a href="https://github.com/CodePothunter/SuperHub/blob/main/src/dsh/chat.ts">src/dsh/chat.ts</a>
+    </div>
+  </figure>
+</section>
+
+<footer>根据 SuperHub 源码、README 和 docs/attention.md 绘制。图中的项目、职责和经验都是示例。<a class="demo-back" href="https://github.com/CodePothunter/SuperHub/pull/1">原六张图解由 @jinbozhan 贡献</a>。</footer>
 
 </div>
 </body>
