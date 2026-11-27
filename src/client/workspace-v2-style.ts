@@ -337,6 +337,7 @@ body[data-ds-dark-theme]:not([data-chief-standalone]) .wv2 { ${darkPalette} }
 .wv2 .v2-byline { display:flex; flex-wrap:wrap; align-items:baseline; gap:8px; margin:0 2px 3px; font-size:13px; }
 .wv2 .v2-byline strong { min-width:0; overflow-wrap:anywhere; }
 .wv2 .v2-byline time { color:var(--v-muted); font-size:12px; font-variant-numeric:tabular-nums; }
+.wv2 .v2-editable-byline { display:flex; align-items:center; justify-content:flex-end; gap:6px; }
 .wv2 .v2-edit-message { display:inline-grid; place-items:center; align-self:center; flex:none; width:28px; height:28px;
   margin-block:-4px; border-radius:7px; color:var(--v-muted); }
 .wv2 .v2-edit-message:hover:enabled { color:var(--v-ink); background:var(--v-tint); }
@@ -373,6 +374,14 @@ body[data-ds-dark-theme]:not([data-chief-standalone]) .wv2 { ${darkPalette} }
 .wv2 .v2-editor-actions .v2-button { min-height:36px; border-radius:999px; padding:6px 13px; white-space:nowrap; }
 @media (pointer:coarse), (max-width:700px) {
   .wv2 .v2-edit-message { width:44px; height:44px; margin-block:0; }
+  .wv2 .v2-message:has(> .v2-editable-byline) { display:grid; grid-template-columns:44px minmax(0,1fr); column-gap:4px;
+    grid-template-areas:"byline byline" "order order" "edit bubble"; }
+  .wv2 .v2-message:has(> .v2-editable-byline)>* { grid-column:1 / -1; }
+  .wv2 .v2-editable-byline { display:contents; }
+  .wv2 .v2-editable-byline .v2-byline { grid-area:byline; }
+  .wv2 .v2-editable-byline .v2-edit-message { grid-area:edit; align-self:start; }
+  .wv2 .v2-editable-byline~.v2-order-tag { grid-area:order; justify-self:start; }
+  .wv2 .v2-editable-byline~.v2-bubble { grid-area:bubble; align-self:start; min-width:0; }
   .wv2 .v2-message-editor textarea { font-size:16px; }
   .wv2 .v2-editor-actions .v2-button { min-height:44px; }
 }

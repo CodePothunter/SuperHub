@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from 'react'
+import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import type { Scoped } from './superhub-api.ts'
 import type { ChatInputAttachment } from '../core/chat-attachments.ts'
 import { MESSAGE_ROW } from './scroll-anchor.ts'
@@ -45,10 +45,14 @@ function isEditReceipt(value: Scoped): value is EditReceipt {
 /** Capture the version at the moment the editor opens. A conflict leaves the draft in the open form. */
 export interface MessageEdit { id: string; text: string; traceId: string; attachments?: readonly ChatInputAttachment[] }
 
-export function MessageEditButton({ open, disabled }: { open: () => void; disabled?: boolean }) {
-  return <button type="button" className="v2-edit-message" aria-label="编辑历史消息" title="编辑历史消息" onClick={open} disabled={disabled}>
-    <V2Icon name="pencil"/>
-  </button>
+export function MessageByline({ children, edit, disabled }: { children: ReactNode; edit?: () => void; disabled?: boolean }) {
+  const byline = <div className="v2-byline">{children}</div>
+  return edit ? <div className="v2-editable-byline">
+    <button type="button" className="v2-edit-message" aria-label="编辑历史消息" title="编辑历史消息" onClick={edit} disabled={disabled}>
+      <V2Icon name="pencil"/>
+    </button>
+    {byline}
+  </div> : byline
 }
 
 export function MessageEditor({ base, sessionId, edit, close, saved, maxLength }: {
