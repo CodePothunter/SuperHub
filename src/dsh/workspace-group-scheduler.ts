@@ -101,6 +101,8 @@ export type GroupCallReason = 'owner' | 'mention' | 'all' | 'wake' | 'unpark'
 
 export interface GroupCall {
   id: string
+  /** Liaison relays sent to the conversation keep their no-order destination when calls queue or steer. */
+  exactScope?: true
   memberId: string
   /** 谁叫的：`owner`、成员 id，或宿主唤醒/解除挂起的 `host`。 */
   by: string
@@ -363,7 +365,8 @@ export class GroupScheduler {
     const workOrderId = line.workOrderId
     if (steer) {
       for (const id of [...callees]) {
-        const busy = this.state.calls.find(call => call.memberId === id && this.sameOrder(call.workOrderId, workOrderId) && RUNNING.includes(call.status))
+        const busy = this.state.calls.find(call => call.memberId === id &&
+          (call.exactScope ? call.workOrderId === workOrderId : this.sameOrder(call.workOrderId, workOrderId)) && RUNNING.includes(call.status))
         if (!busy) continue
         callees = callees.filter(other => other !== id)
         effects.push({ type: 'steer', callId: busy.id, memberId: id, seq: line.seq, reason, note, ...workOrderId !== undefined && { workOrderId } })
@@ -451,7 +454,7 @@ export class GroupScheduler {
   }
 
   /** Queue one recorded liaison decision. A replay uses the same ledger line and receipt. */
-  dispatchEngagement(request: string, memberIds: string[], spec: { triggerSeq: number; note: string; workOrderId?: string }): GroupEffect[] {
+  dispatchEngagement(request: string, memberIds: string[], spec: { triggerSeq: number; note: string; workOrderId?: string; exactScope?: true }): GroupEffect[] {
     const receipts = this.state.engagementDispatches ??= {}
     if (Object.hasOwn(receipts, request)) return []
     const effects: GroupEffect[] = []
@@ -854,14 +857,15 @@ export class GroupScheduler {
    * 叫一组成员，同一次叫人共享一个批次（groups.js:1273-1298 `callIn`）。成员已有兼容的排队叫人（同一派活者，
    * 或任一方是主人/宿主）时只更新那一条，不重复叫；同一派活者再叫同一成员，并入其最新批次（groups.js:993-1026）。
    */
-  private callIn(callees: string[], spec: { by: string; reason: GroupCallReason; note: string; triggerSeq: number; workOrderId?: string; coAnswering?: string[]; done?: string[]; results?: number[] }) {
+  private callIn(callees: string[], spec: { by: string; reason: GroupCallReason; note: string; triggerSeq: number; workOrderId?: string; exactScope?: true; coAnswering?: string[]; done?: string[]; results?: number[] }) {
     const list = [...new Set(callees)].filter(id => this.isMember(id) && id !== spec.by)
     if (list.length === 0) return
     const coAnswering = spec.coAnswering ?? list
     const fresh: { id: string; queued?: GroupCall }[] = []
     const merged: { call: GroupCall; joins: boolean }[] = []
     for (const id of list) {
-      const queued = this.state.calls.find(call => call.memberId === id && call.status === 'queued' && this.currentEngagement(call) && this.sameOrder(call.workOrderId, spec.workOrderId)
+      const queued = this.state.calls.find(call => call.memberId === id && call.status === 'queued' && this.currentEngagement(call)
+        && (call.exactScope || spec.exactScope ? call.workOrderId === spec.workOrderId : this.sameOrder(call.workOrderId, spec.workOrderId))
         && (call.by === spec.by || plainCaller(call.by) || plainCaller(spec.by)))
       if (!queued) { fresh.push({ id }); continue }
       // 主人/宿主的叫人并入成员的排队叫人：保留原批次，回答的人改成主人的那一行（DS-Bot 删去 slot.by、保留 batchKey）。
@@ -879,6 +883,7 @@ export class GroupScheduler {
       call.note = spec.note
       call.triggerSeq = spec.triggerSeq
       call.coAnswering = coAnswering
+      if (spec.exactScope) call.exactScope = true
       if (spec.workOrderId !== undefined) call.workOrderId = spec.workOrderId
       if (spec.results) {
         call.done = [...new Set([...(call.done ?? []), ...(spec.done ?? [])])]
@@ -891,6 +896,7 @@ export class GroupScheduler {
         id: this.id('c'), memberId: id, ...engagement && {engagement}, by: spec.by, reason: spec.reason, note: spec.note, triggerSeq: spec.triggerSeq,
         ...batch && { batchId: batch.id },
         ...spec.workOrderId !== undefined && { workOrderId: spec.workOrderId },
+        ...spec.exactScope && { exactScope: true },
         ...spec.results && { done: [...(spec.done ?? [])], results: [...spec.results] },
         coAnswering, status: 'queued', queuedAt: this.now(),
         toolCalls: 0, worked: false, retried: false, called: [], posted: [], held: [], lastFlushAt: 0,

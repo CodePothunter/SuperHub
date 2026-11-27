@@ -7,7 +7,7 @@ import { delimiter, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { button, backToOrder, CLAUDE_STAFF, CODEX_STAFF, codexStaff, createOrder, createSession, joinStaff, openOrderSession, openWorkspace, newSpace, providerBinaries, say, signIn } from './workspace-browser-fixture.mjs'
 import { acceptanceHost, until } from './acceptance-host.mjs'
-import { checkCalendarConnection, connectTestCalendar, openCreatedWorkspace, readCalendar, readPeople } from './workspace-daily-acceptance.mjs'
+import { checkCalendarConnection, checkLiaisonWorkspaceActions, connectTestCalendar, openCreatedWorkspace, readCalendar, readPeople } from './workspace-daily-acceptance.mjs'
 import { checkWorkspaceDesign } from './workspace-design-acceptance.mjs'
 import { checkConversationEdits, checkLiaisonEdit, verifyConversationRestart } from './workspace-conversation-acceptance.mjs'
 
@@ -360,6 +360,7 @@ try {
   // 「一句话交办」红点只读未读数（/chat/unread），不打开接口人对话或旧工作台。
   assert.ok(!reads.some(path => /\/api\/(state|chat|rooms)(\/|$)/.test(path) && !/\/api\/chat\/unread$/.test(path)), '旧链接不能打开另一套可写工作台')
   await openCreatedWorkspace(desktop,host,scope)
+  await checkLiaisonWorkspaceActions(desktop,mobile,host,scope,picture)
   // The order page is the order's chat; the design check reads the execution view, with the session list beside the conversation.
   async function conversationOf(orderHash) {
     const place = new URLSearchParams(orderHash.slice(4))

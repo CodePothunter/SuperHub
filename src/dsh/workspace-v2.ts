@@ -3,10 +3,10 @@ import type { SavedOrderResults } from '../core/workspace-notices.ts'
 import type { ChatInputAttachment } from '../core/chat-attachments.ts'
 import type { ChatAttachments } from './chat-attachments.ts'
 import type { V2Attachment } from '../core/workspace-v2.ts'
-import { LIAISON_AUTHOR, WORKSPACE_ARCHIVED, awaitingChoice, messageWorkOrder, pinnedOutside, orderEnded, workspaceArchived, type V2CodingPermission, type V2Delegation, type V2Delivery, type V2DialogueSource, type V2DirectoryWait, type V2Executor, type V2Interjection, type V2Message, type V2PendingApproval, type V2PermissionChange, type V2Session, type V2SteerOutcome, type V2Transcript, type V2WorkDirectory } from '../core/workspace-v2.ts'
+import { LIAISON_AUTHOR, WORKSPACE_ARCHIVED, awaitingChoice, messageWorkOrder, pinnedOutside, orderEnded, workspaceArchived, type V2CodingPermission, type V2Delegation, type V2Delivery, type V2DialogueSource, type V2DirectoryWait, type V2Executor, type V2Interjection, type V2Message, type V2PendingApproval, type V2PermissionChange, type V2Session, type V2SteerOutcome, type V2Transcript, type V2WorkDirectory, type V2Workspace } from '../core/workspace-v2.ts'
 import { json, type Route } from './http.ts'
 import { workspaceError, workspaceFingerprint } from './superhub-goals.ts'
-import { INTERJECTION_UNKNOWN, UNKNOWN_TURN, WorkspaceV2Store, commandText, mutationKey, assignmentTurn, isRosterGroup, type AcceptanceOutcome, type AssignmentStart, type EngagementJob, type GroupStart, type Mutation, type OwnerCommand, type WorkspaceTarget } from './workspace-v2-store.ts'
+import { INTERJECTION_UNKNOWN, UNKNOWN_TURN, WorkspaceV2Store, commandText, mutationKey, assignmentTurn, isRosterGroup, type AcceptanceOutcome, type AssignmentStart, type EngagementJob, type GroupStart, type LiaisonDialogueCancellation, type LiaisonDialogueRecord, type LiaisonDialogueRequest, type LiaisonOrderContext, type Mutation, type OwnerCommand, type WorkspaceTarget } from './workspace-v2-store.ts'
 import { mentionSegments, type MentionSegment } from '../core/mentions.ts'
 import { LIAISON_MEMBER_ID } from './workspace-group-members.ts'
 import { GROUP_COMMANDS_FILE, liaisonGapReason, type GroupEngine, type GroupDeliveryOutcome } from './workspace-group-engine.ts'
@@ -41,10 +41,22 @@ export interface WorkspaceApprovals {
   pending(filter?: {workspaceId?: string; sessionId?: string; orderId?: string | null}): V2PendingApproval[]
   answer(id: string, allow: boolean, where: {workspaceId: string; sessionId?: string; orderId?: string | null}): boolean
 }
+
+interface LiaisonDialogueResult {
+  workspace: V2Workspace
+  session: V2Session
+  requestId: string
+  traceId: string
+  sourceMessageId?: string
+  state: 'created' | 'pending' | 'sent' | 'replied' | 'failed' | 'cancelled'
+  reason?: string
+}
+
 interface Options {
   inputAttachments?: Pick<ChatAttachments, 'resolve' | 'grant'>
   learning?: ExperienceLearning
   learningProblem?: (error: unknown) => void
+  liaisonTrace?: () => string
   staff?:WorkspaceStaffStore; store: WorkspaceV2Store; source: V2DialogueSource; timeZone?: string; now?: () => Date; approvals?: WorkspaceApprovals
   /** The liaison's acceptance review of new results. Absent: results are not reviewed. */
   review?: AcceptanceReviewer
@@ -167,7 +179,7 @@ export function earlierResults(notices: StoredResult[], orderId: string, turnId:
 }
 
 /** Mounted behind serveApi's authenticated desktop/mobile gateways, under the active brain lock. */
-export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shanghai', now, approvals, review, coordinate, canonicalModel, remind, locks = directoryLocks, judge, groups, inputAttachments, learning, learningProblem }: Options) {
+export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shanghai', now, approvals, review, coordinate, canonicalModel, remind, locks = directoryLocks, judge, groups, inputAttachments, learning, learningProblem, liaisonTrace }: Options) {
   const scope = store.scope
   const flights = new Map<string, InFlight>()
   let disposed = false
@@ -500,6 +512,96 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     return {session: store.session(session.workspaceId, session.id), messageId: lineId(line.seq), deliveries: rows.map(row =>
       delivered?.find(saved => saved.memberId === row.memberId && saved.outcome === 'failed') ?? row)}
   }
+
+  const liaisonPosts = new Map<string, Promise<void>>()
+
+  async function postLiaisonDialogue(record: LiaisonDialogueRecord) {
+    const { workspaceId, sessionId, traceId, question, original, ref } = record
+    const requestId = record.actionRequestId ?? original.requestId
+    if (!question) return
+    const activeSource = () => {
+      if (!record.liaisonTraceId || !liaisonTrace || liaisonTrace() === record.liaisonTraceId) return true
+      let posted: GroupLine | undefined
+      if (record.progress.state === 'pending' && record.progress.posting) {
+        try { posted = groups?.lines({id:sessionId,workspaceId}, traceId).find(line => line.ref === ref) } catch { /* The version is unreadable. */ }
+      }
+      store.saveLiaisonDialogue(requestId, {state:'cancelled',reason:'接口人对话已续写，宿主已停止补发原请求', ...(posted && {seq:posted.seq})})
+      return false
+    }
+    if (!activeSource()) return
+    let mayHavePosted = record.progress.state === 'pending' && record.progress.posting === true
+    try {
+      store.writable(workspaceId)
+      const session = store.session(workspaceId, sessionId)
+      if (session.closed) return workspaceError(409, '这场会话已关闭')
+      store.assertActiveTrace(session, traceId)
+      const engine = await groupEngine(session)
+      const row = store.liaisonDialogue(requestId)
+      if (!row || row.progress.state !== 'pending' && row.progress.state !== 'failed' || !activeSource()) return
+      mayHavePosted = !!engine.ledger.byRef(ref)
+      if (store.session(workspaceId, sessionId).closed) return workspaceError(409, '这场会话已关闭')
+      store.writable(workspaceId)
+      store.assertActiveTrace(session, traceId)
+      groups?.workDir(session)
+      engine.refreshMembers()
+      const member = engine.members().find(row => row.id === (record.staffId ?? LIAISON_MEMBER_ID))
+      if (!member) return workspaceError(409, '接话的幕僚已不在这个工作区')
+      grantGroupFiles(session, undefined, record.inputAttachments)
+      const prompt = record.handoff ?? '请用本工作区可用的资料回答主人转来的问题。需要主人补充时，说明缺少哪项。'
+      // The scheduler writes its dispatch receipt with the queued call. A retry after the ledger write reuses the line.
+      store.saveLiaisonDialogue(requestId, {state:'pending', posting:true})
+      mayHavePosted = true
+      const line = engine.dispatchEngagement(ref, [member.id], record.staffId ? '@' + member.name + ' ' + prompt : prompt,
+        undefined, {original:question, inputAttachments:record.inputAttachments, exactScope:true})
+      store.saveLiaisonDialogue(requestId, {state:'sent', seq:line.seq})
+    } catch (error) {
+      current()
+      const reason = (error instanceof Error ? error.message : String(error)).slice(0, 240)
+      store.saveLiaisonDialogue(requestId, mayHavePosted ? {state:'pending', posting:true, reason} : {state:'failed', reason})
+    }
+  }
+
+  function dispatchLiaisonDialogue(record: LiaisonDialogueRecord): Promise<void> {
+    const pending = liaisonPosts.get(record.ref)
+    if (pending) return pending
+    const post = Promise.resolve().then(() => postLiaisonDialogue(record)).finally(() => liaisonPosts.delete(record.ref))
+    liaisonPosts.set(record.ref, post)
+    return post
+  }
+
+  function liaisonDialogueStatus(originalRequestId: string): LiaisonDialogueResult | undefined {
+    current()
+    const row = store.liaisonDialogue(originalRequestId)
+    if (!row || row.progress.state === 'replaced') return
+    const {workspaceId, sessionId, traceId, progress} = row
+    const workspace = store.workspace(workspaceId)
+    const session = store.session(workspaceId, sessionId)
+    const target = {workspace, session, traceId, requestId:originalRequestId}
+    if (progress.state === 'sent') {
+      const rows = groups?.lines(session, traceId) ?? []
+      const replied = rows.some(line => line.replyTo === progress.seq && line.memberCompleted)
+      const failure = !replied && rows.findLast(line => line.engagement?.triggerSeq === progress.seq && line.kind === 'event'
+        && (line.event === 'failed' || line.event === 'interrupted'))
+      return {...target, sourceMessageId:lineId(progress.seq), state:replied ? 'replied' : 'sent',
+        ...(failure && {reason:failure.text}) }
+    }
+    return {...target, state:progress.state, ...'reason' in progress && progress.reason && {reason:progress.reason},
+      ...progress.state === 'cancelled' && progress.seq && {sourceMessageId:lineId(progress.seq)}}
+  }
+
+  async function liaisonDialogue(input: LiaisonDialogueRequest) {
+    current()
+    if (input.staffId) activeMember(input.workspaceId, input.staffId)
+    const record = store.beginLiaisonDialogue({...input,liaisonTraceId:liaisonTrace?.()})
+    if (record.progress.state === 'pending' || record.progress.state === 'failed') await dispatchLiaisonDialogue(record)
+    return liaisonDialogueStatus(input.actionRequestId ?? input.original.requestId) ?? workspaceError(409, '这项请求已交给工单，请打开原工单')
+  }
+
+  function liaisonDialogueCancel(input: LiaisonDialogueCancellation) {
+    current()
+    if (store.cancelLiaisonDialogue(input)) return liaisonDialogueStatus(input.originalRequestId)
+  }
+
   /**
    * Before each member call: a staff member must still be in the workspace with the identity the call is built from
    * (its `StaffContext` token), and a call on an order uses one turn of the order's budget (refused when it is used up,
@@ -2398,12 +2500,17 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
    * the order goes to the focused group or a new one, and the liaison's hand-over is posted there, @-mentioning the staff
    * member the owner named, or calling the liaison member to decide whom to @.
    */
-  function assign(sourceId: string, text: string, executor?: V2Executor, selected?: string, selectedSession?: string, brief?:Partial<OrderBrief>, staffId?:string, permission?: V2CodingPermission, handoff?: string, directory?: string, refs?: ChatInputAttachment[], reporting?: EngagementReporting) {
+  function assign(sourceId: string, text: string, executor?: V2Executor, selected?: string, selectedSession?: string, brief?:Partial<OrderBrief>, staffId?:string, permission?: V2CodingPermission, handoff?: string, directory?: string, refs?: ChatInputAttachment[], reporting?: EngagementReporting, ownerContext?: LiaisonOrderContext) {
     current()
+    const dialogue = ownerContext && store.liaisonDialogue(ownerContext.actionRequestId ?? ownerContext.original.requestId)
+    if (dialogue?.liaisonTraceId && liaisonTrace && liaisonTrace() !== dialogue.liaisonTraceId) {
+      return workspaceError(409, '接口人对话已续写，请在当前对话重新提出这项交办')
+    }
+    if (dialogue && liaisonPosts.has(dialogue.ref)) return workspaceError(409, '原问题正在送往会话，请核对送达状态后再继续')
     const grouped = store.rosterGroups
     if (staffId && (!selected || (!grouped && executor && executor !== 'dsh'))) return workspaceError(400,'请从幕僚加入的工作区交办，具名幕僚使用 DSH 受限会话')
     const member = staffId && selected ? activeMember(selected,staffId) : undefined
-    const { firstRequestId, ...job } = store.assign(sourceId,text,member && !grouped ? 'dsh' : executor,selected,selectedSession,brief,member,permission,handoff,directory,refs,grouped ? reporting ?? (coordinate ? 'final' : undefined) : undefined)
+    const { firstRequestId, ...job } = store.assign(sourceId,text,member && !grouped ? 'dsh' : executor,selected,selectedSession,brief,member,permission,handoff,directory,refs,grouped ? reporting ?? (coordinate ? 'final' : undefined) : undefined,ownerContext)
     if (roster(job.session)) {
       void postGroupStarts(job.session.id)
       return job
@@ -2441,7 +2548,7 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     }
     return {workspace:store.workspace(workspaceId), delegation, session, state}
   }
-  return Object.assign(route, { assign, follow, followup, notices, resolveLearningOriginals, verifyLearningOriginal, recover() {
+  return Object.assign(route, { assign, liaisonDialogue, liaisonDialogueStatus, liaisonDialogueCancel, follow, followup, notices, resolveLearningOriginals, verifyLearningOriginal, recover() {
     if (disposed) return
     if (learning) for (const result of store.resultNotices()) {
       if (!archived(result.workspaceId)) learnResult(result, true)
@@ -2463,7 +2570,14 @@ export function workspaceV2Routes({ staff, store, source, timeZone = 'Asia/Shang
     for (const row of store.unforwardedCommands().filter(row => !archived(row.workspaceId))) void Promise.resolve().then(() => forwardHeld(row.requestId, row)).catch(() => { /* the choice stays open in the conversation */ })
     // Groups with members mid-call (or queued work) start now, so those members are gated and resumed; hand-overs not
     // yet in their group are posted.
-    if (groups) void groups.boot().then(() => postGroupStarts()).catch(() => { /* retried on the next start */ })
+    if (groups) void groups.boot().then(async () => {
+      if (disposed) return
+      await Promise.all([
+        postGroupStarts(),
+        ...store.pendingLiaisonDialogues().filter(row => !archived(row.workspaceId) && !store.deletedReason(row.workspaceId, row.sessionId))
+          .map(dispatchLiaisonDialogue),
+      ])
+    }).catch(() => { /* retried on the next start */ })
     for (const session of store.pendingDialogueEdits()) void resumeActiveEdit(session).catch(() => { /* the stored edit keeps its request */ })
     runAcceptances()
     recoverGroupLedger()

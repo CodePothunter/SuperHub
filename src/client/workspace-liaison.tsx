@@ -22,11 +22,12 @@ interface Links {
   openRoom?: (id: string) => void
   openWorkspace: (id: string) => void
   openDelegation?: (workspaceId: string, delegationId: string) => void
+  openSession?: (workspaceId: string, sessionId: string, messageId?: string, traceId?: string) => void
   /** 「设置 → 定时安排」：定时提醒下的「在设置中查看」。 */
   openSchedules?: () => void
 }
 interface Props extends Links {
-  scope: string; surface: SuperhubSurface; selectedId?: string; sessionId?: string; workOrderId?: string; changed: () => void; close: () => void
+  scope: string; surface: SuperhubSurface; selectedId?: string; sessionId?: string; sessionTraceId?: string; workOrderId?: string; changed: () => void; close: () => void
   workspace?: { id: string; name: string }
   pending?: ReactNode
   trace?: string
@@ -47,12 +48,37 @@ const style = `
 .wv2 .v2-liaison .wr-room-receipts small { margin-inline-end:4px; }
 .wv2 .v2-liaison .v2-notice-text { margin:0; white-space:pre-wrap; overflow-wrap:anywhere; }
 .wv2 .v2-liaison .v2-notice-status { display:block; color:var(--v-muted); font-size:13px; margin-top:4px; }
+.wv2 .v2-liaison .v2-conversation-receipt { display:flex; width:fit-content; max-width:100%; min-height:44px; overflow-wrap:anywhere; }
 .wv2 .v2-liaison .v2-turn.settled .v2-notice-text { color:var(--v-muted); }
 `
 
 const speechId = (m: Pick<ChatMessage, 'role' | 'seq' | 'firstSeq' | 'messageId'>) => m.role + '-' + speechCursor(m)
 type LiaisonSpeech = Pick<ChatMessage, 'role' | 'time' | 'text' | 'discussions' | 'workspaces' | 'profileImports' | 'inputAttachments'>
 type ChatNotice = ChatView['notices'][number]
+
+function WorkspaceReceipts({ receipts, openWorkspace, openDelegation, openSession }: Pick<Links, 'openWorkspace' | 'openDelegation' | 'openSession'> & {
+  receipts: ChatMessage['workspaces']
+}) {
+  return receipts?.map(({ id, name, delegationId, delegationTitle, workOrderDeletedAt,
+    sessionId, sessionTitle, sessionTraceId, sourceMessageId, sessionDeletedAt, sessionUnavailable }) => {
+    if (delegationId && workOrderDeletedAt) {
+      return <small key={id + '/' + delegationId} className="v2-notice-status">{delegationTitle && delegationTitle + ' · '}工单已删除</small>
+    }
+    if (delegationId && openDelegation) {
+      return <button type="button" key={id + '/' + delegationId} className="v2-link" onClick={() => openDelegation(id, delegationId)}>
+        {delegationTitle ? '打开工单「' + delegationTitle + '」' : '打开工单'}</button>
+    }
+    if (sessionId) {
+      const key = [id, sessionId, sessionTraceId, sourceMessageId].join('/')
+      if (sessionDeletedAt || sessionUnavailable) return <small key={key} className="v2-notice-status">
+        {sessionTitle && '「' + sessionTitle + '」 · '}{sessionDeletedAt ? '对话已删除' : '对话已不可用'}</small>
+      if (openSession) return <button type="button" key={key} className="v2-link v2-conversation-receipt"
+        onClick={() => openSession(id, sessionId, sourceMessageId, sessionTraceId)}>
+        {sessionTitle ? '打开对话「' + sessionTitle + '」' : '打开对话'}</button>
+    }
+    return <button type="button" key={id} className="v2-link" onClick={() => openWorkspace(id)}>打开工作区「{name}」</button>
+  })
+}
 
 /** A reminder the liaison sends on its own (an order completed, waits for the owner, or stopped short), as one of its turns. */
 function NoticeBody({ notice, openRoom, openDelegation, openSchedules }: Pick<Links, 'openRoom' | 'openDelegation' | 'openSchedules'> & { notice: ChatNotice }) {
@@ -66,7 +92,7 @@ function NoticeBody({ notice, openRoom, openDelegation, openSchedules }: Pick<Li
   </>
 }
 
-function LiaisonTurn({ message, result, notice, id, scope, sessionId, editMessage, editor, openProfileImport, openRoom, openWorkspace, openDelegation, openSchedules }: Links & {
+function LiaisonTurn({ message, result, notice, id, scope, sessionId, editMessage, editor, openProfileImport, openRoom, openWorkspace, openDelegation, openSession, openSchedules }: Links & {
   id?: string; scope: string; sessionId?: string; message: LiaisonSpeech; result?: DiscussionResult; notice?: ChatNotice; editMessage?: () => void; editor?: ReactNode
 }) {
   const mine = message.role === 'you'
@@ -82,18 +108,14 @@ function LiaisonTurn({ message, result, notice, id, scope, sessionId, editMessag
         {message.text && <Markdown text={message.text} className="v2-markdown"/>}
         <MessageInputAttachments scope={scope} target={sessionId ? {sessionId} : undefined} attachments={message.inputAttachments}/>
         <RoomReceipts discussions={message.discussions} open={openRoom}/>
-        {message.workspaces?.map(({id, name, delegationId, delegationTitle, workOrderDeletedAt}) =>
-          workOrderDeletedAt ? <small key={id + '/' + delegationId} className="v2-notice-status">{delegationTitle && delegationTitle + ' · '}工单已删除</small>
-          : delegationId && openDelegation ? <button key={id + '/' + delegationId} className="v2-link" onClick={() => openDelegation(id, delegationId)}>
-            {delegationTitle ? '打开工单「' + delegationTitle + '」' : '打开工单'}</button>
-            : <button key={id} className="v2-link" onClick={() => openWorkspace(id)}>打开工作区「{name}」</button>)}
+        <WorkspaceReceipts receipts={message.workspaces} openWorkspace={openWorkspace} openDelegation={openDelegation} openSession={openSession}/>
         {message.profileImports?.map(({importId}) => <button type="button" key={importId} className="v2-link" onClick={() => openProfileImport(importId)}>核对资料</button>)}
       </div>}
     </div>
   </li>
 }
 
-export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, openWorkspace, openDelegation, openSchedules, workspace, surface, selectedId, sessionId, workOrderId, changed, pending, trace, sourceMessage, sourceSession, currentTrace }: Props) {
+export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, openWorkspace, openDelegation, openSession, openSchedules, workspace, surface, selectedId, sessionId, sessionTraceId, workOrderId, changed, pending, trace, sourceMessage, sourceSession, currentTrace }: Props) {
   const { revoke } = useContext(V2Client)
   const following = useRef(!sourceMessage)
   const chat = useChat(changed, scope, revoke, () => following.current, {trace, message:sourceMessage, sessionId:sourceSession})
@@ -106,7 +128,7 @@ export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, op
   const [draft, setDraft] = useState(() => { try { return sessionStorage.getItem(key) ?? '' } catch { return '' } })
   const latestDraft = useRef(draft)
   latestDraft.current = draft
-  const destination = JSON.stringify([key, sessionId, workOrderId, chat.sessionId])
+  const destination = JSON.stringify([key, sessionId, sessionTraceId, workOrderId, chat.sessionId])
   const files = useChatAttachments(scope, chat.sessionId ? {sessionId:chat.sessionId} : undefined, destination, revoke)
   const openDestination = useRef<string | undefined>(destination)
   useLayoutEffect(() => {
@@ -183,7 +205,7 @@ export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, op
     if (chat.hasNewer) void chat.toLatest()
     try {
       if (await chat.say(draft, 'auto', {surface, ...(selectedId && {selectedId}),
-        ...(surface === 'workspace' && sessionId && {sessionId, ...(workOrderId && {workOrderId})})}, files.ready, chat.traceId)) {
+        ...(surface === 'workspace' && sessionId && {sessionId, ...(sessionTraceId && {sessionTraceId}), ...(workOrderId && {workOrderId})})}, files.ready, chat.traceId)) {
         if (openDestination.current !== destination) {
           try { if (sessionStorage.getItem(key) === draft) sessionStorage.removeItem(key) } catch { /* Optional in embedded hosts. */ }
           return
@@ -222,7 +244,8 @@ export function WorkspaceLiaison({ scope, close, openProfileImport, openRoom, op
                   if ((trace || sourceMessage) && currentTrace) currentTrace()
                   else { following.current = true; setSavedMessage(receipt.messageId); void chat.toLatest() }
                 }}/>}
-              openProfileImport={openProfileImport} openRoom={openRoom} openWorkspace={openWorkspace} openDelegation={openDelegation} openSchedules={openSchedules}/>
+              openProfileImport={openProfileImport} openRoom={openRoom} openWorkspace={openWorkspace} openDelegation={openDelegation}
+              openSession={openSession} openSchedules={openSchedules}/>
           })}
         </ol>}
         <NewerEdge edge={bottom} hasNewer={chat.hasNewer} loading={chat.loadingNewer} error={chat.newerError} load={loadNewer}

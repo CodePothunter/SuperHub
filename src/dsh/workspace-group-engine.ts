@@ -624,12 +624,12 @@ export class GroupEngine {
   }
 
   dispatchEngagement(request: string, members: string[], text: string, workOrderId?: string,
-    handoff?: {original?: string; inputAttachments?: ChatInputAttachment[]; experienceRefs?: GroupLine['experienceRefs']; replyTo?: number}) {
+    handoff?: {original?: string; inputAttachments?: ChatInputAttachment[]; experienceRefs?: GroupLine['experienceRefs']; replyTo?: number; exactScope?: true}) {
     if (this.viewOnly) throw new Error(WORKSPACE_ARCHIVED)
     const line = this.note({speaker: 'liaison', text, workOrderId, ref: request, inputAttachments: handoff?.inputAttachments, experienceRefs:handoff?.experienceRefs,
       ...(handoff?.replyTo !== undefined && {replyTo: handoff.replyTo}),
       ...(handoff?.original && {quote: {label: '主人原话', text: handoff.original}})})
-    this.handle(s => s.dispatchEngagement(request, members, {triggerSeq: line.seq, note: '接口人请你继续处理这一项', workOrderId}), true, true)
+    this.handle(s => s.dispatchEngagement(request, members, {triggerSeq: line.seq, note: '接口人请你继续处理这一项', workOrderId, exactScope:handoff?.exactScope}), true, true)
     return line
   }
 

@@ -48,7 +48,7 @@ const settings: Settings = { timeZone: 'Asia/Shanghai', concurrency: 2, mobile: 
 /** 周三上午 10 点（上海）：定时安排的回执按这个时刻算下一次。 */
 const SCHEDULE_NOW = new Date('2026-11-25T02:00:00Z')
 
-function host(options: { groups?: boolean; push?: boolean; llm?: unknown } = {}) {
+function host(options: { groups?: boolean; push?: boolean; llm?: unknown; activeLiaison?: () => boolean; workspaceHistory?: () => SessionEventLike[] } = {}) {
   const groupTurns = new Map<string, GroupTurn>()
   const directory = mkdtempSync(join(tmpdir(), 'chief-liaison-tools-'))
   cleanup.push(() => rmSync(directory, { recursive: true, force: true }))
@@ -148,7 +148,10 @@ function host(options: { groups?: boolean; push?: boolean; llm?: unknown } = {})
     control: { show: () => ({ ...publicSettings(settings), dev: false, git: true, mobile: { ...publicSettings(settings).mobile, running: false, addresses: [] } }), update: async () => '已保存' },
     importer: { prompt: '把你对我的了解写出来', submit: submitImport },
     exporter: { build: () => ({ empty: true }) as never },
-    superhub, workspaceStore, staffStore, ...(groups && {groups}), groupTurn: (id: string) => groupTurns.get(id), orderFollowup:workspaceRoutes.followup, assign:workspaceRoutes.assign, follow:workspaceRoutes.follow, modelDefaults: () => defaults,
+    superhub, workspaceStore, staffStore, ...(groups && {groups}), groupTurn: (id: string) => groupTurns.get(id), orderFollowup:workspaceRoutes.followup, assign:workspaceRoutes.assign, follow:workspaceRoutes.follow,
+    workspaceDialogue: workspaceRoutes.liaisonDialogue, workspaceDialogueStatus: workspaceRoutes.liaisonDialogueStatus,
+    workspaceDialogueCancel: workspaceRoutes.liaisonDialogueCancel,
+    activeLiaison: options.activeLiaison, workspaceHistory: options.workspaceHistory, modelDefaults: () => defaults,
   } as unknown as Parameters<typeof registerTools>[1])
 
   /** 主人本轮原话：宿主确认的人类 RPC 输入。 */
@@ -179,6 +182,264 @@ const plain = (value: unknown) => {
   expect(losslessViolations(value)).toEqual([])
   return value as Record<string, unknown>
 }
+
+describe('从接口人查找工作区并执行日常操作', () => {
+  const exactQuestion = '问一下三家供应商的报价怎么比。含税价、质保和到货周期都核对一下。'
+  const initialRequest = '在采购比价的工作区里，开一个对话，不用开工单，' + exactQuestion
+  const confirmation = '你帮我做就行了，你可以做的。带工单也行，你就启动吧。'
+  const end = {type: 'turn/end', seq: 5, time: 5, data: {}}
+  const project = (f: ReturnType<typeof host>, requestId: string, name: string, goal = '') => {
+    const body = {requestId, name, goal}
+    return f.workspaceStore.createWorkspace(mutationKey(['v2','workspaces'], body), body).workspace
+  }
+  const metadata = (f: ReturnType<typeof host>, args: Record<string, unknown>, result: unknown, id: string): SessionEventLike[] => [
+    {type: 'tool/call', seq: 3, time: 3, data: {callId: id, name: 'chief_workspace'}},
+    {type: 'tool/result', seq: 4, time: 4, data: {message: {toolCallId: id}, meta: f.registered.get('chief_workspace')!.output.presentationMeta!(args, result)}},
+  ]
+
+  it('同一轮创建零工单群并送达首问，后续宽限和重放返回原对话深链', async () => {
+    const f = host({groups: true})
+    const space = project(f, 'space-destiny', '采购比价')
+    const another = project(f, 'space-interviews', '客户访谈', '整理访谈记录')
+    const args = {action: 'start_session', name: space.name, title: '供应商报价', question: exactQuestion}
+    const firstTurn = f.ownerTurn(initialRequest, 'destiny-first')
+    const opened = plain(await f.call('chief_workspace', args, f.liaison(firstTurn)))
+    expect(opened).toMatchObject({workspace: {id: space.id}, session: {title: '供应商报价'}, state: 'sent', sourceMessageId: 'g-1', traceId: 'initial'})
+    const session = f.workspaceStore.view(space.id).sessions[0]!
+    expect(session.delegationIds).toEqual([])
+    expect(f.groups!.lines(session)).toEqual([expect.objectContaining({kind: 'message', quote: {label: '主人原话', text: exactQuestion}})])
+    await vi.waitFor(() => expect(f.memberCalls).toEqual(['liaison']))
+    expect(await f.call('chief_workspace', {...args, title: '不同的标题'}, f.liaison(firstTurn))).toEqual(opened)
+    const secondTurn = f.liaison([...firstTurn, ...metadata(f, args, opened, 'start-result'), end, ...f.ownerTurn(confirmation, 'destiny-continue')])
+    const repeated = plain(await f.call('chief_workspace', {action: 'assign', name: space.name, request_source: 'previous', order_mode: 'fallback',
+      order_quote: '带工单也行', title: '供应商报价', promise: '输出分析'}, secondTurn))
+    expect(repeated).toEqual(opened)
+    expect(f.registered.get('chief_workspace')!.output.presentationMeta!(args, opened)).toMatchObject({'dsh-chief/workspace': {
+      id: space.id, name: space.name, sessionId: session.id, sessionTitle: session.title, sessionTraceId: 'initial', sourceMessageId: 'g-1',
+    }})
+    expect(f.workspaceStore.view(space.id).sessions).toHaveLength(1)
+    expect(f.workspaceStore.view(space.id).orders).toEqual([])
+    expect(f.workspaceStore.view(another.id).sessions).toEqual([])
+    expect(f.workspaceStore.personalWorkspaceId()).toBeUndefined()
+  })
+
+  it('明确要求另开一场时，为同一原问题建立新的操作并回放其独立回执', async () => {
+    const f = host({groups: true})
+    const space = project(f, 'space-repeat', '采购比价')
+    const first = f.ownerTurn(initialRequest, 'repeat-first')
+    const args = {action: 'start_session', name: space.name, title: '供应商报价', question: exactQuestion}
+    const opened = await f.call('chief_workspace', args, f.liaison(first))
+    const again = f.ownerTurn('同一个问题再开一场', 'repeat-next')
+    const beforeRepeat = [...first, ...metadata(f, args, opened, 'repeat-start'), end, ...again]
+    const repeatArgs = {...args, name: undefined, target_source: 'receipt', target_quote: '同一个问题',
+      request_source: 'receipt', new_session_quote: '再开一场'}
+    const repeated = await f.call('chief_workspace', repeatArgs, f.liaison(beforeRepeat))
+    expect(repeated.session).not.toEqual(opened.session)
+    expect(repeated).toMatchObject({workspaceActionOrigin: {originalRequestId: 'repeat-first', actionRequestId: 'repeat-next'}})
+    expect(await f.call('chief_workspace', repeatArgs, f.liaison(beforeRepeat))).toEqual(repeated)
+    const afterRepeat = f.liaison([...beforeRepeat, ...metadata(f, repeatArgs, repeated, 'repeat-receipt'), end,
+      ...f.ownerTurn('刚开的那场可加单备用', 'repeat-follow')])
+    expect(await f.call('chief_workspace', {action: 'assign', target_source: 'receipt', target_quote: '刚开的那场',
+      request_source: 'receipt', order_quote: '可加单备用', order_mode: 'fallback', title: '采购建议', promise: '交付供应商选择'},
+    afterRepeat)).toEqual(repeated)
+    expect(f.workspaceStore.view(space.id).sessions).toHaveLength(2)
+    expect(f.workspaceStore.view(space.id).orders).toEqual([])
+  })
+
+  it('承接没有工具回执的旧原话，上一轮给目标和问题，本轮给执行授权', async () => {
+    const f = host({groups: true})
+    const space = project(f, 'space-legacy', '采购比价')
+    const prior = f.ownerTurn(initialRequest, 'legacy-first')
+    const next = f.ownerTurn(confirmation, 'legacy-continue')
+    const args = {action: 'start_session', name: '采购比价', target_source: 'previous', request_source: 'previous', title: '供应商报价'}
+    await expect(f.call('chief_workspace', args, f.liaison(next))).rejects.toThrow('有效主人原话')
+    const receipt = await f.call('chief_workspace', args, f.liaison([...prior, end, ...next]))
+    expect(receipt).toMatchObject({workspace: {id: space.id}, state: 'sent'})
+    expect(f.workspaceStore.liaisonDialogue('legacy-first')).toMatchObject({
+      original: {requestId: 'legacy-first', text: initialRequest}, source: {requestId: 'legacy-continue', text: confirmation},
+    })
+    const third = f.ownerTurn('刚才那件事需要的话也可以开单', 'legacy-third')
+    const afterReceipt = f.liaison([...prior, end, ...next, ...metadata(f, args, receipt, 'legacy-start'), end, ...third])
+    expect(await f.call('chief_workspace', {action: 'assign', target_source: 'receipt', target_quote: '刚才那件事',
+      request_source: 'receipt', order_mode: 'fallback', order_quote: '需要的话也可以开单', title: '供应商报价', promise: '输出分析'}, afterReceipt)).toEqual(receipt)
+    expect(f.workspaceStore.view(space.id).orders).toEqual([])
+    expect(f.workspaceStore.view(space.id).sessions).toHaveLength(1)
+    expect(f.workspaceStore.personalWorkspaceId()).toBeUndefined()
+  })
+
+  it('同一原生插入事件可核对前一句，换段读取只为当前真人提供指代', async () => {
+    const archived: SessionEventLike[] = []
+    const f = host({groups: true, workspaceHistory: () => archived})
+    const space = project(f, 'space-splice', '采购比价')
+    const first = f.ownerTurn(initialRequest, 'splice-first')
+    const current = f.ownerTurn(confirmation, 'splice-next')
+    const args = {action: 'start_session', name: space.name, request_source: 'previous', target_source: 'previous', title: '供应商报价'}
+    const spliced: SessionEventLike = {type: 'agent/inbox/spliced', seq: 7, time: 7,
+      data: {target: 'next-step', inserted: [first[1]!.data, current[1]!.data]}}
+    expect(await f.call('chief_workspace', args, f.liaison([current[0]!, spliced]))).toMatchObject({workspace: {id: space.id}, state: 'sent'})
+    expect(f.workspaceStore.liaisonDialogue('splice-first')).toMatchObject({source: {requestId: 'splice-next'}})
+    archived.push(...f.ownerTurn(initialRequest, 'segment-first'), end)
+    await expect(f.call('chief_workspace', args, f.liaison([]))).rejects.toThrow('经宿主确认')
+    expect(await f.call('chief_workspace', args, f.liaison(f.ownerTurn(confirmation, 'segment-next')))).toMatchObject({workspace: {id: space.id}, state: 'sent'})
+    expect(f.workspaceStore.liaisonDialogue('segment-first')).toMatchObject({source: {requestId: 'segment-next'}})
+  })
+
+  it('承接上轮问题须使用上轮选区或目标证据，当前打开的无关工作区不会接到转交', async () => {
+    const f = host({groups: true})
+    const space = project(f, 'space-earlier', '采购比价')
+    const other = project(f, 'space-current', '会务行政')
+    const args = {action: 'start_session', request_source: 'previous', title: '供应商报价'}
+    const from = async (requestId: string, text: string, selectedId?: string) => {
+      await f.intake.submit({scope, requestId, text, context: selectedId ? {surface: 'workspace', selectedId} : {surface: 'today'}}, {channel: 'chat'})
+      return f.ownerTurn(text, requestId)
+    }
+    const owner = await from('select-other', confirmation, other.id)
+    const unbound = await from('earlier-today', initialRequest)
+    await expect(f.call('chief_workspace', args, f.liaison([...unbound, end, ...owner]))).rejects.toThrow('没有可沿用的工作区选区')
+    const bound = await from('earlier-project', '在这里新开对话，' + exactQuestion, space.id)
+    expect(await f.call('chief_workspace', args, f.liaison([...bound, end, ...owner]))).toMatchObject({workspace: {id: space.id}, state: 'sent'})
+    expect(f.workspaceStore.view(other.id).sessions).toEqual([])
+  })
+
+  it('旧事项明确允许备用工单时按原请求去重，保存两轮各自来源', async () => {
+    const f = host({groups: true})
+    const space = project(f, 'space-fallback', '采购比价')
+    const prior = f.ownerTurn(initialRequest, 'fallback-first')
+    const next = f.ownerTurn(confirmation, 'fallback-continue')
+    const auth = f.liaison([...prior, end, ...next])
+    const args = {action: 'assign', name: space.name, target_source: 'previous', request_source: 'previous', order_mode: 'fallback',
+      title: '供应商报价', promise: '给出问题的分析'}
+    for (const order_quote of [undefined, '我要求你必须开单']) {
+      await expect(f.call('chief_workspace', {...args, order_quote}, auth)).rejects.toThrow('本轮明确开单或允许')
+    }
+    await expect(f.call('chief_workspace', {...args, order_quote: '带工单也行'}, auth)).rejects.toThrow('先尝试原定的普通对话')
+    const original = {requestId: 'fallback-first', messageId: 'msg-fallback-first', text: initialRequest}
+    f.workspaceStore.beginLiaisonDialogue({mode: 'start', workspaceId: space.id, title: '供应商报价',
+      source: original, original, conversationId: 'hq', question: exactQuestion})
+    f.workspaceStore.saveLiaisonDialogue(original.requestId, {state: 'failed', reason: '模拟群服务无法送达'})
+    const first = await f.call('chief_workspace', {...args, order_quote: '带工单也行'}, auth)
+    expect(await f.call('chief_workspace', {...args, order_quote: '带工单也行'}, auth)).toEqual(first)
+    expect(f.workspaceStore.view(space.id).orders).toHaveLength(1)
+    const order = f.workspaceStore.assignedOrder('fallback-first')!
+    expect(order.workspaceId).toBe(space.id)
+    expect(f.workspaceStore.orderOriginal(space.id, order.id)).toEqual({text: initialRequest, complete: true, liaisonSource: {
+      requestId: 'fallback-first', messageId: 'msg-fallback-first',
+      authorization: {requestId: 'fallback-continue', messageId: 'msg-fallback-continue', text: '带工单也行'},
+    }})
+  })
+
+  it('按真实目标过滤，先列同名候选，收到主人选择后回取原问题', async () => {
+    const f = host({groups: true})
+    const short = project(f, 'space-short', '增长研究', '两周临时验证')
+    const long = project(f, 'space-long', '增长研究', '做长期记录和复盘记录')
+    const other = project(f, 'space-other', '其他项目', '做长期记录和复盘')
+    const exact = project(f, 'space-exact', '复盘记录')
+    const said = '在增长研究开个普通对话，问一下转化变化。顺便列一下其他项目的会话。'
+    const firstTurn = f.ownerTurn(said, 'choice-first')
+    const args = {action: 'start_session', name: '增长研究', workspace_id: short.id, title: '转化变化', question: '问一下转化变化'}
+    const pending = await f.call('chief_workspace', args, f.liaison(firstTurn))
+    expect(pending.candidates).toEqual([{number: 1, id: short.id, name: short.name, goal: short.goal, owner: short.owner},
+      {number: 2, id: long.id, name: long.name, goal: long.goal, owner: long.owner}])
+    expect(f.workspaceStore.view(short.id).sessions).toHaveLength(0)
+    const found = await f.call('chief_workspace', {action: 'list', query: '长期记录'})
+    expect(found.workspaces).toEqual([expect.objectContaining({id: long.id}), expect.objectContaining({id: other.id})])
+    const listArgs = {action: 'list_sessions', name: other.name}
+    const listResult = await f.call('chief_workspace', listArgs, f.liaison(firstTurn))
+    const continuation = (text: string) => f.liaison([...firstTurn, ...metadata(f, args, pending, 'choice-result'),
+      ...metadata(f, listArgs, listResult, 'read-other'), end, ...f.ownerTurn(text, 'choice-next')])
+    expect(await f.call('chief_workspace', {action: 'list_sessions', request_source: 'pending', target_quote: exact.name},
+      continuation('改到复盘记录看看会话'))).toMatchObject({workspace: {id: exact.id}})
+    const nextArgs = {action: 'start_session', request_source: 'pending', title: '转化变化', target_quote: '长期记录'}
+    await expect(f.call('chief_workspace', {...nextArgs, workspace_id: other.id}, continuation('做长期记录那个'))).rejects.toThrow('不同目标')
+    const sent = await f.call('chief_workspace', {...nextArgs, workspace_id: long.id}, continuation('做长期记录那个'))
+    expect(sent).toMatchObject({workspace: {id: long.id}, state: 'sent'})
+    const ordinalArgs = {...nextArgs, target_quote: '第二个', target_choice: 2, workspace_id: long.id}
+    await expect(f.call('chief_workspace', {...ordinalArgs, name: other.name}, continuation('我选第二个'))).rejects.toThrow('不同目标')
+    expect(await f.call('chief_workspace', ordinalArgs, continuation('我选第二个'))).toEqual(sent)
+    expect(f.workspaceStore.liaisonDialogue('choice-first')).toMatchObject({question: said})
+    expect(f.workspaceStore.view(other.id).sessions).toHaveLength(0)
+  })
+
+  it('主人可取消尚未投递的原请求，晚到的重试也沿用取消结果', async () => {
+    const f = host({groups: true})
+    const space = project(f, 'space-cancel', '采购比价')
+    const original = {requestId: 'cancel-first', messageId: 'msg-cancel-first', text: initialRequest}
+    f.workspaceStore.beginLiaisonDialogue({mode: 'start', workspaceId: space.id, title: '供应商报价',
+      source: original, original, conversationId: 'hq', question: exactQuestion})
+    const prior = f.ownerTurn(initialRequest, original.requestId)
+    const chosen = f.liaison([...prior, end, ...f.ownerTurn('那件事先不做了', 'cancel-now')])
+    const args = {action: 'cancel_session_request', request_source: 'previous', cancel_quote: '先不做了'}
+    await expect(f.call('chief_workspace', {...args, cancel_quote: '必须取消'}, chosen)).rejects.toThrow('本轮取消')
+    const cancelled = await f.call('chief_workspace', args, chosen)
+    expect(cancelled).toMatchObject({workspace: {id: space.id}, state: 'cancelled'})
+    expect(await f.call('chief_workspace', args, chosen)).toEqual(cancelled)
+    const attempted = await f.call('chief_workspace', {action: 'start_session', name: space.name, title: '供应商报价', question: exactQuestion}, f.liaison(prior))
+    expect(attempted).toMatchObject({state: 'cancelled'})
+    expect(f.workspaceStore.pendingLiaisonDialogues()).toEqual([])
+    expect(f.memberCalls).toEqual([])
+    expect(f.workspaceStore.view(space.id).orders).toEqual([])
+  })
+
+  it('续接原会话、读回现有目录与幕僚、按上轮真实回执更新配置', async () => {
+    const f = host({groups: true})
+    const space = project(f, 'space-review', '设计评审', '设计备忘')
+    const other = project(f, 'space-sales', '产品销售', '销售培训')
+    const body = {requestId: 'make-session', title: '方案晨会'}
+    const {session} = f.workspaceStore.createSession(mutationKey(['v2','workspaces',space.id,'sessions'], body), space.id, body)
+    const read = f.liaison(f.ownerTurn('有哪几场设计评审的对话？', 'read-sessions'))
+    expect(await f.call('chief_workspace', {action: 'list_sessions', name: space.name}, read)).toMatchObject({
+      sessions: [{id: session.id, title: session.title, traceId: 'initial', orderIds: []}],
+    })
+    const args = {action: 'send_session', name: space.name, session_id: session.id, session_quote: session.title, question: '问一下确认时间'}
+    const sentTurn = f.ownerTurn('给设计评审的方案晨会再问一下确认时间', 'send-workspace')
+    await expect(f.call('chief_workspace', {...args, trace_id: 'old'}, f.liaison(sentTurn))).rejects.toThrow('版本已更新')
+    const sent = await f.call('chief_workspace', {...args, trace_id: 'initial'}, f.liaison(sentTurn))
+    expect(sent).toMatchObject({workspace: {id: space.id}, session: {id: session.id}, state: 'sent'})
+    expect(f.workspaceStore.view(space.id).sessions).toHaveLength(1)
+    expect(f.workspaceStore.view(space.id).orders).toEqual([])
+    const follow = (text: string, id: string) => f.liaison([...sentTurn, ...metadata(f, args, sent, 'send-receipt'), end, ...f.ownerTurn(text, id)])
+    const config = {action: 'update_workspace', target_source: 'receipt', target_quote: '刚才那个工作区', goal: '每周复盘'}
+    const current = follow('把刚才那个工作区的目标改成每周复盘', 'change-goal')
+    await expect(f.call('chief_workspace', {...config, workspace_id: other.id}, current)).rejects.toThrow('不同目标')
+    await expect(f.call('chief_workspace', {...config, name: other.name}, current)).rejects.toThrow('不同目标')
+    await expect(f.call('chief_workspace', {...config, expected_goal: '已过时'}, current)).rejects.toThrow('工作区目标刚刚已变更')
+    expect(await f.call('chief_workspace', config, current)).toMatchObject({workspace: {id: space.id}, changed: {goal: '每周复盘'}})
+    const rename = {action: 'update_workspace', name: space.name, new_name: '设计协作'}
+    const renameTurn = f.liaison(f.ownerTurn('把设计评审改名为设计协作', 'rename-workspace'))
+    const renamed = await f.call('chief_workspace', rename, renameTurn)
+    expect(renamed).toMatchObject({workspace: {id: space.id}, changed: {name: '设计协作'}})
+    expect(await f.call('chief_workspace', rename, renameTurn)).toEqual(renamed)
+    expect(f.workspaceStore.session(space.id, session.id)).toMatchObject({title: '方案晨会'})
+    expect(f.workspaceStore.workspace(other.id)).toEqual(other)
+    expect(await f.call('chief_workspace', {action: 'list_staff', name: '设计协作'},
+      f.liaison(f.ownerTurn('查查设计协作里有哪些幕僚', 'read-staff')))).toMatchObject({workspace: {id: space.id}, members: []})
+    const staff = {action: 'create', workspace_id: space.id, target_quote: '每周复盘', name: '复盘助手', brief: '准备每周复盘与行动清单，汇总当周决定并报告没有完成的事项。'}
+    expect(await f.call('chief_staff', staff, f.liaison(f.ownerTurn('在每周复盘的工作区添加复盘助手', 'create-staff-by-goal')))).toMatchObject({workspace: {id: space.id}, staff: {name: staff.name}})
+  })
+
+  it('拒绝查无所指、伪造回执、只读来源、归档及已失效的私聊', async () => {
+    let active = true
+    const f = host({groups: true, activeLiaison: () => active})
+    const space = project(f, 'blocked-current', '设计评审')
+    const archiveBody = {requestId: 'archive-workspace'}
+    f.workspaceStore.archive(mutationKey(['v2','workspaces', space.id, 'archive'], archiveBody), space.id)
+    const args = {action: 'start_session', name: space.name, title: '晨会'}
+    await expect(f.call('chief_workspace', args, f.liaison(f.ownerTurn('在设计评审开晨会', 'blocked-a')))).rejects.toThrow('已归档')
+    await expect(f.call('chief_workspace', {action: 'assign', name: '没建项目', title: '晨会', promise: '答复'},
+      f.liaison(f.ownerTurn('在没建项目开一张单', 'blocked-missing')))).rejects.toThrow('没有名为')
+    const lackingVerifiedReceipt = f.liaison([...f.ownerTurn('查下设计评审', 'blocked-no-receipt'), end, ...f.ownerTurn('在刚才那个区建对话', 'blocked-invalid')])
+    await expect(f.call('chief_workspace', {action: 'start_session', workspace_id: space.id, target_source: 'receipt', target_quote: '刚才那个区', title: '晨会'}, lackingVerifiedReceipt)).rejects.toThrow('没有可核对的工作区')
+    const readonly = {scope, text: '在设计评审开晨会', operation: 'read', requestId: 'blocked-ro'}
+    await f.intake.submit(readonly, {channel: 'owner'})
+    const readTurn = f.liaison(f.ownerTurn(readonly.text, readonly.requestId))
+    await expect(f.call('chief_workspace', args, readTurn)).rejects.toThrow('指定了只读')
+    expect(await f.call('chief_workspace', {action: 'list_sessions', name: space.name}, readTurn)).toMatchObject({sessions: []})
+    active = false
+    await expect(f.call('chief_workspace', args, f.liaison(f.ownerTurn('在设计评审开晨会', 'blocked-old-version')))).rejects.toThrow('接口人对话或第二大脑已切换')
+    expect(f.workspaceStore.view(space.id).sessions).toEqual([])
+    expect(f.workspaceStore.personalWorkspaceId()).toBeUndefined()
+  })
+})
 
 it('接口人新建幕僚时保存目录中的默认造型，更新角色卡后沿用默认', async () => {
   const f = host()
@@ -423,7 +684,7 @@ describe('方案 A：模型理解、结构化提交；主人本轮原话作为�
     f.staffStore.apply(space.id,{action:'join',staffId:'engineer',duty:'效果评测',requestId:'join-engineer'})
     const named = await f.call('chief_workspace',{action:'assign',name:space.name,staff_name:'工程师',title:'跑评测',promise:'评测结果'},
       f.liaison(f.ownerTurn('在' + space.name + '里让工程师跑一遍评测','group-named')))
-    expect(named).toMatchObject({ message: expect.stringContaining('并 @ 了工程师') })
+    expect(named).toMatchObject({ message: expect.stringContaining('交办将指定 @工程师') })
     await vi.waitFor(() => expect(f.memberCalls).toEqual(['liaison', 'engineer']))
   })
 

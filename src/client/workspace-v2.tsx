@@ -168,6 +168,11 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
     await refresh()
     setOpening(current => current === next ? undefined : current)
   }
+  function openWorkspaceReceipt(workspace: string, target: Pick<Place, 'panel' | 'session' | 'delegation' | 'trace' | 'message'> = {}) {
+    void enterCreated({ view: 'workspace', workspace, ...target }, async () => {
+      await Promise.all([index.refresh(), workspace === chosenId && current.refresh()])
+    })
+  }
   const openWorkspace = (id?: string) => go({ view: 'workspace', workspace: id })
   const openDelegation = (id: string) => go({ view: 'workspace', workspace: chosenId, delegation: id })
   const openSession = (id: string, from?: string, message?: string, trace?: string) =>
@@ -235,7 +240,7 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
       : {view:'workspace',workspace:row.workspaceId,panel:'execution',session:row.sessionId})}
     openOrder={row => go({view:'workspace',workspace:row.workspaceId,delegation:row.orderId})}/>
   const lostOrder = !panel && place.delegation && (index.data && !workspace || view && !delegation)
-  async function reread() { await Promise.all([index.refresh(), current.refresh()]) }
+  const reread = useCallback(async () => { await Promise.all([index.refresh(), current.refresh()]) }, [index.refresh, current.refresh])
   return <ArchivedWorkspace.Provider value={archived}><OwnerActions.Provider value={{ items:pending, refresh:ownerActions.refresh }}>
     <header className="v2-mast"><div className="v2-bound">
       <V2Brand home={() => go({ view: 'today' })}/>
@@ -366,14 +371,13 @@ function Home({ scope, native, configure, reloadBrain }: Props) {
       surface={place.view === 'profile' ? 'history' : place.view} workspace={selecting ? workspace : undefined}
       trace={shownLiaisonSource?.traceId} sourceMessage={shownLiaisonSource?.messageId} sourceSession={shownLiaisonSource?.sessionId}
       currentTrace={() => setLiaisonSource(undefined)}
-      sessionId={liaisonSession ? liaisonSession.id : undefined} workOrderId={liaisonOrder || undefined}
+      sessionId={liaisonSession ? liaisonSession.id : undefined} sessionTraceId={liaisonSession ? place.trace : undefined} workOrderId={liaisonOrder || undefined}
       selectedId={place.view === 'people' ? place.item : place.view === 'calendar' ? place.date : selecting ? workspace.id : undefined}
       close={() => {setPopup(undefined);setLiaisonSource(undefined)}} openProfileImport={openProfile}
       pending={(pendingCount > 0 || ownerActions.error) ? pendingList(true) : undefined}
-      changed={index.refresh} openWorkspace={id => { void enterCreated({view:'workspace',workspace:id},index.refresh) }}
-      openDelegation={(workspace, delegation) => { void enterCreated({view:'workspace',workspace,delegation}, async () => {
-        await Promise.all([index.refresh(), workspace === chosenId && current.refresh()])
-      }) }}
+      changed={reread} openWorkspace={openWorkspaceReceipt}
+      openDelegation={(workspace, delegation) => openWorkspaceReceipt(workspace, { delegation })}
+      openSession={(workspace, session, message, trace) => openWorkspaceReceipt(workspace, { panel: 'execution', session, message, trace })}
       openRoom={id => openHistory(historyItemId('room', id))} openSchedules={openSchedules}/>}
     {(popup === 'import' || popup === 'export') && <TransferDialog key={popup} mode={popup} close={() => setPopup(undefined)}
       openProfile={() => openProfile()} openLibrary={() => openHistory()}/>}

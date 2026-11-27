@@ -66,6 +66,55 @@ export interface GroupStart {
   /** The staff member the owner named: the line @-mentions them. Absent: the liaison member decides whom to @. */
   staffId?: string
 }
+
+export interface LiaisonOwnerTurn { requestId: string; messageId: string; text: string }
+
+export interface LiaisonDialogueRequest {
+  mode: 'start' | 'send'
+  /** A newly requested conversation may repeat a prior question as a separate action. */
+  actionRequestId?: string
+  liaisonTraceId?: string
+  workspaceId: string
+  sessionId?: string
+  traceId?: string
+  title?: string
+  conversationId: string
+  source: LiaisonOwnerTurn
+  original: LiaisonOwnerTurn
+  question?: string
+  handoff?: string
+  staffId?: string
+  inputAttachments?: ChatInputAttachment[]
+}
+
+export interface LiaisonOrderContext {
+  actionRequestId?: string
+  original: LiaisonOwnerTurn
+  source: LiaisonOwnerTurn
+  conversationId: string
+  orderMode: 'explicit' | 'fallback'
+  authorizationQuote?: string
+}
+
+export interface LiaisonDialogueCancellation {
+  originalRequestId: string
+  workspaceId: string
+  source: LiaisonOwnerTurn
+  conversationId: string
+}
+
+type LiaisonDialogueProgress =
+  | { state: 'created' }
+  | { state: 'replaced' }
+  | { state: 'cancelled'; by?: LiaisonOwnerTurn; reason?: string; seq?: number }
+  | { state: 'pending'; posting?: true; reason?: string }
+  | { state: 'failed'; reason?: string }
+  | { state: 'sent'; seq: number }
+
+export type LiaisonDialogueRecord = Omit<LiaisonDialogueRequest, 'sessionId' | 'traceId'>
+  & { ref: string; sessionId: string; traceId: string; progress: LiaisonDialogueProgress }
+
+const dialogueRef = (requestId: string) => 'liaison-question-' + workspaceFingerprint(requestId)
 /**
  * A turn accepted before its conversation was free. `interject` rows are owner words moved to the next turn; they keep
  * the owner's own request (`hash`) and have no `delegationId` when they belong to the session discussion.
@@ -334,6 +383,7 @@ interface Board {
   commands?: Record<string, OwnerCommand>
   /** Liaison work for roster groups whose group line is not posted yet. */
   groupStarts?: GroupStart[]
+  liaisonDialogues?: Record<string, LiaisonDialogueRecord>
   /** Bound, changed and removed project directories of workspaces, oldest first. */
   directoryChanges?: { workspaceId: string; at: string; from?: string; to?: string }[]
   /** Workspaces archived and restored, oldest first. */
@@ -814,7 +864,10 @@ export class WorkspaceV2Store {
     const workspace = this.board.workspaces.find(row => row.id === context.selectedId)
     if (!workspace || !archived && workspaceArchived(workspace)) return
     const session = context.sessionId ? sessionRecord(this.board, workspace.id, context.sessionId) : undefined
-    if (!session || session.deletedAt) return {workspace, session:undefined, order:undefined}
+    const activeTrace = session && (this.board.dialogueTraces?.[session.id]?.active ?? INITIAL_WORKSPACE_TRACE)
+    if (!session || session.deletedAt || context.sessionTraceId && activeTrace !== context.sessionTraceId) {
+      return {workspace, session:undefined, order:undefined}
+    }
     const order = context.workOrderId ? orderRecord(this.board, workspace.id, context.workOrderId) : undefined
     return {workspace, session, order:order?.sessionId === session.id && !order.deletedAt ? order : undefined}
   }
@@ -1754,6 +1807,97 @@ export class WorkspaceV2Store {
     })
   }
 
+  updateWorkspace(mutation: Mutation, workspaceId: string, body: Body) {
+    this.workspace(workspaceId)
+    this.writable(workspaceId)
+    return this.write(mutation, board => {
+      const workspace = board.workspaces.find(row => row.id === workspaceId)!
+      const expected = body.expected as Partial<Pick<V2Workspace, 'name' | 'goal'>> | undefined
+      if (body.name === undefined && body.goal === undefined) return workspaceError(400, '请选择要更新的工作区名称或目标')
+      if (body.name !== undefined) {
+        if (expected?.name !== undefined && workspace.name !== expected.name) return workspaceError(409, '工作区名称刚刚已变更，请核对当前名称')
+        workspace.name = field(body.name, '工作区名称', 160)
+      }
+      if (body.goal !== undefined) {
+        if (expected?.goal !== undefined && workspace.goal !== expected.goal) return workspaceError(409, '工作区目标刚刚已变更，请核对当前目标')
+        workspace.goal = body.goal === '' ? '' : field(body.goal, '工作区目标', 4000)
+      }
+      return { workspace }
+    })
+  }
+
+  liaisonDialogue(requestId: string): LiaisonDialogueRecord | undefined {
+    this.current()
+    return this.board.liaisonDialogues?.[dialogueRef(requestId)]
+  }
+
+  /** Saving the session and the pending question together lets the host resume the same group. */
+  beginLiaisonDialogue(input: LiaisonDialogueRequest): LiaisonDialogueRecord {
+    const { mode, workspaceId, sessionId, traceId, original, question } = input
+    const requestId = input.actionRequestId ?? original.requestId
+    if (!this.rosterGroups) return workspaceError(503, '当前工作区宿主暂不支持普通群聊')
+    this.workspace(workspaceId)
+    this.writable(workspaceId)
+    const saved = this.liaisonDialogue(requestId)
+    if (input.actionRequestId !== undefined && input.actionRequestId !== input.source.requestId &&
+      (saved?.original.requestId !== original.requestId || saved.original.text !== original.text)) {
+      return workspaceError(400, '请用本轮主人的请求重新开聊，或打开已建立的会话')
+    }
+    if (saved) {
+      if (saved.workspaceId !== workspaceId || saved.mode !== mode || mode === 'send' && sessionId !== saved.sessionId) {
+        return workspaceError(409, '这项请求已有负责会话，请核对已保存的工作区和会话')
+      }
+      if (saved.progress.state === 'replaced') return workspaceError(409, '这项请求已交给工单，请打开原工单')
+      return saved
+    }
+    if (this.assignedOrder(requestId)) return workspaceError(409, '这项请求已交给工单，请打开原工单')
+    if (question !== undefined && (!question.trim() || question.length > 64_000 || !original.text.includes(question))) {
+      return workspaceError(400, '请引用主人原话中要转交的完整问题')
+    }
+    if (mode === 'send' && !question) return workspaceError(400, '请提供要转交的主人原话')
+    const ref = dialogueRef(requestId)
+    const handoff = handoffOf(input.handoff)
+    return this.commit(board => {
+      const session = mode === 'start'
+        ? rosterSession(workspaceId, field(input.title, '会话名称', 300))
+        : findSession(board, workspaceId, sessionId ?? '')
+      if (session.closed) return workspaceError(409, '这场会话已关闭，请从工作区另开会话')
+      if (!isRosterGroup(session)) return workspaceError(409, '请选择工作区群聊来继续普通对话')
+      const active = mode === 'start' ? INITIAL_WORKSPACE_TRACE : this.assertActiveTrace(session, traceId)
+      if (mode === 'start') board.sessions.push(session)
+      const record: LiaisonDialogueRecord = {
+        ...structuredClone(input), handoff, ref, sessionId: session.id, traceId: active,
+        progress: { state: question ? 'pending' : 'created' },
+      }
+      ;(board.liaisonDialogues ??= {})[ref] = record
+      return record
+    })
+  }
+
+  pendingLiaisonDialogues(): LiaisonDialogueRecord[] {
+    this.current()
+    return Object.values(this.board.liaisonDialogues ?? {}).filter(row => row.progress.state === 'pending' || row.progress.state === 'failed')
+  }
+
+  saveLiaisonDialogue(requestId: string, progress: LiaisonDialogueProgress) {
+    const previous = this.liaisonDialogue(requestId)
+    if (!previous || previous.progress.state === 'sent' || previous.progress.state === 'replaced' || previous.progress.state === 'cancelled') return
+    this.commit(board => { board.liaisonDialogues![previous.ref]!.progress = progress })
+  }
+
+  cancelLiaisonDialogue({originalRequestId,workspaceId,source}: LiaisonDialogueCancellation) {
+    const record = this.liaisonDialogue(originalRequestId)
+    if (!record || record.progress.state === 'replaced') return
+    if (record.workspaceId !== workspaceId) return workspaceError(409, '这项请求属于另一个工作区，请核对目标')
+    if (record.progress.state === 'created' || record.progress.state === 'cancelled') return record
+    if (record.progress.state === 'sent' || record.progress.state === 'pending' && record.progress.posting) {
+      return workspaceError(409, '原问题已进入或正在写入群聊，请打开原会话查看并叫停')
+    }
+    const {requestId,messageId,text} = source
+    this.saveLiaisonDialogue(originalRequestId, {state:'cancelled', by: {requestId,messageId,text}})
+    return this.liaisonDialogue(originalRequestId)
+  }
+
   createDelegation(mutation: Mutation, workspace: V2Workspace, body: Body, staff?: {id:string;name:string;token:string}) {
     return this.write(mutation, board => {
       writable(board, workspace.id)
@@ -1799,10 +1943,17 @@ export class WorkspaceV2Store {
   }
 
   /** Bind the owner's original words to one work order and the selected native executor. */
-  assign(sourceId: string, text: string, requested?: V2Executor, selected?: string, selectedSession?: string, briefInput?:Partial<OrderBrief>, staff?:{id:string;name:string;token:string}, permission?: V2CodingPermission, handoffInput?: string, directoryInputValue?: string, inputAttachments?: ChatInputAttachment[], reporting?: EngagementReporting) {
+  assign(sourceId: string, text: string, requested?: V2Executor, selected?: string, selectedSession?: string, briefInput?:Partial<OrderBrief>, staff?:{id:string;name:string;token:string}, permission?: V2CodingPermission, handoffInput?: string, directoryInputValue?: string, inputAttachments?: ChatInputAttachment[], reporting?: EngagementReporting, ownerContext?: LiaisonOrderContext) {
     this.current()
     permissionOf(permission)
     const handoff = handoffOf(handoffInput)
+    const authorization = ownerContext?.authorizationQuote ?? ownerContext?.source.text
+    if (ownerContext && (ownerContext.source.requestId !== sourceId || ownerContext.original.text !== text
+      || !authorization || !ownerContext.source.text.includes(authorization))) return workspaceError(400, '工单缺少可核对的主人原话或本轮授权')
+    if (ownerContext?.actionRequestId && this.liaisonDialogue(ownerContext.actionRequestId)?.original.requestId !== ownerContext.original.requestId) {
+      return workspaceError(409, '原问题和负责会话的记录不一致，请核对已有回执')
+    }
+    sourceId = ownerContext?.actionRequestId ?? ownerContext?.original.requestId ?? sourceId
     const previousId = assignmentId('signup', sourceId)
     const previous = !!this.board.receipts['req-' + previousId]
     const requestId = previous ? previousId : assignmentId('assign', sourceId)
@@ -1819,9 +1970,19 @@ export class WorkspaceV2Store {
     const result = this.write(mutation, board => {
       if (typeof text !== 'string' || !text.trim() || text.length > 64_000) return workspaceError(400, '请填写有效的交办原话，最多 64000 字')
       writable(board, selected ?? board.personalWorkspaceId)
+      const dialogue = board.liaisonDialogues?.[dialogueRef(sourceId)]
+      if (!dialogue && ownerContext?.orderMode === 'fallback') {
+        return workspaceError(409, '请先尝试把原问题发到工作区普通对话')
+      }
+      if (dialogue) {
+        if (!ownerContext || dialogue.workspaceId !== selected || dialogue.progress.state !== 'failed') {
+          return workspaceError(409, '原请求已有普通对话，请先核对会话和送达状态')
+        }
+        dialogue.progress = { state: 'replaced' }
+      }
       if (requestedDirectory !== undefined && executor === 'dsh') return workspaceError(400, CODING_ONLY + '，请选择 codex 或 claude-code')
       const directory = requestedDirectory === undefined ? undefined : this.checkDirectory(requestedDirectory)
-      if (roster) return this.assignGroup(board, mutation, text, selected, bound, briefInput, staff, permission, handoff, directory, inputAttachments, reporting)
+      if (roster) return this.assignGroup(board, mutation, text, selected, bound, briefInput, staff, permission, handoff, directory, inputAttachments, reporting, ownerContext)
       if (inputAttachments?.length) return workspaceError(409, '请在工作区群聊交办这些材料')
       let workspace = board.workspaces.find(w => w.id === (selected ?? board.personalWorkspaceId))
       if (!workspace) {
@@ -1865,7 +2026,7 @@ export class WorkspaceV2Store {
    * quoted) is posted to the group once (`groupStarts`), @-mentioning the staff member the owner named.
    */
   private assignGroup(board: Board, mutation: Mutation, text: string, selected: string | undefined, bound: V2Session | undefined, briefInput: Partial<OrderBrief> | undefined,
-    staff: {id:string;name:string;token:string} | undefined, permission: V2CodingPermission | undefined, handoff: string | undefined, directory: string | undefined, inputAttachments?: ChatInputAttachment[], reporting?: EngagementReporting) {
+    staff: {id:string;name:string;token:string} | undefined, permission: V2CodingPermission | undefined, handoff: string | undefined, directory: string | undefined, inputAttachments?: ChatInputAttachment[], reporting?: EngagementReporting, ownerContext?: LiaisonOrderContext) {
     let workspace = board.workspaces.find(w => w.id === (selected ?? board.personalWorkspaceId))
     if (!workspace) {
       if (selected || board.personalWorkspaceId) return workspaceError(404, '找不到这项交办所在的工作区')
@@ -1885,13 +2046,21 @@ export class WorkspaceV2Store {
     if (staff) delegation.staffId = staff.id
     delegation.hasOriginal = true
     const originals = board.originals ??= {}
-    originals[delegation.id] = {text,complete:true}
+    const source = ownerContext?.original
+    const authorization = ownerContext && {
+      requestId:ownerContext.source.requestId,messageId:ownerContext.source.messageId,text:ownerContext.authorizationQuote ?? ownerContext.source.text,
+    }
+    originals[delegation.id] = {text,complete:true, ...(source && authorization && source.requestId !== authorization.requestId && {
+      liaisonSource: {requestId:source.requestId,messageId:source.messageId,authorization},
+    })}
     session.delegationIds.push(delegation.id)
     board.delegations.push(delegation)
     const said = handoff ?? assignHandoff(delegation.title, delegation.promise)
     ;(board.liaisonTurns ??= {})['start-' + mutation.id] = {handoff: said}
+    const quoted = source && authorization && source.requestId !== authorization.requestId
+      ? text + '\n\n〔主人本次授权〕\n' + authorization.text : text
     ;(board.groupStarts ??= []).push({kind: 'assign', requestId: 'start-' + mutation.id, workspaceId: workspace.id, sessionId: session.id, orderId: delegation.id, generation: delegation.reporting ? delegation.generation : undefined,
-      handoff: said, original: text, ...(staff && {staffId: staff.id}), ...inputAttachments?.length && {inputAttachments: structuredClone(inputAttachments)}})
+      handoff: said, original: quoted, ...(staff && {staffId: staff.id}), ...inputAttachments?.length && {inputAttachments: structuredClone(inputAttachments)}})
     return { workspace, delegation, session }
   }
 

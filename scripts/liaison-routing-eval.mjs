@@ -84,6 +84,20 @@ const sameDirectory = (value, expected) => {
   const given = String(value ?? '').trim().replace(/^~(?=\/|$)/, homedir())
   try { return realpathSync(given) === realpathSync(expected) } catch { return false }
 }
+const dialogueWorkspace = process.env.CHIEF_ROUTING_DIALOGUE_WORKSPACE || '研究档案'
+const dialogueQuestion = process.env.CHIEF_ROUTING_DIALOGUE_QUESTION || '季度材料里有哪些地方要再核对？先看来源和日期。'
+const dialogueFirst = process.env.CHIEF_ROUTING_DIALOGUE_FIRST || `在${dialogueWorkspace}工作区新开一个对话，不用开工单。问一下${dialogueQuestion}`
+const heldQuestion = '比较三家供应商时要留哪几项凭据？'
+const heldFirst = '我在想在做供应商比价的项目里开个对话问一下：' + heldQuestion + '现在先别执行。'
+const dialogueConfirm = '你帮我做就行了，你可以做的。带工单也行，你就启动吧。'
+const dialogueTarget = (turn, name) => turn.workspaces.find(space => space.name === name)?.id
+function judgeDialogue(turn, name, original) {
+  const target = dialogueTarget(turn, name)
+  if (!target || turn.newWorkspaces || turn.newRooms || createdTicket(turn) || turn.newOrders) return '普通对话额外写入了工作区、工单或讨论'
+  const entry = turn.dialogues.find(row => row.workspaceId === target && row.quote?.includes(original))
+  if (turn.newSessions !== 1 || !entry?.sessionId) return '没有在指定工作区新建一场对话并转入原问题'
+  if (!entry.reply) return '工作区成员尚未回答或提出需要补充的资料'
+}
 
 /** Owner phrases in conversation order. `group` cases must pass every run. */
 const allCases = [
@@ -162,6 +176,23 @@ const allCases = [
     judge: turn => {
       if (turn.newWorkspaces || !calls(turn, 'chief_workspace', row => args(row).action === 'list' && succeeded(row)).length || !turn.reply.includes('字节 Landing')) return '未从真实清单回答'
     } },
+  { id:'workspace-dialogue-start', said:dialogueFirst, dialogue:true, group:true,
+    expect:'在指定工作区开一场普通对话，转入首问并读回成员回复，新增零张工单',
+    judge:turn => judgeDialogue(turn, dialogueWorkspace, dialogueQuestion) },
+  { id:'workspace-dialogue-reuse', needs:['workspace-dialogue-start'], said:'就启动吧，带工单也行。', dialogue:true, group:true,
+    expect:'上轮问题已送达，返回同一会话，新增零场会话和零张工单',
+    judge:turn => {
+      if (turn.newWorkspaces || turn.newRooms || turn.newSessions || turn.newOrders || createdTicket(turn)) return '已经发过的事项被重复启动'
+      if (!turn.dialogues.some(row => row.workspaceId === dialogueTarget(turn, dialogueWorkspace) && row.quote?.includes(dialogueQuestion))) return '没有给出已送达会话的真实入口'
+    } },
+  { id:'workspace-dialogue-held', said:heldFirst, dialogue:true, group:true,
+    expect:'主人暂不执行，保留聊天并等待下一轮',
+    judge:turn => {
+      if (turn.newRooms || turn.newWorkspaces || turn.newOrders || turn.newSessions || createdTicket(turn)) return '主人要求等待却执行了写入'
+    } },
+  { id:'workspace-dialogue-confirm', needs:['workspace-dialogue-held'], said:dialogueConfirm, dialogue:true, group:true,
+    expect:'从上轮描述找到采购筹备，续办原问题，优先保留普通对话',
+    judge:turn => judgeDialogue(turn, '采购筹备', heldQuestion) },
   { id: 'workspace-directory', needs: ['workspace-create'], get said() { return '把字节 Landing 绑定到 ' + projectDir('landing') }, expect: 'set_directory 把工作区绑定到主人给的目录，不建单',
     judge: turn => {
       const bound = calls(turn, 'chief_workspace', row => args(row).action === 'set_directory' && succeeded(row))
@@ -448,6 +479,11 @@ async function configureHost(host, model) {
   await host.start()
   await host.api('/pause', { paused: true })
   const {scope} = await host.api('/v2/bootstrap')
+  if (CASES.some(item => item.dialogue)) {
+    for (const [name,goal] of [[dialogueWorkspace, '整理调研记录与证据'], ['采购筹备', '负责供应商比价与资料核对']]) {
+      await host.api('/v2/workspaces?scope=' + encodeURIComponent(scope), {requestId:randomUUID(), name, goal})
+    }
+  }
   await host.api('/v2/history/import?scope='+encodeURIComponent(scope),{scope,requestId:randomUUID()})
   rmSync(join(directory,'trial-archived.md'))
   await host.api('/meetings', { title:calendarMeeting, at:calendarDay + 'T10:30' })
@@ -468,6 +504,8 @@ async function conversation(host) {
     return [...state.you, ...state.queued, ...state.active, ...state.ended]
   }
   const turns = []
+  const project = id => host.api(`/v2/workspaces/${encodeURIComponent(id)}?scope=${scope}`)
+  const snapshots = async spaces => Promise.all(spaces.map(space => project(space.id)))
   for (const item of CASES) {
     if (scenario === 'workspace' && item.selected) {
       await host.stop()
@@ -478,6 +516,7 @@ async function conversation(host) {
     }
     const beforeTickets = new Set((await ticketList()).map(row => row.id)), beforeRooms = (await host.api('/rooms')).length
     const beforeSpaces = (await host.api(`/v2/workspaces?scope=${scope}`)).workspaces
+    const beforeProjects = item.dialogue && await snapshots(beforeSpaces)
     const selectedId = item.selected && beforeSpaces.find(space => space.name === '字节 Landing')?.id
     const focus = item.bound && turns.find(t => t.id === (item.bound === true ? 'order-write' : item.bound))?.workOrders[0]
     const context = focus ? {surface:'workspace',selectedId:focus.workspaceId,sessionId:focus.sessionId,workOrderId:focus.id}
@@ -531,6 +570,26 @@ async function conversation(host) {
       denied: details.flatMap(row => row.ticket.superhub?.contracts?.at(-1)?.denied ?? []), newRooms: (await host.api('/rooms')).length - beforeRooms, reply: reply.slice(0, 400),
       workspaces, newWorkspaces: workspaces.length - beforeSpaces.length, workspaceLinks, workOrders,focus,
       currentSurface: route?.currentWorkspace === true, calendarDate:route?.calendarDate, productGuide: route?.productGuide === true, workspaceTool: route?.workspaceTool === true }
+    if (beforeProjects) {
+      const after = await snapshots(workspaces)
+      const priorSessions = new Set(beforeProjects.flatMap(project => project.sessions.map(row => row.id)))
+      const priorOrders = new Set(beforeProjects.flatMap(project => project.orders.map(row => row.id)))
+      turn.newSessions = after.flatMap(project => project.sessions).filter(row => !priorSessions.has(row.id)).length
+      turn.newOrders = after.flatMap(project => project.orders).filter(row => !priorOrders.has(row.id)).length
+      turn.dialogues = await Promise.all(workspaceLinks.filter(link => link.sessionId && link.sourceMessageId).map(async link => {
+        const session = after.find(row => row.workspace.id === link.id)?.sessions.find(row => row.id === link.sessionId)
+        const route = `/v2/workspaces/${link.id}/sessions/${link.sessionId}?scope=${scope}`
+        const read = async () => {
+          const {messages} = await host.api(route)
+          return {quote:messages.find(row => row.id === link.sourceMessageId)?.quote?.text,
+            reply:messages.find(row => row.replyTo === link.sourceMessageId && row.kind === 'message' && !!row.text.trim())?.text}
+        }
+        return {workspaceId:link.id,sessionId:session?.id, ...await until(async () => {
+          const result = await read()
+          return result.reply && result
+        }, '普通对话成员答复', 60_000).catch(read)}
+      }))
+    }
     const followupJob = focus || workOrders[0]
     if (item.id.startsWith('followup-') && followupJob) turn.followup = await host.api(`/v2/workspaces/${followupJob.workspaceId}/orders/${followupJob.id}/followup?scope=${scope}`)
     if (item.id.startsWith('portrait-') || item.id.startsWith('workspace-staff-')) turn.staff = (await host.api(`/v2/staff?scope=${encodeURIComponent(scope)}`)).members

@@ -22,7 +22,7 @@ import { inTurnOwnerMessages, type NativeRooms, type RequestRoomExecution } from
 import type { Connectors } from './connectors.ts'
 import { createHash, randomUUID } from 'node:crypto'
 import type { Worklines } from './worklines.ts'
-import type { Agent, HostContext, ToolExecution } from './ports.ts'
+import type { Agent, HostContext, SessionEventLike, ToolExecution } from './ports.ts'
 import { describeCustom, SECTION_IDS, TAB_IDS } from '../core/custom.ts'
 import type { ExportResult, ExportTarget } from '../core/export.ts'
 import type { CustomStore } from './custom-store.ts'
@@ -41,6 +41,8 @@ import type { CalendarWeek } from '../core/workspace-calendar.ts'
 import type { HistoryDetail } from '../core/workspace-history.ts'
 import { readLiaisonCalendar } from './liaison-calendar.ts'
 import { followupParameters, liaisonOrderFollowup, type OrderFollowupAccess } from './liaison-order-followup.ts'
+import { hasWorkspaceTarget, workspaceListRow, workspaceMatches, workspaceOwnerEvidence, workspaceQuoted, workspaceRequestSource,
+  workspaceSessionTarget, workspaceSourceMeta, workspaceTarget, WorkspaceTargetChoices, workspaceTargetHistory, workspaceTargetProperties } from './liaison-workspace-target.ts'
 import { BRIEF_GUIDE } from './workspace-order-brief.ts'
 import type { V2Workspace } from '../core/workspace-v2.ts'
 import { HANDOFF_LIMIT, archivedRefusal, mutationKey, type WorkspaceV2Store } from './workspace-v2-store.ts'
@@ -95,10 +97,38 @@ const textOut = (value: unknown) => [{ type: 'text' as const, text: typeof value
 const OBJECT = { type: 'object', additionalProperties: true }
 
 const workspaceOutput = { schema: OBJECT, render: (_args: unknown, value: unknown) => textOut(value), presentationMeta: (_args: unknown, value: unknown) => {
-  const { workspace, delegation } = value as { workspace?: Pick<V2Workspace,'id'|'name'>; delegation?: {id:string;title:string} }
-  return workspace ? { 'dsh-chief/workspace': { id:workspace.id, name:workspace.name,
-    ...(delegation && {delegationId:delegation.id,delegationTitle:delegation.title}) } } : {}
+  const { workspace, delegation, session, traceId, sourceMessageId } = value as {
+    workspace?: Pick<V2Workspace, 'id'|'name'>
+    delegation?: {id: string; title: string}
+    session?: {id: string; title: string}
+    traceId?: string
+    sourceMessageId?: string
+  }
+  const evidence = workspaceSourceMeta(value)
+  if (!workspace) return evidence
+  return { ...evidence, 'dsh-chief/workspace': {
+    id: workspace.id, name: workspace.name,
+    ...(delegation && {delegationId: delegation.id, delegationTitle: delegation.title}),
+    ...(session && !delegation && {sessionId: session.id, sessionTitle: session.title, ...(traceId && {sessionTraceId: traceId}), ...(sourceMessageId && {sourceMessageId})}),
+  } }
 } }
+
+type LiaisonDialogue = ReturnType<typeof workspaceV2Routes>['liaisonDialogue']
+type LiaisonDialogueResult = Awaited<ReturnType<LiaisonDialogue>>
+
+function liaisonDialogueReceipt({ workspace, session, state, traceId, sourceMessageId, reason, requestId }: LiaisonDialogueResult, originalRequestId: string) {
+  const target = '「' + workspace.name + '」的对话「' + session.title + '」'
+  const explanation = {
+    created: '已创建' + target + '。',
+    pending: target + '已就绪，问题正在等待投递。',
+    sent: '原问题已发到' + target + '。' + (reason ? '后续处理遇到问题，可打开查看。' : '可打开查看后续回复。'),
+    replied: target + '已收到本区成员回复，可以打开查看。',
+    failed: target + '已保留。' + (reason ? '这次未能送达，原因是' + reason + '。' : '这次未能送达。'),
+    cancelled: target + '尚未投递的请求已取消，可以打开原对话核对。',
+  }[state]
+  return {workspace: {id: workspace.id, name: workspace.name}, session: {id: session.id, title: session.title},
+    state, traceId, sourceMessageId, reason, workspaceActionOrigin: {originalRequestId, actionRequestId: requestId}, message: explanation}
+}
 
 export interface UiControl {
   /** 从 git 源码运行：可以交给界面师改源码。 */
@@ -139,6 +169,9 @@ export interface ScheduleAccess { store: ScheduleStore; timeZone: string; now?: 
 export interface GroupTurn { workspaceId?: string; owner?: { requestId: string; text: string } }
 
 export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomExecution?: RequestRoomExecution; connectors?: Connectors; isLiaison: (id: string) => boolean; lookup: AgentLookup; worklines?: Worklines; readOnlyExecution?: (id: string) => boolean; executionBinding?: (id: string) => { ticketId: string; assignmentId: string } | undefined; schedules: ScheduleAccess; ui: UiControl; control: ChiefControl; importer: Importer; exporter: Exporter; superhub?: SuperhubIntake; inputAttachments?: ChatAttachments; groups?: Pick<WorkspaceGroupHost, 'refresh'>; groupTurn?: (agentId: string) => GroupTurn | undefined; modelDefaults?: () => ModelDefaults; workspaceStore: WorkspaceV2Store; staffStore?:WorkspaceStaffStore; learning?: ExperienceLearning; assign?: ReturnType<typeof workspaceV2Routes>['assign']; follow?: ReturnType<typeof workspaceV2Routes>['follow']; orderFollowup:OrderFollowupAccess; calendarWeek: (day?: string) => Promise<CalendarWeek>; personDetail: (id:string) => Promise<HistoryDetail>;
+  activeLiaison?: (id: string) => boolean; workspaceDialogue?: LiaisonDialogue; workspaceDialogueStatus?: ReturnType<typeof workspaceV2Routes>['liaisonDialogueStatus'];
+  workspaceHistory?: (id: string) => readonly SessionEventLike[];
+  workspaceDialogueCancel?: ReturnType<typeof workspaceV2Routes>['liaisonDialogueCancel'];
   liaisonSource?: NonNullable<Parameters<typeof liaisonOrderFollowup>[5]> }): (() => void)[] {
   const { engine, brain, roster, inputAttachments } = deps
   const attachmentWriteGuard = (agent: Agent | undefined) => {
@@ -184,6 +217,24 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
     if (!source || !agent) throw new Error(unavailable)
     return { source, sessionId: agent.id, events }
   }
+  const activeWorkspaceOwner = (execution: ToolExecution, unavailable?: string) => {
+    const turn = ownerSource(execution, unavailable)
+    execution.signal?.throwIfAborted()
+    if (deps.activeLiaison && !deps.activeLiaison(turn.sessionId)) throw new Error('接口人对话或第二大脑已切换，请刷新后核对原话。')
+    return turn
+  }
+  const workspaceSelection = (args: Record<string, unknown>, turn: ReturnType<typeof ownerSource>, required: boolean, priorName = false) => {
+    const history = workspaceTargetHistory(turn.events, turn.source, deps.workspaceHistory?.(turn.sessionId))
+    const original = workspaceRequestSource(args, turn.source, history)
+    const origin = deps.superhub?.ownerTurnOrigin(turn.source)
+    const previous = original !== turn.source ? original : history.previous
+    const previousOrigin = previous && deps.superhub?.ownerTurnOrigin(previous)
+    const space = args.action === 'cancel_session_request' && !hasWorkspaceTarget(args) ? undefined
+      : workspaceTarget(deps.workspaceStore, args, {source: turn.source, history, original, context: origin?.context,
+          previousContext: previousOrigin?.context, priorName}, required)
+    const actionRequestId = args.request_source === 'receipt' ? history.actionRequestId ?? original.requestId : original.requestId
+    return {space, history, original, actionRequestId}
+  }
   /** This turn's words, plus the immediately preceding human message a short confirmation can refer to. */
   const ownerWordsOf = (source: { text: string; requestId: string }, events: Parameters<typeof nativeIntakeSource>[0]) => {
     // Only a real human message supplies a name, goal or directory, never the model's suggestion or a tool result.
@@ -224,7 +275,11 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
   const register = (definition: Parameters<HostContext['tools']['register']>[0], options?: Parameters<HostContext['tools']['register']>[1]) => ctx.tools.register({ ...definition, execute: async (args, execution) => {
     const id = (execution as ToolExecution & { agent?: { id: string } }).agent?.id
     if (id && deps.readOnlyExecution?.(id) && !(['chief_lookup', 'chief_brief'].includes(definition.name) || (definition.name === 'chief_ticket' && args.action === 'view'))) throw new Error('交付讨论只读，写操作需主人显式转为跟进工单')
-    return jsonSafe(await definition.execute(args, execution), definition.name)
+    try { return jsonSafe(await definition.execute(args, execution), definition.name) }
+    catch (error) {
+      if (error instanceof WorkspaceTargetChoices) return jsonSafe(error.result(), definition.name)
+      throw error
+    }
   } }, options)
   const privateLiaison = { when: ({ agent }: { agent: { id: string } }) => deps.isLiaison(agent.id) }
   /**
@@ -243,25 +298,20 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
       if (!group.owner || !group.workspaceId) throw new Error('群里只有主人亲口提出、正由接口人接手的这一回合，才能给本工作区加人或改幕僚。未改动；需要时请主人在群里直接说。')
       const space = deps.workspaceStore.workspace(group.workspaceId)
       const named = str(args.workspace)
-      if (named && named.normalize('NFC') !== space.name.normalize('NFC')) {
-        throw new Error('在「' + space.name + '」的群里只能管本工作区的幕僚，未改动。要改「' + named + '」的幕僚，请主人在那个工作区的群里或作战台私聊提出。')
+      const selectedId = str(args.workspace_id)
+      if (named && named.normalize('NFC') !== space.name.normalize('NFC') || selectedId && selectedId !== space.id || args.target_choice !== undefined) {
+        throw new Error('在「' + space.name + '」的群里只能管本工作区的幕僚，未改动。要改别处的幕僚，请主人从目标工作区或作战台私聊提出。')
       }
       if (workspaceArchived(space)) throw new Error(archivedRefusal(space.name))
       if (!deps.staffStore) throw new Error('当前宿主无法管理工作区幕僚。')
       return { source: { requestId: group.owner.requestId, text: group.owner.text }, space, store: deps.staffStore }
     }
-    const { source, events } = ownerSource(execution, refusal)
-    const named = str(args.workspace)
-    if (!named) throw new Error('workspace 需要是主人点名的工作区名称；主人没提工作区时不填，改的是全局幕僚。')
-    if (!ownerWordsOf(source, events).some(text => text.normalize('NFC').includes(named.normalize('NFC')))) {
-      throw new Error('主人原话里没有工作区「' + named + '」，未改动。只在主人点名某个工作区的幕僚时填写 workspace，并照录工作区名称。')
-    }
-    const matches = deps.workspaceStore.list().filter(row => row.name.normalize('NFC') === named.normalize('NFC'))
-    if (matches.length !== 1) throw new Error((matches.length ? '有多个' : '没有') + '名为「' + named + '」的工作区，未改动。请用 chief_workspace list 核对名称。')
-    const space = matches[0]!
+    const turn = activeWorkspaceOwner(execution, refusal)
+    if (deps.superhub?.ownerTurnOrigin(turn.source)?.operation === 'read') throw new Error('主人在本次交办中指定了只读，请按只读方式回答。')
+    const space = workspaceSelection({...args, name: args.workspace}, turn, true, true).space!
     if (workspaceArchived(space)) throw new Error(archivedRefusal(space.name))
     if (!deps.staffStore) throw new Error('当前宿主无法管理工作区幕僚。')
-    return { source, space, store: deps.staffStore }
+    return { source: turn.source, space, store: deps.staffStore }
   }
   /** Executor, model and effort as given by the liaison, the model checked against the DSH catalog. */
   const workspaceRunSettings = async (args: Record<string, unknown>, saved: { model?: string; effort?: string } = {}) => {
@@ -291,6 +341,8 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
     const shape = args.portrait_shape
     if (shape !== undefined && shape !== null && shape !== '' && !isStaffAvatarShape(shape)) throw new Error('请选择素材库中可用于幕僚的头像造型')
     const settings = await workspaceRunSettings(args)
+    const current = ownerWorkspace(args, execution, '主人回合已结束，请重新核对要创建的本区幕僚。')
+    if (current.source.requestId !== source.requestId || current.space.id !== space.id) throw new Error('主人消息或目标工作区已变更，请重新核对。')
     // The same owner turn, workspace and name are one creation: a retried call is answered from the store's receipt.
     const requestId = createHash('sha256').update(JSON.stringify(['staff-workspace', space.id, source.requestId, name])).digest('hex')
     const view = store.apply(space.id, { action: 'create', name, brief, uniqueName: true, requestId, ...settings, ...(isStaffAvatarShape(shape) && { portraitShape: shape }) })
@@ -310,6 +362,8 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
     const brief = str(args.brief)
     if (brief !== undefined && brief.length < 20) throw new Error('角色卡太短：brief 要给改完后的全文')
     const settings = await workspaceRunSettings(args, { model: member.model, effort: member.reasoningEffort })
+    const current = ownerWorkspace(args, execution, '主人回合已结束，请重新核对要更新的本区幕僚。')
+    if (current.source.requestId !== source.requestId || current.space.id !== space.id) throw new Error('主人消息或目标工作区已变更，请重新核对。')
     if (brief === undefined && !Object.keys(settings).length) throw new Error('update 需要至少一项要改的内容：brief、executor、model 或 reasoning_effort。')
     const change = { ...brief !== undefined && { brief }, ...settings }
     const requestId = createHash('sha256').update(JSON.stringify(['staff-workspace-update', space.id, source.requestId, member.id, change])).digest('hex')
@@ -365,10 +419,25 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
     register({
       ...WORKSPACE_TOOL,
       parameters: { type: 'object', required: ['action'], properties: {
-        action: { type: 'string', enum: ['list', 'create', 'set_directory', 'assign', 'list_staff', 'remember_staff', 'remember_experience', 'list_orders', 'read_order', 'follow_order'] },
-        name: { type: 'string', description: '主人点名的工作区。创建时保留原名，交办时可省略；set_directory 时省略即当前所在工作区。' },
+        action: { type: 'string', enum: ['list', 'list_sessions', 'start_session', 'send_session', 'cancel_session_request', 'create', 'update_workspace', 'set_directory', 'assign', 'list_staff', 'remember_staff', 'remember_experience', 'list_orders', 'read_order', 'follow_order'] },
+        ...workspaceTargetProperties,
+        name: { type: 'string', description: '主人点名的工作区全名。create 用它命名。其他操作用它定位已有区。改名时新名称另用 new_name。' },
+        query: { type: 'string', maxLength: 240, description: 'list 可用名称、目标或负责人的一段文字缩小范围。省略读取工作区清单。' },
+        session_id: { type: 'string', maxLength: 160, description: 'send_session 使用 list_sessions 或「打开对话」回执的实际会话 ID。主人本轮打开的会话可省略。' },
+        session_quote: { type: 'string', maxLength: 300, description: 'send_session 使用主人点名的会话标题或 ID，或摘录本轮指向上轮会话回执的短语。' },
+        trace_id: { type: 'string', maxLength: 160, description: 'send_session 沿用 list_sessions 或会话回执的 traceId，以便核对当前版本。' },
+        request_source: { type: 'string', enum: ['current', 'previous', 'pending', 'receipt'], description: '原问题或原任务的出处。previous 指紧邻上条主人原话，pending 指上轮候选回执尚待办理的问题，receipt 指上一轮实际对话或工单回执对应的原任务。本轮主人消息决定是否行动。' },
+        question: { type: 'string', maxLength: 40000, description: 'start_session 和 send_session 的主人问题。逐字摘录 request_source 中完整的一段，不改写。start_session 仅建空对话时省略。' },
+        new_session_quote: { type: 'string', maxLength: 500, description: '主人明确要求把上一件事另开一场新的对话时，start_session 摘录本轮要求再开一场的原话。' },
+        cancel_quote: { type: 'string', maxLength: 500, description: 'cancel_session_request 必填。逐字摘录主人本轮要取消尚未投递请求的原话。' },
+        order_quote: { type: 'string', maxLength: 500, description: '继续上轮事项改为 assign 时必填。逐字摘录主人本轮明确开单或允许带工单的原话。' },
+        order_mode: { type: 'string', enum: ['explicit', 'fallback'], description: 'assign。主人明确要单时用 explicit。允许带工单作为备用时用 fallback，须同时提供本轮 order_quote。' },
+        new_name: { type: 'string', maxLength: 160, description: 'update_workspace 中的工作区新名称，逐字引用主人给出的名字。' },
+        clear_goal_quote: { type: 'string', maxLength: 240, description: 'update_workspace 清空目标时须逐字引用主人本轮明确要求，并设 goal 为一个空字符串。' },
+        expected_name: { type: 'string', maxLength: 160, description: 'update_workspace 可选。已核对的改名前名称，用于并发校验。' },
+        expected_goal: { type: 'string', maxLength: 4000, description: 'update_workspace 可选。已核对的原目标，用于并发校验。' },
         directory: { type: 'string', description: '主人原话里明确给出的项目目录绝对路径（照录，可含 ~）。create 可选：新工作区的默认项目目录；set_directory 必填，空字符串表示解除绑定；assign 可选：只在主人本轮原话为这一单明确给出目录时填写，本单开一个在该目录干活的群，覆盖工作区默认目录。目录须已存在、属于主人本人，不能是根目录、系统目录、家目录本身或第二大脑内部目录；不合法时返回原因，什么也不保存、不建单。' },
-        title:{type:'string',maxLength:48,description:'assign 必填。'+BRIEF_GUIDE},
+        title:{type:'string',maxLength:48,description:'assign 或 start_session 必填。'+BRIEF_GUIDE},
         promise:{type:'string',maxLength:160,description:'assign 必填，用一句话说明这张工单应交付的结果。'},
         reporting: {type:'string', enum: ENGAGEMENT_REPORTING, description:'assign 或 follow_order 的成果汇报约定。each 为每个已验收的分项，milestone 为主人指定的阶段，final 为整个成果。新工单默认 final；补充原单时只在主人明确改了汇报约定才填，并在 handoff 中说明对应阶段。按项执行的顺序不等于按项汇报。'},
         quote:{type:'string',maxLength:3000,description:'remember_staff 和 remember_experience 只用主人本轮明确要求今后执行、更正或停用的连续原话。'},
@@ -376,18 +445,19 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
         experience_id:{type:'string',description:'修订、停用经验时使用本轮可核对的现有编号。'},
         experience_version:{type:'integer',minimum:1,description:'修订、停用经验时使用本轮可核对的现有版本。'},
         global_scope_quote:{type:'string',description:'只有主人明确要求所有工作区使用同一做法时，才用连续原话注明全局范围。'},
-        staff_name:{type:'string',description:'主人本轮点名的本区幕僚：照录主人的称呼，交办会在群里直接 @ 这位幕僚。可用 list_staff 核对。主人只提 Codex、Claude Code 等工具名时不填。'},
+        staff_name:{type:'string',description:'assign、start_session 或 send_session 可用。照录主人点名的本区幕僚；list_staff 可核实。主人只提 Codex、Claude Code 等工具名时不填。'},
         session_title:{type:'string',maxLength:48,description:'可选的新会话短名。沿用现有会话时保留已有名称。'},
         work_order_id: { type: 'string', description: 'read_order 与 follow_order 使用的实际工单标识，由接单回执或 list_orders 提供；本段对话最近 assign 的工单（不必是最后一张）直接用那次回执里的 order.id。' },
-        offset: { type: 'integer', minimum:0, description:'list_orders 继续读取时使用上一次返回的 nextOffset。' },
+        offset: { type: 'integer', minimum:0, description:'list_orders 或 list_sessions 继续读取时使用上一次返回的 nextOffset。' },
         executor: { type: 'string', enum: ['dsh', 'codex', 'claude-code'], description: '已废弃，不用填：工单在工作区群聊里办，由接口人在群里按分工 @ 幕僚，填了也会被忽略。' },
-        handoff: { type: 'string', maxLength: HANDOFF_LIMIT, description: 'assign 和 follow_order 可选。你以接口人身份写给执行者的交办说明：用你自己的话讲清要做什么、交付什么、注意事项（如范围、格式、截止）。不要照抄或粘贴主人原话，主人原话会自动作为引用附在你的说明后面。省略时按标题和结果约定生成一句模板。' },
+        handoff: { type: 'string', maxLength: HANDOFF_LIMIT, description: '可选的接口人转交说明，用自己的话讲清工作、问题或注意事项。不要照抄主人原话，宿主会自动附上可核对的引用。' },
         permission: { type: 'string', enum: ['ask', 'approve-for-me', 'full-access'], description: 'assign 可选，这张工单的命令档位：群里成员（Codex、Claude Code 或 DSH 幕僚）为它执行高危命令时怎么把关。只在主人本轮明确要求“先问我”时填 ask（删除、推送、安装等高危命令逐条请主人批准），明确要求“替我把关”或“代为批准”时填 approve-for-me（由自动审查按工单目标代为决定）；省略即完全访问。' },
-        goal: { type: 'string', description: '主人已给出的项目目标，可留空。' },
+        goal: { type: 'string', maxLength: 4000, description: 'create 或 update_workspace 使用主人给出的目标。update_workspace 留空字符串时须有 clear_goal_quote。' },
       } },
       output: workspaceOutput,
       execute: async (args, execution) => {
-        const { source, events, sessionId: conversationId } = ownerSource(execution)
+        const turn = activeWorkspaceOwner(execution)
+        const { source, events, sessionId: conversationId } = turn
         const origin = deps.superhub?.ownerTurnOrigin(source)
         const store = deps.workspaceStore
         const focus = store.focus(origin?.context)
@@ -396,17 +466,50 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
         const archivedHere = shown && !focus ? shown.workspace : undefined
         const refuseArchived = (space: V2Workspace) => { if (workspaceArchived(space)) throw new Error(archivedRefusal(space.name)) }
         const ownerWords = () => ownerWordsOf(source, events)
+        const assertCurrentOwner = () => {
+          if (activeWorkspaceOwner(execution).source.requestId !== source.requestId) throw new Error('刚收到新的主人消息，请按最新要求重新核对目标。')
+        }
+        const offsetOf = () => {
+          const offset = args.offset ?? 0
+          if (typeof offset !== 'number' || !Number.isSafeInteger(offset) || offset < 0) throw new Error('请使用有效的分页偏移。')
+          return offset
+        }
+        const namedStaff = (space: V2Workspace | undefined, originalText = source.text) => {
+          const name = str(args.staff_name)
+          if (!name) return
+          if (!space || !deps.staffStore || !originalText.includes(name) && !source.text.includes(name)) {
+            throw new Error('请从项目交办，沿用主人本轮点名的幕僚。')
+          }
+          const members = deps.staffStore.view(space.id).members.filter(row => row.name === name)
+          if (members.length !== 1) throw new Error('本区没有唯一匹配的幕僚，请先用 list_staff 核对。')
+          return members[0]
+        }
         if (args.action === 'list') {
-          const workspaces = store.list().map(({ id, name, goal, owner, projectDirectory, archivedAt }) => ({ id, name, goal, owner, ...(projectDirectory && {projectDirectory}),
-            ...(archivedAt && {archived: true as const}) }))
-          const selected = origin?.context?.surface === 'workspace' && workspaces.find(row => row.id === origin.context?.selectedId)
-          return { workspaces, ...selected ? { selected } : {}, message: `本脑有 ${workspaces.length} 个工作区。` }
+          const query = str(args.query) ?? str(args.name)
+          const all = store.list()
+          const matches = query ? workspaceMatches(all, query) : all
+          const selected = shown && workspaceListRow(shown.workspace)
+          // Only a lookup tied to the owner's own clue can become an ordinal choice in a later turn.
+          const choices = query && matches.length > 1 && workspaceQuoted(source, query)
+            ? new WorkspaceTargetChoices(matches, source.requestId).result() : undefined
+          return { workspaces: matches.map(workspaceListRow), ...(selected && {selected}), ...choices,
+            message: choices?.message ?? (query ? `找到 ${matches.length} 个匹配的工作区。` : `本脑有 ${all.length} 个工作区。`) }
+        }
+        if (args.action === 'list_sessions') {
+          const {space} = workspaceSelection(args, turn, true)
+          const sessions = store.view(space!.id).sessions
+          const offset = offsetOf()
+          return {workspace: {id: space!.id, name: space!.name},
+            sessions: sessions.slice(offset, offset + 40).map(session => ({id: session.id, title: session.title,
+              traceId: store.assertActiveTrace(session), closed: session.closed, orderIds: session.delegationIds})),
+            ...(offset + 40 < sessions.length && {nextOffset: offset + 40}), message: `「${space!.name}」有 ${sessions.length} 场对话。`}
         }
         if (args.action === 'list_staff') {
-          if (!shown || !deps.staffStore) throw new Error('请从目标工作区打开接口人，以核对可接单的幕僚。')
+          const {space} = workspaceSelection(args, turn, true)
+          if (!deps.staffStore) throw new Error('当前宿主无法查询工作区幕僚。')
           const defaults = deps.modelDefaults?.() ?? { liaisonPinned: false }
           const cards = brain.staff()
-          return {members:deps.staffStore.view(shown.workspace.id).members.map(member => {
+          return {workspace: {id: space!.id, name: space!.name}, members:deps.staffStore.view(space!.id).members.map(member => {
             const native = cards.find(card => card.id === member.id)
             const effective = native && effectiveModel(native, defaults)
             return {id:member.id,name:member.name,brief:member.brief,duty:member.memberships[0]?.duty,
@@ -461,7 +564,9 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
         if (args.action === 'list_orders' || args.action === 'read_order') {
           const name = str(args.name)
           let spaces = store.list()
-          if (name) {
+          if (hasWorkspaceTarget({...args, name: undefined})) {
+            spaces = [workspaceSelection(args, turn, true).space!]
+          } else if (name) {
             spaces = spaces.filter(row => row.name.normalize('NFC') === name.normalize('NFC'))
             if (spaces.length !== 1) throw new Error('没有找到唯一匹配的工作区，请核对项目名称。')
           } else if (origin?.context?.surface === 'workspace' && origin.context.selectedId) {
@@ -479,23 +584,97 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
             return {workspace:{id:workspaceId,name},order,delegation:{id:order.id,title:order.title,sessionId:session.id},
               session:{id:session.id,title:session.title,executor:session.executor},message:'已读回这张工单及其负责会话。'}
           }
-          const offset = args.offset ?? 0
-          if (typeof offset !== 'number' || !Number.isSafeInteger(offset) || offset < 0) throw new Error('请提供有效的工单列表偏移。')
+          const offset = offsetOf()
           return { orders:orders.slice(offset,offset+40).map(({id,workspaceId,sessionId,title,status}) => ({id,workspaceId,sessionId,title,status})),
             ...(offset+40 < orders.length ? {nextOffset:offset+40} : {}), message:`当前范围共有 ${orders.length} 张工单。` }
         }
         if (origin?.operation === 'read') throw new Error('主人在本次交办中指定了只读，请按只读方式回答。')
-        if (origin?.context?.surface === 'workspace' && origin.context.sessionId && !focus?.session && !archivedHere) throw new Error('当前会话已变更，请重新打开后操作。')
-        if (args.action === 'set_directory') {
-          const name = str(args.name)
-          let workspace = focus?.workspace ?? archivedHere
-          if (name) {
-            if (!ownerWords().some(text => text.normalize('NFC').includes(name.normalize('NFC')))) throw new Error('绑定目录需要主人点名工作区，或从那个工作区发起。')
-            const matches = store.list().filter(row => row.name.normalize('NFC') === name.normalize('NFC'))
-            if (matches.length !== 1) throw new Error('没有找到唯一匹配的工作区，请核对项目名称。')
-            workspace = matches[0]
+        const carriedRequest = args.request_source !== undefined && args.request_source !== 'current'
+        const reliesOnPage = args.target_source === 'page' || !hasWorkspaceTarget(args) && !carriedRequest
+          || args.workspace_id === origin?.context?.selectedId && args.workspace_id !== undefined && !args.name && !args.target_quote
+        if (origin?.context?.surface === 'workspace' && origin.context.sessionId && !focus?.session && !archivedHere && reliesOnPage) {
+          throw new Error('当前会话已变更，请重新打开后操作。')
+        }
+        if (args.action === 'cancel_session_request') {
+          const quote = str(args.cancel_quote)
+          if (!quote || !workspaceQuoted(source, quote)) throw new Error('请照录主人本轮取消这项请求的原话。')
+          const {space, original, actionRequestId} = workspaceSelection(args, turn, false)
+          if (original === source) throw new Error('请用 request_source 指出主人要取消的先前请求。')
+          if (!deps.workspaceDialogueCancel) throw new Error('工作区普通对话服务暂不可用。')
+          const recorded = await deps.workspaceDialogueStatus?.(actionRequestId)
+          assertCurrentOwner()
+          if (!recorded) return {message: '没有找到这项请求尚待投递的普通对话。'}
+          if (space && recorded.workspace.id !== space.id) throw new Error('工作区与原请求的回执不一致，请核对要取消的事情。')
+          const cancelled = await deps.workspaceDialogueCancel({originalRequestId: actionRequestId, workspaceId: recorded.workspace.id,
+            source: workspaceOwnerEvidence(source), conversationId})
+          return cancelled ? liaisonDialogueReceipt(cancelled, original.requestId) : {message: '没有找到这项请求尚待投递的普通对话。'}
+        }
+        if (args.action === 'start_session' || args.action === 'send_session') {
+          if (!deps.workspaceDialogue) throw new Error('工作区普通对话服务暂不可用，原问题仍保留在接口人聊天里。')
+          const {space, original, history, actionRequestId} = workspaceSelection(args, turn, true)
+          refuseArchived(space!)
+          const newSessionQuote = str(args.new_session_quote)
+          if (args.new_session_quote !== undefined
+            && (args.action !== 'start_session' || !newSessionQuote || !workspaceQuoted(source, newSessionQuote))) {
+            throw new Error('请照录主人本轮明确要求另开一场对话的原话。')
           }
-          if (!workspace) throw new Error('请说明要绑定目录的工作区名称。')
+          const requestId = newSessionQuote ? source.requestId : actionRequestId
+          const workspaceActionOrigin = {originalRequestId: original.requestId, actionRequestId: requestId}
+          const existingOrder = store.assignedOrder(requestId)
+          if (existingOrder) {
+            if (existingOrder.workspaceId !== space!.id) throw new Error('原请求已有不同工作区的回执，请核对要继续的事项。')
+            const order = {id: existingOrder.id, title: existingOrder.title, sessionId: existingOrder.sessionId}
+            return {workspace: {id: space!.id, name: space!.name}, order, delegation: order,
+              workspaceActionOrigin, message: '这项请求已在原工单里处理，可打开该工单查看。'}
+          }
+          const sending = args.action === 'send_session'
+          const session = sending ? workspaceSessionTarget(store, args, space!.id, {source, original, history,
+            shownSessionId: shown?.workspace.id === space!.id ? shown.session?.id : undefined}) : undefined
+          const title = str(args.title) ?? str(args.session_title)
+          if (!sending && !title) throw new Error('请给新对话填写一个简洁的标题。')
+          const question = str(args.question) ?? (sending || original !== source ? original.text : undefined)
+          if (args.question !== undefined && !str(args.question) || question && (!workspaceQuoted(original, question) || question.length > 40000)) {
+            throw new Error('要转交的问题须完整摘自主人的原话。请核对 request_source 和 question。')
+          }
+          const staff = namedStaff(space, original.text)
+          const pageTrace = session && origin?.context?.sessionId === session.id ? origin.context.sessionTraceId : undefined
+          const traceId = str(args.trace_id) ?? (args.target_source === 'receipt' && session
+            ? history.receipts.findLast(receipt => receipt.id === space!.id && receipt.sessionId === session.id)?.traceId : undefined)
+          if (pageTrace && traceId && traceId !== pageTrace) throw new Error('要发送的对话版本与你打开的版本不同，请到当前对话继续。')
+          const attachments = deps.superhub?.ownerTurnOrigin(original)?.inputAttachments
+          return liaisonDialogueReceipt(await deps.workspaceDialogue({mode: sending ? 'send' : 'start', workspaceId: space!.id,
+            sessionId: session?.id, traceId:traceId ?? pageTrace, title, original: workspaceOwnerEvidence(original), source: workspaceOwnerEvidence(source),
+            actionRequestId: requestId === original.requestId ? undefined : requestId,
+            conversationId, question, handoff: handoffArg(args.handoff), staffId: staff?.id, inputAttachments: question ? attachments : undefined}), original.requestId)
+        }
+        if (args.action === 'update_workspace') {
+          const name = str(args.new_name)
+          const goal = args.goal === '' ? '' : str(args.goal)
+          const clearQuote = str(args.clear_goal_quote)
+          if (args.new_name !== undefined && !name || args.goal !== undefined && goal === undefined || !name && goal === undefined) {
+            throw new Error('请提供要保存的新名称或目标。')
+          }
+          if ((name && !workspaceQuoted(source, name)) || (goal && !workspaceQuoted(source, goal))
+            || goal === '' && (!clearQuote || !workspaceQuoted(source, clearQuote))) {
+            throw new Error('请照录主人本轮给出的新名称、目标或明确清空目标的原话。')
+          }
+          const changes = {...name && {name}, ...goal !== undefined && {goal}}
+          const requestId = createHash('sha256').update(JSON.stringify(['liaison-workspace-update', source.requestId])).digest('hex')
+          const selector = {workspaceId: args.workspace_id, name: args.name, quote: args.target_quote, source: args.target_source, choice: args.target_choice}
+          const mutation = mutationKey(['liaison', 'workspace-update'], {requestId, selector, ...changes})
+          const existing = store.receipt(mutation)
+          const result = existing?.kind === 'mutation' && 'workspace' in existing.result ? existing.result : undefined
+          const space = result ? store.workspace(result.workspace.id) : workspaceSelection(args, turn, true).space!
+          refuseArchived(space)
+          const expected = {...name && {name: str(args.expected_name) ?? space.name},
+            ...goal !== undefined && {goal: typeof args.expected_goal === 'string' ? args.expected_goal : space.goal}}
+          const {workspace: saved} = store.updateWorkspace(mutation, space.id, {...changes, expected})
+          const fields = [name && '名称为「' + saved.name + '」', goal !== undefined && (saved.goal ? '目标为「' + saved.goal + '」' : '目标已清空')].filter(Boolean)
+          return {workspace: workspaceListRow(saved), changed: {...name && {name: saved.name}, ...goal !== undefined && {goal: saved.goal}},
+            message: '已更新工作区「' + saved.name + '」，' + fields.join('，') + '。'}
+        }
+        if (args.action === 'set_directory') {
+          const workspace = workspaceSelection(args, turn, true, true).space!
           refuseArchived(workspace)
           if (args.directory === undefined) throw new Error('set_directory 需要 directory：主人给出的绝对路径，或空字符串表示解除绑定。')
           const directory = ownerDirectory(args.directory, ownerWords()) ?? ''
@@ -538,38 +717,52 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
           if (reporting !== undefined && !isEngagementReporting(reporting)) throw new Error('请选择有效的成果汇报约定。')
           if (!deps.assign) throw new Error('当前宿主无法接手新工单。')
           if (args.executor !== undefined && args.executor !== 'dsh' && args.executor !== 'codex' && args.executor !== 'claude-code') throw new Error('请选择工作区团队、Codex 或 Claude Code。')
-          const name = str(args.name)
-          let selected = origin?.context?.surface === 'workspace' ? origin.context.selectedId : undefined
-          if (name) {
-            if (!source.text.normalize('NFC').includes(name.normalize('NFC'))) throw new Error('交办到指定项目需要主人本轮点名，或从那个工作区发起。')
-            const matches = store.list().filter(row => row.name.normalize('NFC') === name.normalize('NFC'))
-            if (matches.length !== 1) throw new Error('没有找到唯一匹配的工作区，请核对指定的项目。')
-            selected = matches[0]!.id
-          }
-          const target = selected === undefined ? undefined : store.list().find(row => row.id === selected)
+          const {space: target, original, actionRequestId} = workspaceSelection(args, turn, carriedRequest)
           if (target) refuseArchived(target)
+          const selected = target?.id
+          if (origin?.context?.surface === 'workspace' && origin.context.selectedId === selected && origin.context.sessionId && !focus?.session) {
+            throw new Error('当前会话已变更，请重新打开后交办。')
+          }
           const currentSession = focus && focus.workspace.id === selected ? focus.session?.id : undefined
           const brief = {title:str(args.title),promise:str(args.promise),sessionTitle:str(args.session_title)}
           if (args.permission !== undefined && args.permission !== 'ask' && args.permission !== 'approve-for-me' && args.permission !== 'full-access') throw new Error('命令档位只能是 ask、approve-for-me 或 full-access。')
-          const named = str(args.staff_name)
-          let staffId:string | undefined
-          if (named) {
-            if (!selected || !deps.staffStore || !source.text.includes(named)) throw new Error('请从项目交办，沿用主人本轮点名的幕僚。')
-            const matches = deps.staffStore.view(selected).members.filter(row=>row.name===named)
-            if (matches.length!==1) throw new Error('本区没有唯一匹配的幕僚，可从工作区的幕僚卡直接交办。')
-            staffId = matches[0]!.id
+          const orderMode = args.order_mode ?? 'explicit'
+          const authorizationQuote = str(args.order_quote)
+          if (orderMode !== 'explicit' && orderMode !== 'fallback') throw new Error('请选择主人明确要单，或只把工单用作已获允许的备用方式。')
+          if (authorizationQuote ? !workspaceQuoted(source, authorizationQuote) : carriedRequest || orderMode === 'fallback' || args.order_quote !== undefined) {
+            throw new Error('请照录主人本轮明确开单或允许以工单作为备用方式的原话。')
           }
+          const assigned = carriedRequest || orderMode === 'fallback' ? store.assignedOrder(actionRequestId) : undefined
+          if (assigned && selected && assigned.workspaceId !== selected) throw new Error('原请求已有其他工作区的工单回执，请核对要继续的事项。')
+          const previousDialogue = await deps.workspaceDialogueStatus?.(actionRequestId)
+          assertCurrentOwner()
+          if (previousDialogue) {
+            if (!target || previousDialogue.workspace.id !== target.id) throw new Error('原请求已有其他工作区的会话回执，请核对要继续的事项。')
+            if (previousDialogue.sourceMessageId || previousDialogue.state !== 'failed') {
+              return liaisonDialogueReceipt(previousDialogue, original.requestId)
+            }
+          }
+          if (orderMode === 'fallback' && !assigned && previousDialogue?.state !== 'failed') {
+            throw new Error('主人允许用工单备用。请先尝试原定的普通对话，只有核实未能投递后才改用工单。')
+          }
+          const named = namedStaff(target)
           const handoff = handoffArg(args.handoff)
           const directory = ownerDirectory(args.directory, [source.text]) || undefined
-          const { workspace, delegation, session } = deps.assign(source.requestId, source.text, args.executor, selected, currentSession, brief, staffId, args.permission, handoff, directory, origin?.inputAttachments, reporting)
+          const { workspace, delegation, session } = assigned
+            ? {workspace: store.workspace(assigned.workspaceId), delegation: assigned, session: store.session(assigned.workspaceId, assigned.sessionId)}
+            : deps.assign(source.requestId, original.text, args.executor, selected, currentSession, brief, named?.id, args.permission, handoff, directory,
+                origin?.inputAttachments, reporting, {original: workspaceOwnerEvidence(original), source: workspaceOwnerEvidence(source),
+                  actionRequestId: actionRequestId === original.requestId ? undefined : actionRequestId, conversationId, orderMode, authorizationQuote})
           store.markConversation(workspace.id, delegation.id, conversationId)
           const order = {id:delegation.id,title:delegation.title,sessionId:session.id}
+          const workspaceActionOrigin = {originalRequestId: original.requestId, actionRequestId}
           const tier = delegation.permission && delegation.permission !== 'full-access' ? delegation.permission : undefined
           if (session.engine === 'roster') {
             const place = store.directoryOf(workspace.id, delegation.id)
-            return { workspace: {id:workspace.id,name:workspace.name}, order, delegation:order, group:{id:session.id,title:session.title}, ...(tier && {permission:tier}),
+            return { workspace: {id:workspace.id,name:workspace.name}, order, delegation:order, group:{id:session.id,title:session.title},
+              workspaceActionOrigin, ...(tier && {permission:tier}),
               ...(place?.path && {directory:{source:place.source,path:place.path}}),
-              message:'接口人已接手，交办已发到工作区群聊「' + session.title + '」' + (named ? '，并 @ 了' + named : '，接口人会在群里按分工 @ 幕僚') + '。'
+              message:'已在工作区群聊「' + session.title + '」登记工单。' + (named ? '交办将指定 @' + named.name + '。' : '接口人会在群里按分工 @ 幕僚。')
                 + (tier === 'ask' ? '高危命令会逐条请主人批准。' : tier === 'approve-for-me' ? '高危命令由自动审查代为把关。' : '')
                 + (place?.path ? '群里的成员在' + DIRECTORY_SOURCE_LABEL[place.source] + '目录 ' + place.path + ' 干活。' : '') + '可打开工单查看群聊、进展与成果。'
                 + '主人接着对这张单补充或改要求时（中间又交办了别的事也一样），用 follow_order，work_order_id 为本回执的 order.id。' }
@@ -578,7 +771,7 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
           const where = session.kind !== 'coding' ? '' : place?.path
             ? '本单在' + DIRECTORY_SOURCE_LABEL[place.source] + '目录 ' + place.path + ' 运行。'
             : '本单在 SuperHub 工作目录运行；工作区未绑定项目目录。'
-          return { workspace: {id:workspace.id,name:workspace.name}, order, delegation:order,
+          return { workspace: {id:workspace.id,name:workspace.name}, order, delegation:order, workspaceActionOrigin,
             executor:session.executor, ...(tier && {permission:tier}), ...(place?.path && {directory:{source:place.source,path:place.path}}),
             message:'接口人已接手。' + (tier === 'ask' ? '高危命令会逐条请主人批准。' : tier === 'approve-for-me' ? '高危命令由自动审查代为把关。' : '') + where + '可打开工单查看负责会话、进展与成果。' }
         }
@@ -1114,8 +1307,8 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
         '查看或调整幕僚团。改动只在主人明确要求时用。',
         'action=list 看现有幕僚：每位的执行器、幕僚卡配置的模型，以及实际生效的模型 effectiveModel、思考深度 effectiveReasoningEffort 和来源 modelSource（幕僚卡 / DSH 默认 / 跟随接口人 / Codex 配置 / 远程，未知）。主人问「谁用什么模型」时用它和 chief_settings show 直接回答，不用建单或开讨论；读不到的如实说读不到；',
         'create 加一位：主人往往只说一句"加个盯竞品的"，由你把角色卡写完整——id（小写英文短横线，如 competitor-watch）、name（中文称呼）、brief（第一行一句话职责，后面 3 到 6 条做事方式，写具体：查什么、产出什么、什么时候该停下来问主人）、executor（dsh 默认；写代码用 claude-code）、verifier（默认 reviewer）；',
-        '主人要给某个工作区加人时（「给 X 工作区加一个…」），create 带 workspace（照录主人本轮原话里的工作区名称），建的是只属于该工作区的专属幕僚：不进全局名册，填 name、brief、portrait_shape；主人点名执行方式或模型时照填 executor（dsh、codex、claude-code）、model、reasoning_effort，不点名就不填（DSH 加默认模型）；不填 id、verifier。主人没提工作区时不填 workspace，照常建全局幕僚。已归档的工作区不能加人；',
-        '改某个工作区的专属幕僚（「把 X 工作区的工程师改成 Codex」）用 update 带 workspace 和 name（照录称呼；找不到时回执列出本区现有幕僚），只给要改的 brief、executor、model、reasoning_effort；全局幕僚不带 workspace、用 id 改；',
+        '主人要给某个工作区加人时用 create。带主人点名的 workspace，或者先用 chief_workspace list 核实 workspace_id 和目标依据。这里的幕僚只属于该区。填 name、brief、portrait_shape；主人点名执行方式或模型时照填 executor（dsh、codex、claude-code）、model、reasoning_effort，不点名就用默认值。专属幕僚的 id 和 verifier 由系统处理。',
+        '修改专属幕僚时给出工作区依据和幕僚称呼。可用 chief_workspace list_staff 核实成员。只给要改的 brief、executor、model、reasoning_effort。主人明确调整全局幕僚时用全局角色 id。工作区群里的操作属于本区。',
         `创建时按主要职责选择 portrait_shape：${staffAvatarGuidance}。多个造型同样贴切时，优先选名册里容易区分的轮廓，list 可查 defaultPortrait。不确定时留空，由系统推荐。配色由系统分配，主人已经手选的头像优先显示。`,
         'update 改一位：给 id 和要改的字段（brief 要给改完后的全文）；model（厂商/模型，空串表示用默认）和 reasoning_effort（思考深度，取该模型支持的档位，空串表示模型默认）只在主人点名时填；',
         'retire 让一位退休：给 id。研判官（chief）和审查官（reviewer）不能退休。',
@@ -1129,10 +1322,11 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
           id: { type: 'string' }, name: { type: 'string' }, brief: { type: 'string' },
           executor: { type: 'string', enum: ['dsh', 'claude-code', 'codex', 'remote'] }, verifier: { type: 'string' }, model: { type: 'string' }, reasoning_effort: { type: 'string' },
           portrait_shape: { type: 'string', enum: staffAvatarShapes, description: '仅用于创建。选择与主要职责贴切、在名册中易区分的默认头像造型。' },
-          workspace: { type: 'string', description: '用于 create 和 update：主人点名某个工作区的专属幕僚时，照录主人本轮原话里的工作区名称。不提工作区时不填。' },
+          workspace: { type: 'string', description: 'create 或 update 专属幕僚时照录主人明确提供的工作区名。也可使用 workspace_id 和目标依据。' },
+          ...workspaceTargetProperties,
         },
       },
-      output: { schema: OBJECT, render: (_a, v) => textOut(v) },
+      output: workspaceOutput,
       execute: async (args, execution) => {
         const defaults = deps.modelDefaults?.() ?? { liaisonPinned: false }
         const list = () => brain.staff().map(s => {
@@ -1146,7 +1340,7 @@ export function registerTools(ctx: HostContext, deps: StateDeps & { requestRoomE
         guard(execution)
         const inGroup = !!groupTurnOf(execution)
         if (inGroup && args.action !== 'create' && args.action !== 'update') throw new Error('群里不能让全局幕僚退休或改全局角色卡，未改动。请主人在作战台私聊提出。')
-        if (inGroup || args.workspace !== undefined && args.workspace !== null && args.workspace !== '') {
+        if (inGroup || hasWorkspaceTarget({...args, name: args.workspace ?? undefined})) {
           if (args.action === 'create') return createWorkspaceStaff(args, execution)
           if (args.action === 'update') return updateWorkspaceStaff(args, execution)
           throw new Error('workspace 只用于 create 和 update：给工作区加或改专属幕僚。退休专属幕僚请主人在工作区的幕僚卡操作。')
