@@ -37,18 +37,24 @@ export const CHAT_ATTACHMENT_STYLE = `
   padding:0 4px; border:0; border-radius:8px; color:var(--v-muted,var(--dim)); background:transparent; font-size:12px; }
 :is(.wv2,.wr) .chat-selected-files :is(.chat-file-remove,.chat-file-retry):enabled:hover { background:var(--v-soft,var(--raise)); }
 :is(.wv2,.wr) :is(.chat-selected-files,.chat-input-files) .v2-icon { flex:none; width:17px; height:17px; }
-:is(.wv2,.wr) .chat-selected-files > li[data-thumbnail] { position:relative; width:60px; height:60px; padding:0; }
+:is(.wv2,.wr) .chat-selected-files > li[data-thumbnail] { position:relative; width:68px; height:68px; padding:0; }
 :is(.wv2,.wr) .chat-selected-files > li[data-thumbnail] img { width:100%; height:100%; border-radius:inherit; }
+:is(.wv2,.wr) .chat-thumbnail-status { position:absolute; inset:auto 3px 3px; padding:2px 0; border-radius:7px; text-align:center;
+  white-space:nowrap; color:var(--v-ink,var(--paper)); background:var(--v-surface,var(--bg)); font-size:11px; }
 :is(.wv2,.wr) .chat-selected-files > li[data-thumbnail] .chat-file-remove { position:absolute; inset:0 0 auto auto; display:flex;
   align-items:flex-start; justify-content:flex-end; padding:4px; background:transparent; }
 :is(.wv2,.wr) .chat-selected-files > li[data-thumbnail] .chat-file-remove .v2-icon { width:21px; height:21px; padding:3px; border-radius:50%;
   background:var(--v-surface,var(--bg)); color:var(--v-ink,var(--paper)); }
 
-:is(.wv2,.wr) .chat-input-files { display:grid; grid-template-columns:minmax(0,1fr); gap:5px; list-style:none; padding:0; margin:6px 0 0; }
+:is(.wv2,.wr) .chat-input-files { display:flex; flex-wrap:wrap; gap:5px; list-style:none; padding:0; margin:6px 0 0; }
+:is(.wv2,.wr) .chat-input-files > li { flex-basis:100%; min-width:0; }
+:is(.wv2,.wr) .chat-input-files > li[data-image] { flex-basis:140px; }
 :is(.wv2,.wr) .chat-input-files a { display:flex; align-items:center; gap:7px; min-height:38px; max-width:100%; color:inherit; text-decoration:underline; text-underline-offset:3px; }
-:is(.wv2,.wr) .chat-input-files a:has(img) { display:grid; justify-items:start; gap:2px; }
+:is(.wv2,.wr) .chat-input-files > li[data-image] a { display:block; overflow:hidden; border:1px solid var(--v-soft,var(--rule));
+  border-radius:12px; background:var(--v-tint,var(--board)); }
+:is(.wv2,.wr) .chat-input-files > li[data-image] a:hover { border-color:var(--hub-brand,var(--tide)); }
 :is(.wv2,.wr) .chat-input-files a span { min-width:0; overflow-wrap:anywhere; }
-:is(.wv2,.wr) .chat-input-files img { max-width:100%; width:auto; height:auto; max-height:160px; border-radius:5px; }
+:is(.wv2,.wr) .chat-input-files img { display:block; width:100%; aspect-ratio:4 / 3; object-fit:contain; }
 :is(.wv2,.wr) .chat-input-files small { flex:none; }
 .wv2 .v2-group-delivery [data-outcome=failed] { color:var(--v-alert); }
 @container (max-width:740px) {

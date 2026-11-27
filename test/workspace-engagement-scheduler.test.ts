@@ -26,11 +26,11 @@ function fixture(engage?: GroupEngineOptions['engage']) {
     async reattach(call) { reattached.push(call.callId); return false },
     dispose() {},
   }
-  function open() {
+  function open(options: Pick<GroupEngineOptions, 'checkOwnerQuestions'> = {}) {
     const engine = new GroupEngine({
       dir, scope: 'scope', workspaceId: 'workspace', groupId: 'group', roster: () => roster,
       workDir: () => dir, info: () => ({workspaceName: '资料整理', title: '核对版本', goal: ''}),
-      runners: {dsh: runner}, engage,
+      runners: {dsh: runner}, engage, ...options,
     })
     cleanup.push(() => engine.dispose())
     return engine
@@ -85,6 +85,27 @@ describe('交接派发和回执恢复', () => {
       expect.objectContaining({text: '两份记录一致。', engagement: expect.objectContaining({generation: 3})}),
     ])
     expect(reopened.view().members.find(member => member.memberId === 'reader')?.status).toBe('idle')
+  })
+
+  it('普通群正式回报先于调度快照落盘时，重启沿用待回应检查凭据', async () => {
+    const {open, calls, reattached, statePath} = fixture()
+    const engine = open({checkOwnerQuestions: true})
+    await engine.start()
+    const owner = engine.ownerSay('@核对员 核对两份记录')
+    const inProgress = readFileSync(statePath)
+    const {call, sink} = calls[0]!
+    const report = '第一份已核对。请主人确认第二份材料的版本。'
+    sink.finished(call.callId, {status: 'completed', text: report, toolCalls: 0})
+    engine.dispose()
+    writeFileSync(statePath, inProgress)
+
+    const reopened = open({checkOwnerQuestions: true})
+    await reopened.start()
+    expect(reattached).toEqual([])
+    expect(reopened.ledger.all().filter(line => line.event === 'interrupted')).toEqual([])
+    expect(reopened.ledger.all().filter(line => line.ownerQuestionCheck)).toEqual([
+      expect.objectContaining({text: report, memberCompleted: true, memberCallId: call.callId, replyTo: owner.seq}),
+    ])
   })
 
   it('无工单发言转交后保留 @ 的唯一接收人和成员间空转保护', async () => {

@@ -79,6 +79,7 @@ export interface GroupEngineOptions {
   /** 管理员派出的工单批次落地时先交宿主验收（`wake` 效果带 `held`，宿主之后发言或 `wakeNow`）。 */
   holdOrderWakes?: boolean
   engage?: GroupSchedulerOptions['engage']
+  checkOwnerQuestions?: boolean
   now?: () => number
   limits?: Partial<GroupLimits>
   logger?: Logger
@@ -379,13 +380,17 @@ export class GroupEngine {
     }
     // Members' lines link their files (`[名字](相对路径)`): those inside the group's working directory become attachments.
     const say: GroupSay = { say: input => this.ledger.say(this.withFiles(input)) }
-    const scheduler = new GroupScheduler({ members: this.roster.map(asMember), say, now: this.now, inputScoped: this.ledger.hasInputs, engage: this.options.engage, idPrefix: this.options.idPrefix, ...state && { state }, ...this.options.limits && { limits: this.options.limits },
+    const scheduler = new GroupScheduler({ members: this.roster.map(asMember), say, now: this.now, inputScoped: this.ledger.hasInputs, engage: this.options.engage,
+      checkOwnerQuestions: this.options.checkOwnerQuestions, idPrefix: this.options.idPrefix, ...state && { state }, ...this.options.limits && { limits: this.options.limits },
       ...this.options.holdOrderWakes && { holdOrderWakes: true },
       ...this.options.experience && {canPublish:call=>this.canPublishExperience(call)} })
     this.scheduler = scheduler
     if (this.retired) scheduler.retire()
     const alive: string[] = []
-    const settled = new Set(this.ledger.all().flatMap(line => line.engagement ? [line.engagement.callId] : []))
+    const settled = new Set(this.ledger.all().flatMap(line => {
+      const callId = line.engagement?.callId ?? (line.ownerQuestionCheck ? line.memberCallId : undefined)
+      return callId ? [callId] : []
+    }))
     const group = this.context()
     for (const call of scheduler.calls) {
       if (!RUNNING.includes(call.status) || !scheduler.currentEngagement(call) || settled.has(call.id) || blocked?.(call.workOrderId)) continue

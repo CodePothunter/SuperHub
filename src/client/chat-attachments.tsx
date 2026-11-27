@@ -16,6 +16,18 @@ function imageType(file: File) {
   return suffix ? 'image/' + (suffix === 'jpg' ? 'jpeg' : suffix) : undefined
 }
 
+function pastedImages(clipboard: DataTransfer) {
+  const files = clipboard.files.length ? Array.from(clipboard.files)
+    : Array.from(clipboard.items, item => item.kind === 'file' ? item.getAsFile() : null)
+  return files.flatMap(file => {
+    if (!file) return []
+    const type = imageType(file)
+    if (!type) return []
+    if (file.name.trim()) return [file]
+    return [new File([file], '剪贴板图片.' + type.slice('image/'.length), {type, lastModified:file.lastModified})]
+  })
+}
+
 interface SelectedFile {
   key: number
   file: File
@@ -113,12 +125,16 @@ function SelectedChatAttachments({ draft, sending }: { draft: AttachmentDraft; s
   if (!draft.items.length) return null
   return <ul className="chat-selected-files" aria-label="待发送附件" aria-live="polite">
     {draft.items.map(row => {
-      const thumbnail = !!row.preview && row.attachment?.kind === 'image'
+      const thumbnail = row.preview && !row.error ? row.preview : undefined
       return <li key={row.key} data-thumbnail={thumbnail ? '' : undefined} data-failed={row.error ? '' : undefined}>
-        {row.preview && !row.error ? <img src={row.preview} alt={thumbnail ? row.file.name : ''} title={thumbnail ? row.file.name : undefined}/>
-          : <span className="chat-file-icon"><V2Icon name="file"/></span>}
-        {!thumbnail && <span className="chat-file-detail"><strong title={row.file.name}>{row.file.name}</strong>
-          <small>{row.error ? '上传失败 · ' + row.error : row.attachment ? fileSize(row.file.size) : '正在上传…'}</small></span>}
+        {thumbnail ? <>
+          <img src={thumbnail} alt={row.file.name} title={row.file.name}/>
+          {!row.attachment && <small className="chat-thumbnail-status">正在上传…</small>}
+        </> : <>
+          <span className="chat-file-icon"><V2Icon name="file"/></span>
+          <span className="chat-file-detail"><strong title={row.file.name}>{row.file.name}</strong>
+            <small>{row.error ? '上传失败 · ' + row.error : row.attachment ? fileSize(row.file.size) : '正在上传…'}</small></span>
+        </>}
         {row.error && <button type="button" className="chat-file-retry" aria-label={'重新上传 ' + row.file.name} onClick={() => void draft.retry(row)}>重试</button>}
         <button type="button" className="chat-file-remove" aria-label={'移除 ' + row.file.name} disabled={sending} onClick={() => draft.remove([row.key])}><V2Icon name="close"/></button>
       </li>
@@ -129,7 +145,15 @@ function SelectedChatAttachments({ draft, sending }: { draft: AttachmentDraft; s
 export function ChatComposer({ draft, text, disabled, sending, status, accessory, children }: {
   draft: AttachmentDraft; text: string; disabled?: boolean; sending?: boolean; status?: string; accessory?: ReactNode; children: ReactNode
 }) {
-  return <div className="chat-composer">
+  return <div className="chat-composer" onPaste={event => {
+    const {target, clipboardData} = event
+    if (!clipboardData || disabled || !draft.enabled || event.defaultPrevented ||
+      !(target instanceof HTMLTextAreaElement) || target.disabled || target.readOnly) return
+    const images = pastedImages(clipboardData)
+    if (!images.length) return
+    if (!clipboardData.getData('text/plain')) event.preventDefault()
+    draft.add(images)
+  }}>
     <SelectedChatAttachments draft={draft} sending={sending}/>
     {children}
     <div className="v2-send-footer">
@@ -151,8 +175,9 @@ export function MessageInputAttachments({ scope, target, attachments }: {
   const query = targetQuery(scope, target)
   return <ul className="chat-input-files" aria-label="消息附件">{attachments.map((row, i) => {
     const url = base + '/input-attachments/' + encodeURIComponent(row.id) + '?' + query
-    return <li key={row.id + '-' + i}>{row.kind === 'image'
-      ? <a href={url} target="_blank" rel="noopener noreferrer" aria-label={'查看图片 ' + row.name}><img src={url} loading="lazy" alt={row.name}/><span>{row.name}</span></a>
+    const image = row.kind === 'image'
+    return <li key={row.id + '-' + i} data-image={image ? '' : undefined}>{image
+      ? <a href={url} target="_blank" rel="noopener noreferrer" aria-label={'查看图片 ' + row.name} title={row.name}><img src={url} loading="lazy" alt={row.name}/></a>
       : <a href={url} download={row.name} aria-label={'下载 ' + row.name}><V2Icon name="file"/><span>{row.name}</span><small>{fileSize(row.bytes)}</small></a>}</li>
   })}</ul>
 }

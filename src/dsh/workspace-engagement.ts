@@ -15,6 +15,7 @@ export function parseEngagement(text: string, input: EngagementInput): Engagemen
   try { value = JSON.parse(body) } catch { return }
   if (!value || typeof value !== 'object' || typeof value.kind !== 'string' || !kinds.has(value.kind)) return
   const result: EngagementDecision = {kind: value.kind as EngagementDecision['kind']}
+  if (input.ownerQuestionCheck && result.kind !== 'ask' && result.kind !== 'none') return
   for (const field of fields) {
     const item = value[field]
     if (item === undefined) continue
@@ -73,6 +74,9 @@ wait：只能等外部依赖、正在执行的成员或约定时间，提供 rea
 reporting 可为 final（最终汇总）、milestone（约定的阶段）或 each（逐项）。新正式交办的缺省是 final；只有主人明确改变汇报节点时才为已有工单修改此字段。汇报节奏不改变执行顺序。临时查进度不会改约。汇总模式下逐项写入证据，直到约定工作齐备才 deliver。
 群里首次承接主人明确交给团队的工作时可以提供 title、promise 和 sourceSeq（对应主人原话）；如果只是问答或可由接口人当轮回答，不登记工单。工单存在时参考本轮和已经交回的证据，步骤数量可以未知。只有在确有需要时才填写可选字段。`
 
+const OWNER_QUESTION_CHECK = `
+本次是普通群的回报检查，只针对 source 返回 ask 或 none。核对已有发言和主人最新答复后，若回报仍缺主人才能提供的事实或决定，把必要缺项与本次对象合成一条可以直接回答的具体问题。只有指向同一个尚未解决的问题时才用 sourceSeq 引用原待回应。新问题省略 sourceSeq。已回答、只问同事、仅报进度或已交回完整结论都返回 none。群内 @ 已由宿主处理，一条回报同时点名同事和询问主人时，仍需检查留给主人的问题。`
+
 /** Interpret a settled turn using the same model selection as the liaison. */
 export function llmEngagementCoordinator(llm: () => Llm | undefined, model: () => ModelSelection | undefined): EngagementCoordinator {
   return async (input, signal) => {
@@ -88,7 +92,7 @@ export function llmEngagementCoordinator(llm: () => Llm | undefined, model: () =
       })),
     })
     let text = ''
-    for await (const chunk of port.stream({...selection, system: SYSTEM, tools: [],
+    for await (const chunk of port.stream({...selection, system: input.ownerQuestionCheck ? SYSTEM + OWNER_QUESTION_CHECK : SYSTEM, tools: [],
       messages: [{role: 'user', content: [{type: 'text', text: prompt}]}], signal})) {
       signal.throwIfAborted()
       if (chunk.type === 'text-delta') text += chunk.text ?? ''

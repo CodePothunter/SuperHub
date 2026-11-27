@@ -51,6 +51,7 @@ export interface GroupHostHandlers {
   /** Hold the wake of the liaison's order batches for an acceptance review (see `GroupEffect` `wake.held`). */
   holdOrderWakes?: boolean
   engage?: (session: V2Session, workOrderId: string | undefined, memberId?: string) => {generation?: number} | undefined
+  checkOwnerQuestions?: boolean
 }
 
 export class WorkspaceGroupHost {
@@ -211,6 +212,7 @@ export class WorkspaceGroupHost {
       onChange: () => { if (canStart()) this.handlers.onChange?.(current(), engine) },
       admit: call => canStart() ? this.handlers.admit?.(current(), call) : '对话版本已更新',
       engage: (orderId, memberId) => this.handlers.engage?.(current(), orderId, memberId),
+      checkOwnerQuestions: this.handlers.checkOwnerQuestions,
       ...this.handlers.holdOrderWakes && { holdOrderWakes: true },
       ...this.options.logger && { logger: this.options.logger },
       ...this.options.now && { now: this.options.now },
