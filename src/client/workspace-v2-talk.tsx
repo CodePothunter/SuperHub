@@ -13,7 +13,7 @@ import { GroupDeliveries, GroupRoster, GroupStatus, MemberBadges, MentionMenu, m
 import { ChatComposer, MessageInputAttachments, useChatAttachments } from './chat-attachments.tsx'
 import { OwnerActionReply, OwnerActions } from './workspace-owner-actions.tsx'
 import type { OwnerAction } from '../core/workspace-engagement.ts'
-import { DeleteWorkspaceTarget, MessageEditButton, MessageEditor } from './workspace-conversation-actions.tsx'
+import { DeleteWorkspaceTarget, MessageByline, MessageEditor } from './workspace-conversation-actions.tsx'
 import { attachmentResource } from './workspace-output-source.ts'
 
 interface BoardProps {
@@ -330,14 +330,14 @@ export function Transcript({ base, session, view, origin, sourceMessage, trace, 
         const member = m.speakerId ? memberBySpeaker.get(m.speakerId) : undefined
         const progress = m.kind === 'progress'
         const editing = activeEdit?.message.id === m.id ? activeEdit : undefined
+        const editMessage = !activeEdit && m.role === 'user' && m.canEdit && activeTraceId && !closed && !archived && !readOnlySource
+          ? () => { following.current = false; setRevision({message:m, traceId:activeTraceId}) } : undefined
         return <li key={m.id} id={prefix + m.id} data-message-id={m.id} data-kind={m.kind} className={m.id === anchoredId ? 'v2-source-turn' : undefined} tabIndex={-1}>
           {dateLine}
           <div className={'v2-turn ' + (m.role === 'user' ? 'mine' : '') + (progress ? ' progress' : '')}><ChatAvatar portrait={m.speakerId ? result?.portraits?.[m.speakerId] : undefined}/>
-            <div className="v2-message"><div className="v2-byline">
-              {!activeEdit && m.role === 'user' && m.canEdit && activeTraceId && !closed && !archived && !readOnlySource &&
-                <MessageEditButton disabled={write.busy} open={() => { following.current = false; setRevision({message:m, traceId:activeTraceId}) }}/>}
+            <div className="v2-message"><MessageByline edit={editMessage} disabled={write.busy}>
               <strong>{m.author}</strong>{member && <MemberBadges member={member}/>}
-              {progress && <span className="v2-progress-tag">进行中</span>}<time dateTime={m.at}>{clock}</time></div>
+              {progress && <span className="v2-progress-tag">进行中</span>}<time dateTime={m.at}>{clock}</time></MessageByline>
               {orderTag}
               {editing ? <MessageEditor base={path} sessionId={session.id} maxLength={64000}
                 edit={{id:editing.message.id, text:editing.message.text, traceId:editing.traceId, attachments:editing.message.inputAttachments}}

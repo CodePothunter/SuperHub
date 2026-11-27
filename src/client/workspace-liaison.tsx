@@ -15,7 +15,7 @@ import { NoticeScheduleActions, SCHEDULE_STYLE } from './workspace-schedules.tsx
 import { NewerEdge, OlderEdge, historyEdgeStyle } from './history-edge.tsx'
 import { useEdgeSentinel, usePrependAnchor } from './scroll-anchor.ts'
 import { speechCursor } from '../core/paging.ts'
-import { MessageEditButton, MessageEditor, type MessageEdit } from './workspace-conversation-actions.tsx'
+import { MessageByline, MessageEditor, type MessageEdit } from './workspace-conversation-actions.tsx'
 
 interface Links {
   openProfileImport: (id: string) => void
@@ -99,9 +99,8 @@ function LiaisonTurn({ message, result, notice, id, scope, sessionId, editMessag
   const at = new Date(message.time).toISOString()
   return <li data-message-id={id} className={'v2-turn' + (mine ? ' mine' : '') + (notice?.done ? ' settled' : '')} tabIndex={-1}>
     <ChatAvatar portrait={mine ? ownerPortrait : liaisonPortrait}/>
-    <div className="v2-message"><div className="v2-byline">
-      {editMessage && <MessageEditButton open={editMessage}/>}
-      <strong>{mine ? '我' : '接口人'}</strong><time dateTime={at}>{readableTime(at)}</time></div>
+    <div className="v2-message"><MessageByline edit={editMessage}>
+      <strong>{mine ? '我' : '接口人'}</strong><time dateTime={at}>{readableTime(at)}</time></MessageByline>
       {editor ?? <div className="v2-bubble">
         {notice && <NoticeBody notice={notice} openRoom={openRoom} openDelegation={openDelegation} openSchedules={openSchedules}/>}
         {result && <DiscussionReply result={result} open={openRoom} className="v2-markdown"/>}
