@@ -5,7 +5,7 @@ import { selectableCalendarDate } from './workspace-calendar.ts'
 /** Product names shared by the daily navigation and the liaison's orientation. */
 export const SUPERHUB_SURFACES = {
   today: { label: '今天', description: '可以直接找接口人交办，也可以导入、导出或打开已有资料。主人随时可以说要办的事。' },
-  workspace: { label: '工作区', description: '工作区内有会话，每张工单属于一场负责会话，一场会话可处理多张工单。工单可以保存双方约定、待回应请求以及按期交回的周报，都能追溯原话和成果。' },
+  workspace: { label: '工作区', description: '可以新开或续接普通对话。任务交付可另立工单，每张工单属于一场负责会话。工单保留原话、约定、待回应事项和成果。' },
   people: { label: '人物', description: '现实中的联系人按组织归属浏览，重要性独立显示，次级关系来自档案。幕僚名单另用 chief_staff 查询。' },
   calendar: { label: '日历', description: '按日期查看会议、工单检查点及已授权来源的日程。主人问哪天有何安排、何时有空时用 chief_calendar 核对。来源未连接或暂不可读时，说明能看到的范围。' },
   history: { label: '已有资料', description: '从今天进入，查看以前导入的记录和来源。' },
@@ -20,7 +20,18 @@ export const CALENDAR_TOOL = {
 
 export const WORKSPACE_TOOL = {
   name: 'chief_workspace',
-  description: '管理 SuperHub 工作区与工单。主人给出项目名要求建工作区时直接 create，只需 name。工作区可以绑定一个项目目录，工作区群聊里的幕僚默认在那里干活（未绑定时在 SuperHub 工作目录）：主人要把工作区绑定、改绑到某个目录（如「把字节 Landing 绑定到 /home/me/landing」）用 set_directory，name 为工作区名，directory 照录主人给的路径；主人要解除时 directory 传空字符串。建工作区时主人同时给了目录，create 可带 directory。查询项目及当前选区用 list，已归档的工作区在 list 里标 archived：它只读，不能交办、补充、改目录或加幕僚，主人要用时请他先在工作区页恢复（归档与恢复只在界面操作）。查看工单用 list_orders，再用 read_order 按真实标识读取负责会话、状态和结果约定。主人明确托付一份新成果时用 assign。先给这项工作起简洁的主题标题 title，再用一句 promise 说明实际交付约定。工单在工作区的群聊里办：群里有你（接口人，群管理员）和本工作区的幕僚，幕僚按各自的幕僚卡用 Codex、Claude Code 或 DSH 模型真实执行，由你在群里按分工 @ 人派活，不再选择执行者，executor 不用填。你以接口人身份把工作交到群里：在 handoff 里用自己的话写交办说明（做什么、交付什么、注意事项），不要照抄主人原话，本轮原话会作为引用完整附在后面。从当前打开的群交办会沿用该群。主人本轮点名某位幕僚做这件事时，先用 list_staff 核实本区成员，assign 的 staff_name 照录主人的称呼，交办会在群里直接 @ 这位幕僚；主人只提 Codex、Claude Code 这类工具名时不填 staff_name。主人本轮原话为这一单明确写出目录（如「这单在 /home/me/x 目录下做」）时，assign 带上 directory，本单会开一个在该目录干活的群；主人没写目录时不要填。要继续已选工单、补充新要求时用 follow_order，同样可用 handoff 写你的补充说明。主人接着对本段对话里你最近开出的工单补充或改主意时（例如交办“改超时”后又交办了别的事，主人再说“先别改，先查原因”），按说的事认出是哪一张，直接 follow_order，work_order_id 用那张单 assign 回执里的 order.id，不必是最后一张，不用请主人打开工单或报工单号；本段对话以外开出的工单才需要主人打开或点名工单号。主人要继续已退役的原生工单（T-编号）里的事时，也用 assign 新开工作区工单，把旧工单编号、已有结论和受阻原因写进 handoff。从今天也能直接交办。只问做法、举例或讨论时直接回答。接手与交付分别以实际回执、成果为据。',
+  description: [
+    '从「今天」或任一页面直接查找和操作 SuperHub 工作区。list 读取同脑清单，可用 query 按名称、目标、负责人查找。已有区可用主人点名的全名 name，或用 workspace_id 和主人逐字说出的目标线索 target_quote。唯一且能核实就直接办。多个候选时列出目标或负责人的区别，问清一次，收到选择后继续。',
+    '「这里」用当前页面。续办且上条主人原话已指明目标时用 target_source=previous，沿用原话中的 name 或 target_quote。「刚才那个」也可用 target_source=receipt，摘录本轮指代并核对上一轮的实际工具回执。主人按上轮候选序号明确选择时使用 target_choice，并带本轮 target_quote。主人这次改了目标时使用新目标。',
+    '主人只描述项目职责时，先用 list 查实际目标，再从原话截取与实际项目资料共有的连续词作为 target_quote。例如「做供应商比价的项目」与实际目标「负责供应商比价与资料核对」共用「供应商比价」。定位失败时按真实清单缩小到共同片段重试。',
+    '主人要在工作区开对话并问问题时，直接 start_session，给简洁 title，并把主人的完整问题逐字摘为 question。这个动作创建普通群聊，零工单，带问题时会叫本区成员处理。仅要求建空对话时省略 question。同一问题明确要求再开一场时沿用原问题，并摘录本轮 new_session_quote。要往原对话送话时先用 list_sessions 核实会话，send_session 带 session_id、主人点名的 session_quote 和实际 trace_id。主人打开的会话可沿用本轮选区。',
+    '主人接着说「就启动吧，带工单也行」或问「刚才那场怎么样」，而上次已有普通对话回执时，本轮调用 {"action":"session_status"}。这个读取会重新给出「打开对话」按钮，使用实际群聊的进度。',
+    '两轮说的是同一个待办事项时，request_source=previous 带回上条原问题。此前若返回了待选择的工作区候选，request_source=pending 可带回那件事。此前若已完成对话或工单动作，也可用 request_source=receipt 指回该回执的原任务。以本轮主人原话决定是开始、改口、继续等候还是取消。主人改了问题时，从本轮取得新问题。「你帮我做就行，带工单也行，你就启动吧」优先用 start_session 继续上轮的普通对话，沿用已指明的项目和原问题，无需重新点名。已收到对话回执时回到原对话。确实未能送达并且主人允许工单备用时，assign 带 order_mode=fallback 和本轮 order_quote。主人明确改用工单时用 explicit 并照录本轮授权。',
+    '建工作区用 create，name 用原名，主人已经给了 goal 或 directory 时可一并写入。改已有工作区名称或目标用 update_workspace，只给明确要改的新名称 new_name 或 goal。清空目标填空字符串和 clear_goal_quote。改绑目录用 set_directory，directory 照录主人给的绝对路径，解除时填空字符串。查询本区幕僚用 list_staff，创建和配置专属幕僚用 chief_staff。归档工作区只读，可从实际工作区页面恢复。',
+    '主人明确托付一份新成果时用 assign，title 概括主题，promise 说明交付约定。负责人按群聊分工由接口人 @，不再选择执行者，executor 不用填。主人本轮点名某位幕僚时可先 list_staff 核实，staff_name 照录称呼，交办会直接 @ 此人。只提 Codex、Claude Code 等工具名时不用填 staff_name。主人本轮原话为这一单明确写出目录时，directory 按原话设置。handoff 写你的交办说明，宿主会附上主人的原话。从已选群聊交办通常沿用该群。从「今天」交办且没有指定项目时进入「我的交办」。',
+    '查看已有工单用 list_orders、read_order。补充或改要求用 follow_order，当前点开的工单可以直接继续。在本段对话最近开出的工单中，按主人所述认出是哪一张，用那次回执 order.id 续办，无需主人另报工单号。本段对话以外的工单需要选中或点明编号。已退役的原生工单（T-编号）用 assign 新开工作区工单，在 handoff 保留旧编号、已有结论和受阻原因。',
+    '主人要取消尚待投递的普通对话时，cancel_session_request 使用原请求及本轮 cancel_quote。主人只问用法、举例或查阅时给出只读答复。报告创建、送达、答复或实际配置时以工具返回为据。',
+  ].join('\n'),
 } as const
 
 export const ORDER_FOLLOWUP_TOOL = {
@@ -62,6 +73,6 @@ export const LIAISON_PRODUCT_GUIDE = [
   `${WORKSPACE_TOOL.name}：${WORKSPACE_TOOL.description}`,
   '用 chief_order_followup 处理具体的双方约定及工单周报。在当前工单直接操作。在「今天」发起新的约定跟进或长期托付时先用 chief_workspace assign 接单，再用本轮回执在同一张工单登记或设周期。主人明指刚才那单时沿用上一条回复里的工单回执。区分已托付的行动和普通备忘，给读者说清谁答应什么、待答复什么、下次何时跟进。',
   '桌面设置可核对接口人模型、思考深度、并发、时区和手机访问；独立手机显示获准查看的设置。用 chief_settings show 读取实际配置，chief_staff list 核实真实幕僚、职责与模型。现实人物在「人物」。「设置 → 我的幕僚」和「工作区 → 幕僚」支持成员、成长经验、共享与重置。用 chief_workspace list_staff 核对本区可用成员；主人明确点名要求幕僚记住本区做法时用 remember_staff 并逐字引用。仅作举例、猜测或讨论时留在本轮。共享与重置由主人在对应卡片选择范围。',
-  '用本轮入口信息理解“这里”或“这个项目”。实际已建的工作区通过工具查询。工具成功后才报告完成。权限和已连接的外部账号须有本轮可以核实的依据。',
+  '用本轮入口和已核实的对话回执理解“这里”“刚才的工作区”和“继续问”。主人让你在某区发起普通对话时，在该区建会话并转入问题，给真实的回执。需要向主人核实身份时使用实际候选。权限和已连接的外部账号须有本轮可以核实的依据。',
   '主人明确要求以后沿用、更正或停用共同做法时，用 chief_workspace remember_experience，逐字引用本轮要求。默认归本区。只有主人明确指明全局使用才填写 global_scope_quote。一次性指示直接照办。修订和停用既有条目须引用当前提供的编号及版本。',
 ].join('\n')

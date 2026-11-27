@@ -18,6 +18,8 @@ function member({ messages, system }) {
     (said(m).includes('群成员：') || said(m).startsWith('〔群里的新消息：主人在你干活时说了话'))) ?? {})
   const replied = text => messages.some(m => m.role === 'assistant' && said(m).includes(text))
   if (name === '接口人') {
+    if (prompt.includes('交接前需要核对哪两项？')) return text('交接前请核对来源和日期。')
+    if (prompt.includes('补充材料最晚哪天交？')) return text('请提供交接日期，我再核对补充材料的最晚提交日。')
     if (prompt.includes('核对一下试点的联系人')) return text('我已经核对了试点联系人，可以在这张工单里查看结果。')
     if (prompt.includes('请同事一起核对报名表') && !replied('@研究员 请核对报名表')) return text('@研究员 请核对报名表的字段是否够用。')
     if (prompt.includes('做完了你交代的活')) return text('我已整理本轮讨论，报名表只需要姓名和邮箱。')
@@ -170,6 +172,33 @@ function response({ messages, sessionId, tools, system }) {
     if (!done('named-workspace')) return call('named-workspace','chief_workspace',{action:'create',name:'字节 Landing'})
     const result = messages.find(m => m.role === 'tool' && m.toolCallId === 'named-workspace')
     return text(result?.isError ? '工作区创建失败。' : '字节 Landing 工作区已就绪。')
+  }
+  if (sessionId?.startsWith('chief-liaison-') && words === '在字节 Landing 开个对话，不开工单。交接前需要核对哪两项？') {
+    if (!done('direct-project-dialogue')) return call('direct-project-dialogue','chief_workspace',{
+      action:'start_session',name:'字节 Landing',title:'交接资料核对',question:'交接前需要核对哪两项？',
+    })
+    return text(toolMessage('direct-project-dialogue') ?? '会话未能创建。')
+  }
+  if (sessionId?.startsWith('chief-liaison-') && words === '考虑在字节 Landing 开个对话，问补充材料最晚哪天交？先别执行。') {
+    return text('等你确定后再问。')
+  }
+  if (sessionId?.startsWith('chief-liaison-') && words === '你帮我做就行了，带工单也行，你就启动吧。') {
+    const prior = messages.filter(m => m.role === 'user' && m.source?.kind === 'user').at(-2)
+    const legacy = said(prior ?? {}).includes('补充材料最晚哪天交')
+    const id = legacy ? 'resume-held-project-dialogue' : 'reuse-project-dialogue'
+    if (!legacy && !done(id)) return call(id,'chief_workspace',{action:'session_status'})
+    if (!done(id)) return call(id,'chief_workspace',{
+      action:'start_session',name:'字节 Landing',title:'补充材料核对',
+      request_source:'previous',target_source:'previous',
+      question:'补充材料最晚哪天交？',
+    })
+    return text(toolMessage(id) ?? '会话未能续办。')
+  }
+  if (sessionId?.startsWith('chief-liaison-') && words === '把字节 Landing 工作区的目标改成每周复核交接材料。') {
+    if (!done('update-project-goal')) return call('update-project-goal','chief_workspace',{
+      action:'update_workspace',name:'字节 Landing',goal:'每周复核交接材料',
+    })
+    return text(toolMessage('update-project-goal') ?? '工作区未能更新。')
   }
   if (sessionId?.startsWith('chief-liaison-') && words === '请帮我核对一下试点的联系人，整理成交给团队的清单。') {
     if (!done('check-trial-contact')) return call('check-trial-contact','chief_workspace',{

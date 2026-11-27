@@ -20,6 +20,7 @@ import type { Agent, NativePromptPart, SessionController, SessionEventLike } fro
 import { liaisonRoomRequest, type DiscussionReceipt, type DiscussionResult } from './room-results.ts'
 import { profileImportId } from '../core/profile-import.ts'
 import { pageWindow, speechCursor, type PageInfo, type PageQuery } from '../core/paging.ts'
+import { INITIAL_WORKSPACE_TRACE } from './workspace-dialogue-trace.ts'
 import { INITIAL_LIAISON_TRACE, liaisonAccepted, liaisonEditError, liaisonForkPrefix, liaisonTraceConflict,
   type LiaisonEdit, type LiaisonEditRequest, type LiaisonTraceBinding, type LiaisonTraces } from './liaison-traces.ts'
 
@@ -54,8 +55,22 @@ export interface ChatMessage {
   /** 只来自 chief_inbox 的宿主回执，按事件去向解析，不从模型文字猜工单。 */
   dispatches?: ChatDispatch[]
   discussions?: DiscussionReceipt[]
-  workspaces?: { id: string; name: string; delegationId?: string; delegationTitle?: string; workOrderDeletedAt?: string }[]
+  workspaces?: ChatWorkspaceReceipt[]
   profileImports?: { importId: string }[]
+}
+
+export interface ChatWorkspaceReceipt {
+  id: string
+  name: string
+  delegationId?: string
+  delegationTitle?: string
+  workOrderDeletedAt?: string
+  sessionId?: string
+  sessionTitle?: string
+  sessionTraceId?: string
+  sourceMessageId?: string
+  sessionDeletedAt?: string
+  sessionUnavailable?: true
 }
 
 export interface ChatDispatch {
@@ -135,7 +150,14 @@ export function describeTool(name: string, rawArgs: string): { label: string; de
     case 'chief_inbox': return { label: '交给幕僚团', detail: clip(a.text, 48) }
     case 'chief_brief': return { label: '看今天的态势' }
     case 'chief_read_attachment': return { label: '读取聊天附件' }
-    case 'chief_workspace': return { label: a.action === 'create' ? '办理工作区' : '查看工作区', detail: clip(a.name, 40) }
+    case 'chief_workspace': {
+      const labels: Record<string, string> = {
+        create: '办理工作区', update_workspace: '更新工作区', set_directory: '调整项目目录',
+        list_sessions: '查看工作区对话', start_session: '新建工作区对话', send_session: '续接工作区对话',
+        assign: '交办工作区工单', follow_order: '补充工作区工单',
+      }
+      return { label: labels[String(a.action)] ?? '查看工作区', detail: clip(a.name, 40) }
+    }
     case ORDER_FOLLOWUP_TOOL.name: {
       const labels: Record<string,string> = {read:'查看工单约定与周报',sources:'查阅工单原话',record:'登记工单约定',resolve:'标记约定已处理',schedule:'设置每周出稿',draft:'生成本周周报'}
       return { label: labels[String(a.action)] ?? '查看工单跟进' }
@@ -177,6 +199,37 @@ function dispatchReceipt(meta: unknown): string | undefined {
   if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) return undefined
   const id = (receipt as Record<string, unknown>).eventId
   return typeof id === 'string' && eventIdPattern.test(id) ? id : undefined
+}
+
+function nativeWorkspaceReceipt(meta: unknown): ChatWorkspaceReceipt | undefined {
+  const value = (meta as Record<string, unknown> | undefined)?.['dsh-chief/workspace']
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return
+  const { id, name, delegationId, delegationTitle, sessionId, sessionTitle, sessionTraceId, sourceMessageId } = value as Record<string, unknown>
+  if (typeof id !== 'string' || !eventIdPattern.test(id) || typeof name !== 'string' || name.length > 160 || !name.trim()) return
+  if (typeof delegationId === 'string' && eventIdPattern.test(delegationId) && typeof delegationTitle === 'string') {
+    return { id, name, delegationId, delegationTitle: delegationTitle.slice(0, 500) }
+  }
+  if (sessionId === undefined && sessionTitle === undefined) return { id, name }
+  if (typeof sessionId !== 'string' || !eventIdPattern.test(sessionId) || typeof sessionTitle !== 'string' ||
+    sessionTitle.length > 300 || !sessionTitle.trim()) return
+  const validTrace = typeof sessionTraceId === 'string' &&
+    (sessionTraceId === INITIAL_WORKSPACE_TRACE || sessionTraceId.startsWith('trace-') && eventIdPattern.test(sessionTraceId.slice(6)))
+  const anchor = typeof sourceMessageId === 'string' && /^g-[1-9]\d{0,15}$/.test(sourceMessageId) && (sessionTraceId === undefined || validTrace)
+    ? sourceMessageId : undefined
+  return { id, name, sessionId, sessionTitle, ...(anchor && { sourceMessageId: anchor, ...(validTrace && { sessionTraceId }) }) }
+}
+
+function addWorkspaceReceipt(receipts: ChatWorkspaceReceipt[], receipt: ChatWorkspaceReceipt) {
+  const sameTarget = (saved: ChatWorkspaceReceipt) => saved.id === receipt.id && saved.delegationId === receipt.delegationId && saved.sessionId === receipt.sessionId
+  if (!receipt.sourceMessageId) {
+    if (!receipts.some(sameTarget)) receipts.push(receipt)
+    return
+  }
+  // Upgrade a link without an anchor when delivery lands. Separate source lines or versions remain independently readable.
+  const previous = receipts.findIndex(saved => sameTarget(saved) && (!saved.sourceMessageId ||
+    saved.sourceMessageId === receipt.sourceMessageId && saved.sessionTraceId === receipt.sessionTraceId))
+  if (previous === -1) receipts.push(receipt)
+  else receipts[previous] = receipt
 }
 
 type AttachmentLookup = (source: { requestId: string; text: string }) => ChatInputAttachment[] | undefined
@@ -268,13 +321,10 @@ export function chatFromEvents(events: readonly SessionEventLike[], limit = 80, 
         }
       }
       if ((call?.name === 'chief_workspace' || call?.name === ORDER_FOLLOWUP_TOOL.name) && !step?.failed) {
-        const receipt = (data?.meta as Record<string, unknown> | undefined)?.['dsh-chief/workspace'] as Partial<NonNullable<ChatMessage['workspaces']>[number]> | undefined
-        if (receipt && typeof receipt.id === 'string' && eventIdPattern.test(receipt.id) && typeof receipt.name === 'string' && receipt.name.length <= 160 && receipt.name.trim()) {
+        const receipt = nativeWorkspaceReceipt(data?.meta)
+        if (receipt) {
           reply = firstReply(event)
-          reply.workspaces ??= []
-          const job = typeof receipt.delegationId === 'string' && eventIdPattern.test(receipt.delegationId) && typeof receipt.delegationTitle === 'string'
-            ? { delegationId: receipt.delegationId, delegationTitle: receipt.delegationTitle.slice(0, 500) } : undefined
-          if (!reply.workspaces.some(space => space.id === receipt.id && space.delegationId === job?.delegationId)) reply.workspaces.push({ id: receipt.id, name: receipt.name, ...job })
+          addWorkspaceReceipt(reply.workspaces ??= [], receipt)
         }
       }
       if (call?.name === 'chief_import' && !step?.failed) {
@@ -349,7 +399,8 @@ export class LiaisonChat {
     private readonly discussionResults?: (receipts: readonly DiscussionReceipt[], options?: { historical?: boolean }) => Promise<DiscussionResult[]>,
     private readonly input?: { service: ChatAttachments; forRequest: AttachmentLookup },
     private readonly beforeDelivery?: (requestId: string, text: string) => Promise<void>,
-    private readonly editing?: LiaisonEditing) {
+    private readonly editing?: LiaisonEditing,
+    private readonly sessionLabel?: (workspaceId: string, sessionId: string) => { title: string; deletedAt?: string } | undefined) {
     this.parts = typeof session === 'string' ? fixedParts(session) : session
   }
 
@@ -431,7 +482,7 @@ export class LiaisonChat {
     return { agent, observedAt, offset, history, live, receipts, traceId }
   }
 
-  /** 不带 `page` 时返回最近 80 条（旧客户端）；带 `page` 时返回那一页并附 `page`。派工状态、工单标签只解析返回的消息。 */
+  /** 不带 `page` 时返回最近 80 条（旧客户端）；带 `page` 时返回那一页并附 `page`。仅解析返回的消息中的派工状态和工作区回执。 */
   async view(page?: PageQuery, trace?: string): Promise<ChatView> {
     const frozen = trace && trace !== this.activeTrace() ? this.editing?.traces.snapshot(trace) : undefined
     if (trace && trace !== this.activeTrace() && !frozen) throw liaisonEditError(404, '没有这版接口人对话')
@@ -449,7 +500,13 @@ export class LiaisonChat {
       const state = this.dispatchState?.(source.eventId) ?? { state: this.dispatchState ? 'missing' as const : 'pending' as const }
       return [{ eventId: source.eventId, ...state }]
     })
-    const labels = (links: NonNullable<ChatMessage['workspaces']>) => links.map(link => {
+    const labels = (links: ChatWorkspaceReceipt[]): ChatWorkspaceReceipt[] => links.map(link => {
+      if (link.sessionId && this.sessionLabel) {
+        const { sessionDeletedAt: _deletedAt, sessionUnavailable: _unavailable, ...receipt } = link
+        const label = this.sessionLabel(link.id, link.sessionId)
+        return label ? { ...receipt, sessionTitle: label.title, ...(label.deletedAt && {sessionDeletedAt: label.deletedAt}) }
+          : { ...receipt, sessionUnavailable: true }
+      }
       const label = link.delegationId && this.orderLabel?.(link.id,link.delegationId)
       if (!label) return link
       if (typeof label === 'string') return {...link,delegationTitle:label}

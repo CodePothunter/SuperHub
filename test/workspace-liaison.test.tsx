@@ -85,6 +85,28 @@ describe('一句话交办', () => {
     expect(html).not.toContain('打开工作区')
   })
 
+  it('opens separate saved and live conversations and keeps unavailable receipts readable', () => {
+    const receipt = { id: 'other-workspace', name: '客户体验' }
+    vi.spyOn(api, 'useChat').mockReturnValue({
+      sessionId: 'hq', confirmedMessages: [], observedAt: 0, messages: [
+        { seq: 1, time: 1, role: 'liaison', text: '', workspaces: [
+          { ...receipt, sessionId: 'interview', sessionTitle: '访谈发现', sessionTraceId: 'initial', sourceMessageId: 'g-1' },
+          { ...receipt, sessionId: 'prototype', sessionTitle: '初版核对', sessionDeletedAt: '2026-11-27T01:00:00.000Z' },
+          { ...receipt, sessionId: 'missing', sessionTitle: '其他反馈', sessionUnavailable: true },
+        ] },
+      ],
+      live: { since: 2, steps: [], text: '', workspaces: [{ ...receipt, sessionId: 'review', sessionTitle: '回访建议' }] },
+      notices: [], workReplies: [], busy: true, error: undefined, say: vi.fn(), refresh: vi.fn(), tick: 0, ...noPaging,
+    })
+    const html = renderToStaticMarkup(<WorkspaceLiaison scope="brain" surface="today" changed={vi.fn()} close={vi.fn()}
+      openProfileImport={vi.fn()} openWorkspace={vi.fn()} openSession={vi.fn()}/>)
+    expect(html).toMatch(/<button [^>]*>打开对话「访谈发现」<\/button>/)
+    expect(html).toMatch(/<button [^>]*>打开对话「回访建议」<\/button>/)
+    expect(html).toContain('「初版核对」 · 对话已删除')
+    expect(html).toContain('「其他反馈」 · 对话已不可用')
+    expect(html).not.toMatch(/打开对话「初版核对|打开对话「其他反馈|打开工作区/)
+  })
+
   it('shows reminders as liaison turns in time order, with the order or discussion they open', () => {
     const at = (minute: number) => new Date(Date.UTC(2026, 10, 24, 3, minute)).toISOString()
     vi.spyOn(api, 'useChat').mockReturnValue({

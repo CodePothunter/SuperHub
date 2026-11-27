@@ -80,7 +80,7 @@ const NATIVE = [
   { id: 'researcher', name: '研究员', brief: '查资料', executor: 'dsh' as const },
 ]
 
-function fixture(options: { turnLimit?: number; review?: AcceptanceVerdict[] | 'fail'; judge?: CommandIntent; root?: string; inputAttachments?: Pick<ChatAttachments, 'resolve' | 'grant'>; coordinate?: EngagementCoordinator; llm?: Pick<Llm, 'stream'> } = {}) {
+function fixture(options: { turnLimit?: number; review?: AcceptanceVerdict[] | 'fail'; judge?: CommandIntent; root?: string; inputAttachments?: Pick<ChatAttachments, 'resolve' | 'grant'>; coordinate?: EngagementCoordinator; llm?: Pick<Llm, 'stream'>; liaisonTrace?: () => string } = {}) {
   const root = options.root ?? mkdtempSync(join(tmpdir(), 'chief-group-routes-'))
   if (!options.root) cleanup.push(() => rmSync(root, { recursive: true, force: true }))
   const dsh = new FakeRunner(), codex = new FakeRunner()
@@ -113,7 +113,7 @@ function fixture(options: { turnLimit?: number; review?: AcceptanceVerdict[] | '
     learning = options.llm && createExperienceLearning({root, scope, staff, writable: id => store.writable(id),
       llm: () => options.llm, model: () => ({provider: 'fixture', model: 'fixture'}),
       verifyOriginal: (evidence, audience) => route.verifyLearningOriginal(evidence, audience)})
-    route = workspaceV2Routes({ staff, store, source, approvals, groups: host, learning, inputAttachments: options.inputAttachments, coordinate: options.coordinate, ...options.review && { review }, ...options.judge && { judge: async () => options.judge! },
+    route = workspaceV2Routes({ staff, store, source, approvals, groups: host, learning, inputAttachments: options.inputAttachments, coordinate: options.coordinate, liaisonTrace:options.liaisonTrace, ...options.review && { review }, ...options.judge && { judge: async () => options.judge! },
       remind: (key, text, _order, extra) => reminders.push({ key, text, ...extra?.localOnly && { localOnly: true } }) })
     route.recover()
   }
@@ -650,6 +650,175 @@ describe('新会话都是群（engine: roster），执行者不再可选', () =>
     const legacyRoot = mkdtempSync(join(tmpdir(), 'chief-group-legacy-'))
     cleanup.push(() => rmSync(legacyRoot, { recursive: true, force: true }))
     expect(new WorkspaceV2Store(legacyRoot, 'x', 4).rosterGroups).toBe(false)
+  })
+})
+
+describe('接口人从私聊发起工作区普通对话', () => {
+  const firstQuestion = '在方舟评测开场普通对话，不开工单，问归档报告需要补哪项资料？'
+  const turn = (requestId: string, text: string) => ({requestId, messageId:'message-' + requestId, text})
+  const start = (workspaceId: string, requestId = 'dialogue') => {
+    const original = turn(requestId, firstQuestion)
+    return {mode:'start' as const, workspaceId, title:'核对归档报告', original, source:original, conversationId:'private-liaison',
+      question:'归档报告需要补哪项资料？'}
+  }
+
+  it('在目标区建零单群，将原问题以接口人转交入账并且只叫一次，读回实际回复', async () => {
+    const f = fixture()
+    const ws = await f.workspace()
+    const other = await f.workspace()
+    const request = start(ws.id)
+    const [first, repeat] = await Promise.all([f.route().liaisonDialogue(request), f.route().liaisonDialogue(request)])
+    expect(first).toEqual(repeat)
+    expect(first).toMatchObject({workspace:{id:ws.id}, session:{title:'核对归档报告',delegationIds:[]}, state:'sent', sourceMessageId:'g-1'})
+    expect(f.store().view(ws.id)).toMatchObject({orders:[], sessions:[{id:first.session.id}]})
+    expect(f.store().view(other.id)).toMatchObject({orders:[], sessions:[]})
+    expect(f.store().personalWorkspaceId()).toBeUndefined()
+    const { call } = f.dsh.last('liaison')
+    expect(call.prompt).toContain('归档报告需要补哪项资料？')
+    expect(call.workOrderId).toBeUndefined()
+    expect(f.host().ownerTurn(first.session.id, call.callId)).toBeUndefined()
+    f.dsh.answer('liaison','报告需要补一份来源索引。',false)
+    const transcript = (await f.view(first.session)).data
+    expect(transcript.messages).toMatchObject([
+      {id:'g-1', author:'接口人', quote:{text:'归档报告需要补哪项资料？'}},
+      {id:'g-2', replyTo:'g-1', text:'报告需要补一份来源索引。'},
+    ])
+    expect(f.route().liaisonDialogueStatus(request.original.requestId)).toMatchObject({state:'replied', sourceMessageId:'g-1'})
+    const confirmed = await f.route().liaisonDialogue({...request, source:turn('permission','带工单也行，你就启动吧。')})
+    expect(confirmed).toMatchObject({session:{id:first.session.id}, state:'replied'})
+    expect(f.dsh.count('liaison')).toBe(1)
+    await expect(f.route().liaisonDialogue({...request, workspaceId:other.id})).rejects.toThrow('已有负责会话')
+  })
+
+  it('继续现场选中的会话保留原 ID，群里的唯一工单不会吃掉这条普通消息', async () => {
+    const f = fixture()
+    const ws = await f.workspace()
+    const session = await f.group(ws)
+    const orderBody = {requestId:'separate-order', sessionId:session.id, title:'手动工单', promise:'整理报告',owner:'接口人'}
+    const order = (await f.call<{order:V2Delegation}>('/' + ws.id + '/orders', orderBody)).data.order
+    const original = turn('send-start','在端点排查追加一句：有没有现成的交接材料？')
+    const request = {mode:'send' as const, workspaceId:ws.id, sessionId:session.id, original,source:original,conversationId:'private-liaison',
+      question:'有没有现成的交接材料？'}
+    await expect(f.route().liaisonDialogue({...request, traceId:'old-trace'})).rejects.toThrow('对话版本已更新')
+    const receipt = await f.route().liaisonDialogue({...request, traceId:'initial'})
+    expect(receipt).toMatchObject({state:'sent', session:{id:session.id}})
+    expect(f.dsh.last('liaison').call.workOrderId).toBeUndefined()
+    expect((await f.view(session)).data.messages[0]).not.toHaveProperty('workOrderId')
+    expect(f.store().view(ws.id)).toMatchObject({orders:[{id:order.id}],sessions:[{id:session.id}]})
+    await f.call('/' + ws.id + '/sessions/' + session.id + '/close', {requestId:'close-session'})
+    const newQuestion = turn('send-before-close','再问一下端点清单。')
+    await expect(f.route().liaisonDialogue({...request, original:newQuestion, source:newQuestion, question:newQuestion.text})).rejects.toThrow('会话已关闭')
+  })
+
+  it.each([false,true])('与同成员排队的旧工单分别调度（先排普通对话 %s）', async ordinaryFirst => {
+    const f = fixture()
+    const ws = await f.workspace()
+    const session = await f.group(ws)
+    const order = (await f.call<{order:V2Delegation}>('/' + ws.id + '/orders',
+      {requestId:'queued-order',sessionId:session.id,title:'旧单',promise:'核对旧资料',owner:'接口人'})).data.order
+    const engine = await f.host().engine(session)
+    engine.dispatchEngagement('running-legacy', ['liaison'], '正在处理的旧单发言。', order.id)
+    const queueOrder = () => engine.dispatchEngagement('queued-legacy', ['liaison'], '等待处理的旧单发言。', order.id)
+    const original = turn('send-independent','在端点排查追加一句：新材料需要目录吗？')
+    const send = () => f.route().liaisonDialogue({mode:'send', workspaceId:ws.id, sessionId:session.id, original,
+      source:original,conversationId:'private-liaison',question:'新材料需要目录吗？'})
+    if (!ordinaryFirst) queueOrder()
+    const receipt = await send()
+    if (ordinaryFirst) queueOrder()
+    expect(engine.workInFlight().map(row => row.workOrderId)).toEqual(ordinaryFirst ? [order.id,undefined,order.id] : [order.id,order.id,undefined])
+    expect((await f.view(session)).data.messages.find(row => row.id === receipt.sourceMessageId)).not.toHaveProperty('workOrderId')
+  })
+
+  it('首问进账但群调度未写入时，重启沿用一行和原群，备用工单此时不能抢跑', async () => {
+    const f = fixture()
+    const ws = await f.workspace()
+    const input = start(ws.id, 'interrupted-dialogue')
+    const pending = f.store().beginLiaisonDialogue(input)
+    const engine = await f.host().engine({id:pending.sessionId, workspaceId:ws.id})
+    vi.spyOn(engine, 'dispatchEngagement').mockImplementationOnce((ref, _members, text, _order, saved) => {
+      engine.note({speaker:'liaison', text, ref, quote:{label:'主人原话',text:saved!.original!}})
+      throw new Error('模拟群调度写入中断')
+    })
+    const first = await f.route().liaisonDialogue(input)
+    expect(first).toMatchObject({state:'pending', reason:'模拟群调度写入中断'})
+    const source = turn('fallback-try','带工单也行，你就启动吧。')
+    const before = {original:input.original, source, conversationId:input.conversationId, orderMode:'fallback' as const}
+    expect(() => f.route().assign(source.requestId, input.original.text, undefined, ws.id, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, before)).toThrow('已有普通对话')
+    f.restart()
+    await vi.waitFor(() => expect(f.route().liaisonDialogueStatus(input.original.requestId)).toMatchObject({state:'sent', sourceMessageId:'g-1'}))
+    expect((await f.view(first.session)).data.messages.map(row => row.id)).toEqual(['g-1'])
+    expect(f.dsh.count('liaison')).toBe(1)
+    expect(f.store().view(ws.id)).toMatchObject({orders:[], sessions:[{id:first.session.id}]})
+  })
+
+  it('明确未送达时备用工单接管同一请求，保存原问题和本轮授权，重启后旧会话不补发', async () => {
+    const f = fixture()
+    const ws = await f.workspace()
+    const input = start(ws.id, 'failed-dialogue')
+    vi.spyOn(f.host(), 'engine').mockRejectedValueOnce(new Error('暂无法开群'))
+    const failed = await f.route().liaisonDialogue(input)
+    expect(failed).toMatchObject({state:'failed',reason:expect.stringContaining('暂无法开群')})
+    const source = turn('allow-ticket','你帮我做就行了。带工单也行，你就启动吧。')
+    const ownerContext = {original:input.original,source,conversationId:input.conversationId,orderMode:'fallback' as const, authorizationQuote:'带工单也行，你就启动吧。'}
+    const assign = () => f.route().assign(source.requestId,input.original.text,undefined,ws.id,undefined,{title:'归档报告',promise:'说明缺哪项资料'},
+      undefined,undefined,undefined,undefined,undefined,undefined,ownerContext)
+    const {delegation,session} = assign()
+    expect(assign().delegation.id).toBe(delegation.id)
+    expect(f.store().orderOriginal(ws.id,delegation.id)).toEqual({text:input.original.text,complete:true,
+      liaisonSource:{requestId:input.original.requestId,messageId:input.original.messageId,authorization:{...source,text:ownerContext.authorizationQuote}}})
+    await vi.waitFor(async () => expect((await f.view(session)).data.messages[0]).toMatchObject({
+      workOrderId:delegation.id,quote:{text:expect.stringContaining('〔主人本次授权〕\n带工单也行，你就启动吧。')},
+    }))
+    f.restart()
+    expect(f.route().liaisonDialogueStatus(input.original.requestId)).toBeUndefined()
+    expect((await f.view(failed.session)).data.messages).toEqual([])
+    expect(f.store().view(ws.id).orders.map(row => row.id)).toEqual([delegation.id])
+  })
+
+  it('主人取消和私聊续写均阻止待投递问题在宿主重启时跑出来', async () => {
+    let trace = 'initial'
+    const f = fixture({liaisonTrace:() => trace})
+    const ws = await f.workspace()
+    const first = start(ws.id, 'will-cancel')
+    const second = start(ws.id, 'will-edit')
+    const engine = vi.spyOn(f.host(),'engine').mockRejectedValue(new Error('群暂不可用'))
+    expect((await f.route().liaisonDialogue(first)).state).toBe('failed')
+    expect((await f.route().liaisonDialogue(second)).state).toBe('failed')
+    const cancellation = turn('cancel-turn','刚才第一场先别启动。')
+    expect(f.route().liaisonDialogueCancel({workspaceId:ws.id,originalRequestId:first.original.requestId,
+      source:cancellation,conversationId:first.conversationId})).toMatchObject({state:'cancelled'})
+    trace = 'edited-liaison'
+    engine.mockRestore()
+    f.restart()
+    await vi.waitFor(() => expect(f.route().liaisonDialogueStatus(second.original.requestId)).toMatchObject({state:'cancelled',reason:expect.stringContaining('已续写')}))
+    expect(f.dsh.count('liaison')).toBe(0)
+  })
+
+  it('仍保留原问题时可另开一场，再确认沿用新对话', async () => {
+    const f = fixture()
+    const ws = await f.workspace()
+    const input = start(ws.id)
+    const first = await f.route().liaisonDialogue(input)
+    const source = turn('new-same-question','再开一场问刚才同一个问题。')
+    const second = await f.route().liaisonDialogue({...input,source,actionRequestId:source.requestId})
+    expect(second.session.id).not.toBe(first.session.id)
+    expect(second.requestId).toBe(source.requestId)
+    const confirmation = turn('same-again','就启动吧。')
+    const replay = await f.route().liaisonDialogue({...input,source:confirmation,actionRequestId:source.requestId})
+    expect(replay.session.id).toBe(second.session.id)
+    expect(f.store().view(ws.id).sessions).toHaveLength(2)
+    expect(f.store().view(ws.id).orders).toHaveLength(0)
+  })
+
+  it('只有确知普通对话失败时才走备用工单', async () => {
+    const f = fixture()
+    const ws = await f.workspace()
+    const {original,conversationId} = start(ws.id)
+    const source = turn('allow-direct-fallback','带工单也行。')
+    expect(() => f.route().assign(source.requestId,original.text,undefined,ws.id,undefined,{title:'核对',promise:'说明缺哪项资料'},
+      undefined,undefined,undefined,undefined,undefined,undefined,{original,source,conversationId,orderMode:'fallback'})).toThrow('先尝试')
+    expect(f.store().view(ws.id)).toMatchObject({sessions:[],orders:[]})
   })
 })
 

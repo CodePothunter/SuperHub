@@ -228,12 +228,12 @@ function featureRef(value: unknown): FeatureRef | undefined {
 function contextOf(value: unknown): IntakeContext | undefined {
   if (value === undefined) return undefined
   if (!value || typeof value !== 'object' || Array.isArray(value)) return bad('界面上下文无效')
-  const { surface, device, selectedId, sessionId, workOrderId } = value as Record<string, unknown>
+  const { surface, device, selectedId, sessionId, sessionTraceId, workOrderId } = value as Record<string, unknown>
   if ((surface !== undefined && (typeof surface !== 'string' || surface.length > 60))
     || (device !== undefined && device !== 'desktop' && device !== 'mobile')
-    || [selectedId,sessionId,workOrderId].some(id => id !== undefined && (typeof id !== 'string' || id.length > 160))) return bad('界面上下文无效')
+    || [selectedId,sessionId,sessionTraceId,workOrderId].some(id => id !== undefined && (typeof id !== 'string' || id.length > 160))) return bad('界面上下文无效')
   return { surface, device, selectedId, ...(surface === 'workspace' && selectedId && sessionId
-    ? {sessionId, ...(workOrderId ? {workOrderId} : {})} : {}) } as IntakeContext
+    ? {sessionId, ...(sessionTraceId ? {sessionTraceId} : {}), ...(workOrderId ? {workOrderId} : {})} : {}) } as IntakeContext
 }
 
 /**

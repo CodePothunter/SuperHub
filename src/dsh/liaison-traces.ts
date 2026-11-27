@@ -130,6 +130,43 @@ const inserted = (data: unknown): unknown[] => {
   return Array.isArray(items) ? items : []
 }
 
+/** A normal segment rotation can carry recent workspace references without copying model or connector context. */
+export function workspaceCarryEvents(events: readonly SessionEventLike[]): SessionEventLike[] {
+  const toolCalls = new Set<string>()
+  const allowedMeta = ['dsh-chief/workspace', 'dsh-chief/workspace-origin', 'dsh-chief/workspace-choices']
+  const retained: SessionEventLike[] = []
+  for (const event of events) {
+    if (event.type === 'user/message' || event.type === 'agent/inbox/spliced') {
+      const data = event.data as ({id?: string; target?: string} & NativeInput) | undefined
+      const inputs = event.type === 'user/message' ? [data] : data?.target !== 'next-turn' ? inserted(data) as (({id?: string} & NativeInput) | undefined)[] : []
+      for (const [index, input] of inputs.entries()) {
+        if (input?.source?.kind !== 'user' || !input.source.rpcId || !Array.isArray(input.content)) continue
+        const content = input.content.flatMap((block): {type: string; text?: string}[] => {
+          if (block.type === 'text' && typeof block.text === 'string') return [{type:'text',text:block.text}]
+          return block.type === 'image' || block.type === 'file' ? [{type:block.type}] : []
+        })
+        const id = input.id ?? (event.type === 'user/message' ? String(event.seq) : `${event.seq}:${index}`)
+        retained.push({type:'user/message',seq:event.seq,time:event.time,data:{id,source:{kind:'user',rpcId:input.source.rpcId},content}})
+      }
+    } else if (event.type === 'tool/call') {
+      const data = event.data as {name?: string; callId?: string} | undefined
+      if (data?.callId && (data.name === 'chief_workspace' || data.name === 'chief_staff')) {
+        toolCalls.add(data.callId)
+        retained.push({type:event.type,seq:event.seq,time:event.time,data:{name:data.name,callId:data.callId}})
+      }
+    } else if (event.type === 'tool/result') {
+      const data = event.data as {message?: {toolCallId?: string; isError?: boolean}; meta?: Record<string, unknown>} | undefined
+      const callId = data?.message?.toolCallId
+      if (!callId || !toolCalls.has(callId) || data?.message?.isError) continue
+      const meta = Object.fromEntries(allowedMeta.filter(key => data?.meta?.[key] !== undefined).map(key => [key,data?.meta?.[key]]))
+      if (Object.keys(meta).length) retained.push({type:event.type,seq:event.seq,time:event.time,data:{message:{toolCallId:callId},meta}})
+    }
+  }
+  let humanMessages = 0
+  const start = retained.findLastIndex(event => event.type === 'user/message' && ++humanMessages === 8)
+  return retained.slice(Math.max(0, start))
+}
+
 /** An inbox insertion remains a durable acknowledgement even if it was later claimed or cancelled. */
 export function liaisonAccepted(agent: Agent, requestId: string, includeCancelled = false) {
   return agent.inbox?.nextStep.some(message => isRequest(message, requestId))

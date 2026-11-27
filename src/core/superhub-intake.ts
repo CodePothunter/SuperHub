@@ -24,7 +24,14 @@ export const featureAnchors = (): FeatureAnchor[] => structuredClone([...catalog
 export const currentFeature = (ref: FeatureRef): boolean => catalog.some(row => row.id === ref.id && row.version === ref.version)
 
 export interface FeatureEvidence extends FeatureRef { title: string; basis: string }
-export interface IntakeContext { surface?: string; device?: 'desktop' | 'mobile'; selectedId?: string; sessionId?: string; workOrderId?: string }
+export interface IntakeContext {
+  surface?: string
+  device?: 'desktop' | 'mobile'
+  selectedId?: string
+  sessionId?: string
+  sessionTraceId?: string
+  workOrderId?: string
+}
 export interface SourceSpan { start: number; end: number }
 export interface IntakeInterpretation {
   text: string

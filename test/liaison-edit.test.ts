@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { chatCursor, LiaisonChat, type LiaisonEditing } from '../src/dsh/chat.ts'
-import { LiaisonTraces, liaisonForkPrefix } from '../src/dsh/liaison-traces.ts'
+import { LiaisonTraces, liaisonForkPrefix, workspaceCarryEvents } from '../src/dsh/liaison-traces.ts'
 import type { Agent, PendingInput, SessionController, SessionEventLike } from '../src/dsh/ports.ts'
 
 const owner = (id: string, text: string) => ({ id: 'native-' + id, source: { kind: 'user', rpcId: id }, content: [{ type: 'text', text }] })
@@ -21,6 +21,22 @@ function turn(rows: SessionEventLike[], id: string, text: string) {
   event(rows, 'step/end')
   event(rows, 'turn/end')
 }
+
+it('normal segment carry keeps only owner inputs and scoped workspace receipt fields', () => {
+  const rows: SessionEventLike[] = []
+  for (let index = 1; index < 10; index++) turn(rows, 'old-' + index, '之前的消息 ' + index)
+  const question = owner('carry','在研发组开场对话问交接日期。')
+  event(rows, 'agent/inbox/spliced', {target:'next-step',inserted:[question]})
+  event(rows, 'tool/call', {callId:'directory',name:'chief_workspace',arguments:'tool request payload'})
+  event(rows, 'tool/result', {message:{toolCallId:'directory',content:[{type:'text',text:'tool response payload'}]},
+    meta:{'dsh-chief/workspace':{id:'workspace-a',name:'研发组'},'example/other':'private connector metadata'}})
+  event(rows, 'agent/inbox/spliced', {target:'next-turn',inserted:[owner('unadmitted','暂存但未进入回合')]})
+  const retained = workspaceCarryEvents(rows)
+  expect(retained.filter(row => row.type === 'user/message')).toHaveLength(8)
+  expect(retained.slice(-3).map(row => row.data)).toEqual([question,
+    {callId:'directory',name:'chief_workspace'},{message:{toolCallId:'directory'},meta:{'dsh-chief/workspace':{id:'workspace-a',name:'研发组'}}}])
+  expect(JSON.stringify(retained)).not.toMatch(/payload|private connector metadata|unadmitted|old-1/)
+})
 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), 'chief-liaison-edit-')), file = join(dir, 'traces.json')

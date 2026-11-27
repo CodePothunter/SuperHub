@@ -976,7 +976,8 @@ to{opacity:1;transform:none}}
 .ws-order-group{border:1px solid var(--line);border-radius:11px;overflow:hidden}
 .ws-order-group button{width:100%;background:white;border:0;text-align:left;display:flex;justify-content:space-between;gap:15px;align-items:flex-start;color:var(--ink)}
 .ws-order-group button:hover{background:#f8f9fd}
-.ws-session{padding:16px 18px;border-bottom:1px solid var(--soft)!important;flex-wrap:wrap}
+.ws-session{padding:16px 18px;flex-wrap:wrap}
+.ws-order-group button.ws-session:not(:only-child){border-bottom:1px solid var(--soft)}
 .ws-session>b{font-size:13px;font-weight:600}
 .ws-session>span{font-size:10px;color:var(--muted)}
 .ws-order{padding:18px;min-height:105px}
@@ -1165,4 +1166,35 @@ to{opacity:1;transform:none}}
   .today-page .today-top:not(.compact){min-height:128px}
   .today-page .today-top:not(.compact)>img{height:128px}
   .today-page .today-intake{padding-block:13px}
+}
+
+.liaison-demo-intro{margin:0 0 15px;scroll-margin-top:22px}
+.liaison-demo-intro h3{font-size:18px;font-weight:650}
+.liaison-demo-intro p{margin-top:6px;color:var(--muted);font-size:13px}
+#liaison-demo-open{border:0;min-height:34px;align-items:center}
+#liaison-demo-open:hover{background:#292c3b}
+#liaison-preview{max-height:calc(100vh - 32px);max-height:calc(100dvh - 32px)}
+#liaison-preview .ws-dialog-head{padding-bottom:12px;border-bottom:1px solid var(--soft)}
+#liaison-preview .ws-dialog-head button{width:44px;height:44px}
+#liaison-preview .liaison-demo-context{margin:0 0 4px;color:var(--muted);font-size:12px}
+#liaison-preview .ws-messages{padding:18px 0;gap:15px}
+#liaison-preview .ws-messages:empty{display:none}
+#liaison-preview .ws-message p{margin-top:4px}
+#liaison-preview .liaison-count{display:block;margin-top:6px}
+#liaison-preview .liaison-receipt{margin-top:8px;min-height:44px}
+.liaison-example-draft{border-top:1px solid var(--soft);padding-top:12px}
+.liaison-example-draft p{color:var(--muted)}
+#liaison-preview .liaison-example-draft .button{margin-top:12px}
+.ws-ordinary-card{grid-column:1/-1}
+.ws-ordinary-card button{min-height:44px}
+.ws-ordinary-dialogue .ws-message{font-size:13px}
+#ws-ordinary-title{scroll-margin-top:22px}
+#ws-ordinary-title:focus-visible{outline:2px solid var(--blue);outline-offset:3px;border-radius:3px}
+.ws-forwarded{margin:8px 0 0;padding:3px 0 3px 11px;border-left:2px solid var(--line);color:var(--muted);line-height:1.8}
+@media(max-width:740px){
+ .liaison-demo-intro h3{font-size:16px}
+ .workspace-preview-bar{min-height:53px}
+ #liaison-demo-open{min-height:44px}
+ #liaison-preview{width:calc(100% - 24px);padding:17px}
+ #liaison-preview .ws-message{font-size:13px}
 }

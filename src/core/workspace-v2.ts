@@ -178,7 +178,15 @@ export interface V2Session {
 }
 
 export interface V2AttachmentRef { id: string; label: string; version?: string }
-export interface V2OrderOriginal { text: string; complete: boolean }
+export interface V2OrderOriginal {
+  text: string
+  complete: boolean
+  liaisonSource?: {
+    requestId: string
+    messageId: string
+    authorization: { requestId: string; messageId: string; text: string }
+  }
+}
 export interface WorkOrderOutput {
   sessionId: string
   messageId: string

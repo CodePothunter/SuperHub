@@ -26,11 +26,40 @@
    experiences:[{status:'已停用',action:'自动过期',version:2,text:'试行期间，周报使用一页模板。',situation:'试行周报',boundary:'有效期至 2026-11-22 当天结束。',reason:'已达到条目约定的有效期，后续周报不再收到这个版本。',sources:['周报试行约定 · 「一页模板用到 11 月 22 日。」'],previous:'版本 1 · 已采纳，适用于模板试行期间。'}],
    orders:[{session:'本周观察',title:'研究周报初稿',state:'执行中',owner:'研究员',avatar:'compass',promise:'整理发现、来源与下一步验证问题。',boundary:'保留来源，明确事实与推断的差别。',material:'本周阅读笔记.md',output:'研究周报草稿.md',request:'把本周笔记整理成周报，结论要有出处，缺少依据的地方单列。',reply:'草稿已按发现、依据与待验证问题组织。接下来继续核对引用和结论之间的关系。',doc:'本周周报样例按发现、来源和待验证问题组织。它保留阅读材料的引用入口，把尚缺依据的判断列为下一步问题。'}]}
  };
- let selected='product',panel='overview',orderIndex=0;
- const picker=$('#workspace-picker'),documentDialog=$('#workspace-document');
+ const liaisonExample={
+  workspace:'product',
+  title:'发布前的两个问题',
+  request:'在产品研发工作区开个对话，不用开工单。问一下发布前看哪几个指标，异常时怎么回退？',
+  followup:'就启动吧，带工单也行。',
+  answer:'先记录错误率、请求延迟和关键流程的成功率，发布后按同一口径比较。指标越过约定阈值时先停下扩大范围，再切回上一版本并验证三项指标是否恢复。',
+ };
+ let selected='product',panel='overview',orderIndex=0,showOrdinaryDialogue=false,liaisonTurns=0;
+ const picker=$('#workspace-picker'),documentDialog=$('#workspace-document'),liaisonDialog=$('#liaison-preview');
+ const liaisonOpen=$('#liaison-demo-open'),liaisonSend=$('#liaison-demo-send'),liaisonLog=$('#liaison-demo-messages');
  function file(label,kind){return `<button class="ws-file" data-ws-document="${kind}">${icon('report')}<span>${label}<small>${kind==='material'?'本单材料':'本单成果'}</small></span><b>↗</b></button>`;}
- function overview(p){return `<div class="ws-directory"><div><span>项目目录</span><code>${p.directory}</code></div><small>已绑定 · 示例路径</small></div><div class="ws-section-head"><h4>会话与工单</h4><span>新建会话　　新建工单</span></div><div class="ws-order-groups">${p.orders.map((o,i)=>`<section class="ws-order-group"><button class="ws-session" data-ws-order="${i}"><b>${o.session}</b><span>群聊 · 1 张工单　›</span></button><button class="ws-order" data-ws-order="${i}"><span><b>${o.title}</b><small>${o.owner} · ${o.promise}</small></span><em class="${o.state==='已完成'?'finished':''}">${o.state}</em></button></section>`).join('')}</div>`;}
- function execution(p){const o=p.orders[orderIndex];return `<div class="ws-execution"><div class="ws-conversation"><div class="ws-conversation-head"><h4>${o.session}</h4><span>${p.name} · 原会话</span></div><div class="ws-messages"><div class="ws-message own">${icon('plane')}<div><small>你</small><p>${o.request}</p></div></div><div class="ws-message">${icon(o.avatar)}<div><small>${o.owner}</small><p>${o.reply}</p>${o.output?file(o.output,'output'):''}</div></div></div><div class="ws-composer">沿着这件事继续说…<span>↑</span></div></div><aside class="ws-order-info"><h4>工单信息</h4><dl><div><dt>工单</dt><dd>${o.title}</dd></div><div><dt>承诺结果</dt><dd>${o.promise}</dd></div><div><dt>执行范围</dt><dd>${o.boundary}</dd></div><div><dt>状态</dt><dd>${o.state}</dd></div></dl>${file(o.material,'material')}</aside></div>`;}
+ function message(author,avatar,words,extra=''){
+  return `<div class="ws-message${author==='你'?' own':''}">${icon(avatar)}<div><small>${author}</small><p>${words}</p>${extra}</div></div>`;
+ }
+ function overview(p){
+  const dialogue=liaisonTurns && selected===liaisonExample.workspace
+   ? `<section class="ws-order-group ws-ordinary-card"><button class="ws-session" type="button" data-ws-ordinary><b>${liaisonExample.title}</b><span>群聊 · 0 张工单　›</span></button></section>` : '';
+  const orderGroups=p.orders.map((o,i)=>`<section class="ws-order-group"><button class="ws-session" data-ws-order="${i}"><b>${o.session}</b><span>群聊 · 1 张工单　›</span></button><button class="ws-order" data-ws-order="${i}"><span><b>${o.title}</b><small>${o.owner} · ${o.promise}</small></span><em class="${o.state==='已完成'?'finished':''}">${o.state}</em></button></section>`).join('');
+  return `<div class="ws-directory"><div><span>项目目录</span><code>${p.directory}</code></div><small>已绑定 · 示例路径</small></div><div class="ws-section-head"><h4>会话与工单</h4><span>新建会话　　新建工单</span></div><div class="ws-order-groups">${dialogue}${orderGroups}</div>`;
+ }
+ function ordinaryDialogue(project){
+  return `<section class="ws-conversation ws-ordinary-dialogue" aria-labelledby="ws-ordinary-title">
+   <div class="ws-conversation-head"><h4 id="ws-ordinary-title" tabindex="-1">${liaisonExample.title}</h4><span>${project.name} · 关联工单 0 张</span></div>
+   <div class="ws-messages">
+    ${message('接口人','sprout','请验收顾问回答发布前的两个问题。',`<blockquote class="ws-forwarded"><small>你的原话</small><br>${liaisonExample.request}</blockquote>`)}
+    ${message('验收顾问','pencil',liaisonExample.answer)}
+   </div>
+  </section>`;
+ }
+ function execution(p){
+  if(showOrdinaryDialogue) return ordinaryDialogue(p);
+  const o=p.orders[orderIndex];
+  return `<div class="ws-execution"><div class="ws-conversation"><div class="ws-conversation-head"><h4>${o.session}</h4><span>${p.name} · 原会话</span></div><div class="ws-messages">${message('你','plane',o.request)}${message(o.owner,o.avatar,o.reply,o.output?file(o.output,'output'):'')}</div><div class="ws-composer">沿着这件事继续说…<span>↑</span></div></div><aside class="ws-order-info"><h4>工单信息</h4><dl><div><dt>工单</dt><dd>${o.title}</dd></div><div><dt>承诺结果</dt><dd>${o.promise}</dd></div><div><dt>执行范围</dt><dd>${o.boundary}</dd></div><div><dt>状态</dt><dd>${o.state}</dd></div></dl>${file(o.material,'material')}</aside></div>`;
+ }
  function outputs(p){
   const items=p.orders.map((order,index)=>order.output ? `
    <button class="ws-output" data-ws-document="output" data-ws-source="${index}">
@@ -105,8 +134,48 @@
  $('.workspace-preview-tabs').addEventListener('keydown',event=>{const index=tabs.indexOf(event.target);if(index<0||!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;event.preventDefault();const next=event.key==='Home'?0:event.key==='End'?tabs.length-1:(index+(event.key==='ArrowRight'?1:-1)+tabs.length)%tabs.length;panel=tabs[next].dataset.workspacePanel;render();tabs[next].focus();});
  $('#workspace-switch').addEventListener('click',()=>picker.showModal());
  $('#workspace-picker-close').addEventListener('click',()=>picker.close());
- document.querySelectorAll('[data-workspace-choice]').forEach(button=>button.addEventListener('click',()=>{selected=button.dataset.workspaceChoice;panel='overview';orderIndex=0;render();picker.close();}));
+ document.querySelectorAll('[data-workspace-choice]').forEach(button=>button.addEventListener('click',()=>{selected=button.dataset.workspaceChoice;panel='overview';orderIndex=0;showOrdinaryDialogue=false;render();picker.close();}));
+ function openLiaisonDialogue(){
+  selected=liaisonExample.workspace;
+  panel='execution';
+  showOrdinaryDialogue=true;
+  render();
+  if(liaisonDialog.open) liaisonDialog.close();
+  $('#ws-ordinary-title').focus();
+ }
+ $('#liaison-example-prompt').textContent=liaisonExample.request;
+ liaisonOpen.disabled=false;
+ liaisonOpen.addEventListener('click',()=>{
+  liaisonDialog.showModal();
+  const next=liaisonTurns===2 ? liaisonLog.lastElementChild.querySelector('[data-liaison-dialogue]') : liaisonSend;
+  next.focus();
+ });
+ $('#liaison-demo-close').addEventListener('click',()=>liaisonDialog.close());
+ liaisonSend.addEventListener('click',()=>{
+  if(liaisonTurns===2) return;
+  const first=liaisonTurns===0;
+  liaisonTurns+=1;
+  const project=projects[liaisonExample.workspace];
+  const reply=first ? `已在「${project.name}」开聊，原问题已送达。` : '刚才的问题已送达，点回执可以打开同一场对话。';
+  const count=first ? '<small class="liaison-count">新增 1 场对话 · 0 张工单</small>' : '';
+  const receipt=`<button type="button" class="stage-button liaison-receipt" data-liaison-dialogue>打开对话「${liaisonExample.title}」</button>`;
+  liaisonLog.insertAdjacentHTML('beforeend',
+   message('你','plane',first?liaisonExample.request:liaisonExample.followup)+message('接口人','sprout',reply,count+receipt));
+  if(first){
+   $('#liaison-example-prompt').textContent=liaisonExample.followup;
+   liaisonSend.textContent='发送补充';
+   render();
+  }else $('#liaison-example-draft').hidden=true;
+  liaisonLog.lastElementChild.querySelector('[data-liaison-dialogue]').focus();
+ });
+ liaisonLog.addEventListener('click',event=>{
+  if(event.target.closest('[data-liaison-dialogue]')) openLiaisonDialogue();
+ });
  $('#workspace-panel').addEventListener('click',event=>{
+  if(event.target.closest('[data-ws-ordinary]')){
+   openLiaisonDialogue();
+   return;
+  }
   const attachment=event.target.closest('[data-ws-document]');
   if(attachment){
    const source=attachment.dataset.wsSource;
@@ -121,6 +190,7 @@
   if(!order)return;
   orderIndex=Number(order.dataset.wsOrder);
   panel='execution';
+  showOrdinaryDialogue=false;
   render();
   $('#workspace-tab-execution').focus();
  });

@@ -33,6 +33,57 @@ it('projects a workspace link only from a matched successful native workspace re
   }
 })
 
+it('keeps distinct workspace conversations and their exact message versions in native receipts', () => {
+  const space = { id: randomUUID(), name: '研发' }
+  const first = { ...space, sessionId: randomUUID(), sessionTitle: '选型讨论' }
+  const posted = { ...first, sourceMessageId: 'g-8', sessionTraceId: 'initial' }
+  const continued = { ...first, sourceMessageId: 'g-12', sessionTraceId: 'trace-' + randomUUID() }
+  const second = { ...space, sessionId: randomUUID(), sessionTitle: '验收讨论' }
+  const bad = { ...first, sessionId: '../not-an-id', sessionTitle: '无效链接' }
+  const order = { ...space, delegationId: randomUUID(), delegationTitle: '交付检查' }
+  const receipts = [space, first, posted, posted, continued, second, bad, order]
+  const turn = [event(1, 'turn/start', {}), ...receipts.flatMap((receipt, index) => {
+    const callId = 'workspace-' + index
+    return [
+      event(index * 2 + 2, 'tool/call', { name: 'chief_workspace', callId }),
+      event(index * 2 + 3, 'tool/result', { message: { toolCallId: callId }, meta: { 'dsh-chief/workspace': receipt } }),
+    ]
+  })]
+  const expected = [space, posted, continued, second, order]
+  expect(chatFromEvents(turn).live?.workspaces).toEqual(expected)
+  expect(chatFromEvents([...turn, event(turn.length + 1, 'turn/end', {})]).messages.at(-1)?.workspaces).toEqual(expected)
+})
+
+it('resolves saved and live conversation receipts against the original scoped target on every read', async () => {
+  const receipt = { id: randomUUID(), name: '研发', sessionId: randomUUID(), sessionTitle: '原始会话名',
+    sourceMessageId: 'g-12', sessionTraceId: 'initial' }
+  const deletedAt = '2026-11-27T01:00:00.000Z'
+  const archived: ChatMessage[] = [{ seq: 1, role: 'liaison', text: '', time: 1, workspaces: [receipt] }]
+  const live = [
+    event(1, 'turn/start', {}),
+    event(2, 'tool/call', { name: 'chief_workspace', callId: 'ask' }),
+    event(3, 'tool/result', { message: { toolCallId: 'ask' }, meta: { 'dsh-chief/workspace': receipt } }),
+  ]
+  const parts: LiaisonParts = { current: () => 'hq-2', base: () => 'hq', offset: () => 100, archived: () => archived, ready: async () => {} }
+  const label = vi.fn<(workspaceId: string, sessionId: string) => { title: string; deletedAt?: string } | undefined>()
+  label.mockReturnValue({ title: '最新会话名' })
+  const chat = new LiaisonChat({} as SessionController, parts, async () => ({ id: 'hq-2', status: 'running', session: { snapshotEvents: () => live } } as Agent),
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, label)
+  const latest = await chat.view()
+  const renamed = { ...receipt, sessionTitle: '最新会话名' }
+  expect(latest.messages[0]?.workspaces).toEqual([renamed])
+  expect(latest.live?.workspaces).toEqual([renamed])
+  expect(label.mock.calls).toEqual([[receipt.id, receipt.sessionId], [receipt.id, receipt.sessionId]])
+  live.push(event(4, 'turn/end', {}))
+  label.mockReturnValue({ title: '最新会话名', deletedAt })
+  expect((await chat.view()).messages.flatMap(row => row.workspaces ?? [])).toEqual([
+    { ...renamed, sessionDeletedAt: deletedAt }, { ...renamed, sessionDeletedAt: deletedAt },
+  ])
+  label.mockReturnValue(undefined)
+  expect((await chat.view()).messages[0]?.workspaces).toEqual([{ ...receipt, sessionUnavailable: true }])
+  expect(archived[0]?.workspaces).toEqual([receipt])
+})
+
 it('opens a profile import only from a real native import receipt, including a reply with no prose', () => {
   const receipt = { importId: 'profile-' + 'a'.repeat(64) }
   const call = event(2, 'tool/call', {name:'chief_import',callId:'paste'})

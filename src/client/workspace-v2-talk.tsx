@@ -358,7 +358,8 @@ export function Transcript({ base, session, view, origin, sourceMessage, trace, 
                 {m.relayed && <small className="v2-relay-note">经接口人转交的原话</small>}
                 <Markdown text={m.text} className="v2-markdown" decorate={group ? mentionDecorator(m.mentions, group.members, result?.portraits) : undefined}/>
                 <MessageInputAttachments scope={scope} target={{...inputTarget, workOrderId:orderId}} attachments={m.inputAttachments}/>
-                {m.quote && <details className="v2-relay-quote"><summary>{m.quote.label}</summary><div className="v2-relay-text">{m.quote.text}</div></details>}
+                {m.quote && <details className="v2-relay-quote" open={m.id === anchoredId || undefined}>
+                  <summary>{m.quote.label}</summary><div className="v2-relay-text">{m.quote.text}</div></details>}
                 {m.attachments?.map(ref => <button key={ref.id} className="v2-link v2-attachment" onClick={() => setAttachment({message:m.id,traceId:m.traceId ?? result?.traceId,ref})}><V2Icon name="box"/>{ref.label}</button>)}
               </div>}
               {m.delivery && <small className="v2-delivery-note" data-delivery={m.delivery}>{deliveryNote[m.delivery]}</small>}

@@ -24,7 +24,7 @@ import { CodingGate, llmReviewer } from './coding-gate.ts'
 import { BrainRepo } from './brain.ts'
 import { createProfileImportService, llmProfileOrganizer } from './assistant-import.ts'
 import { inboxDispatchState, LIAISON_HISTORY_MAX, LIAISON_PROMPT, LiaisonChat, offsetSpeech, type ChatMessage, type LiaisonParts } from './chat.ts'
-import { LiaisonTraces, liaisonEditError } from './liaison-traces.ts'
+import { LiaisonTraces, liaisonEditError, workspaceCarryEvents } from './liaison-traces.ts'
 import { chatAttachmentError, ChatAttachments } from './chat-attachments.ts'
 import { registerCodexApprovals, type CodexApprovalConfig } from './codex-approvals.ts'
 import { contextTokens, handoffText, hasRawConnectorHistory, liaisonGuard, LiaisonToolVisibility, mergeHistory, nextPartId, rotateLine, SteerCutter, type LiaisonToolStatus } from './liaison.ts'
@@ -66,7 +66,7 @@ import { ScheduleRunner, scheduleProducer, scheduleRoutes, ScheduleStore } from 
 import { LIAISON_SEEN_FILE, LiaisonSeen } from './liaison-seen.ts'
 import { enqueueResultNotice, noticeDelivery, resultDelivery } from './result-notices.ts'
 import { situationText } from './poc-view.ts'
-import type { Agent, HostContext } from './ports.ts'
+import type { Agent, HostContext, SessionEventLike } from './ports.ts'
 import { FileRemoteQueue } from './remote.ts'
 import { Roster } from './roster.ts'
 import { CustomStore } from './custom-store.ts'
@@ -256,6 +256,14 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
     const isLiaison = (id: string) => id === hqSession() || traces.nativeIds().has(id) || earlier().includes(id)
     const historyFile = () => join(liaisonDir, `${baseId()}.history.json`)
     const handoffFile = (id: string) => join(liaisonDir, `${id}.handoff.md`)
+    const workspaceHandoff = (id: string) => join(liaisonDir, `${id}.workspace-context.json`)
+    const workspaceHistory = (id: string): SessionEventLike[] => {
+      if (id !== hqSession()) return []
+      try {
+        const saved = JSON.parse(readFileSync(workspaceHandoff(id), 'utf8')) as {traceId?: string; events?: SessionEventLike[]}
+        return saved.traceId === traces.activeTraceId && Array.isArray(saved.events) ? saved.events : []
+      } catch { return [] }
+    }
     let archive: ChatMessage[] | undefined
     const archived = (): ChatMessage[] => {
       if (traces.binding) return traces.binding.archived
@@ -449,7 +457,7 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
             throw liaisonEditError(409, '第二大脑已切换，请刷新接口人对话')
           }
         },
-      })
+      }, (workspaceId, sessionId) => workspaceStore.reference(workspaceId, 'session', sessionId))
 
     /**
      * 换段：一轮结束、接口人闲着、上下文超过线时，开一段新会话。
@@ -473,6 +481,10 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
         const { messages } = chat.project(agent.session?.snapshotEvents() ?? [])
         mkdirSync(liaisonDir, { recursive: true, mode: 0o700 })
         writeFileSync(handoffFile(next), handoffText(previous, omitHistory ? [] : messages, clock().now.replace('T', ' ')))
+        const carry = omitHistory || legacyConnectors ? [] : workspaceCarryEvents([
+          ...workspaceHistory(previous), ...agent.session?.snapshotEvents() ?? [],
+        ])
+        writeFileSync(workspaceHandoff(next), JSON.stringify({traceId:traces.activeTraceId,events:carry}), {mode:0o600})
         const merged = mergeHistory(archived(), messages.map(m => offsetSpeech(m, parts.offset())), LIAISON_HISTORY_MAX)
         const materials = new Map(merged.flatMap(message => (message.inputAttachments ?? []).map(file => [file.id, file] as const)))
         for (const [id, file] of omitHistory ? [] : materials) {
@@ -977,6 +989,7 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
         context: id => staffStore.context(workspaceId, id), liaisonName: LIAISON_AUTHOR }) })
     releases.push(() => groupHost.dispose())
     const v2Routes = workspaceV2Routes({ staff:staffStore, store: workspaceStore, canonicalModel: (wanted, saved) => canonicalSelection(ctx.get('llm'), wanted, saved), source: dialogue, timeZone, approvals: gate, groups: groupHost, inputAttachments, learning, learningProblem,
+      liaisonTrace: () => traces.activeTraceId,
       coordinate: llmEngagementCoordinator(() => ctx.get('llm'), liaisonModel),
       // The liaison reviews new results with its own model, and reminds the owner when an order still falls short.
       review: llmAcceptanceReviewer(() => ctx.get('llm'), liaisonModel),
@@ -986,6 +999,9 @@ export async function createRuntime(ctx: HostContext, opts: RuntimeOptions): Pro
     releases.push(() => v2Routes.dispose())
     v2Routes.recover()
     releases.push(...registerTools(ctx, { ...deps, calendarWeek: day => calendarRoutes.week(day), personDetail:historyRoutes.personDetail, isLiaison, lookup, readOnlyExecution: (id: string) => executors.readOnly(id), executionBinding: (id: string) => executors.binding(id), schedules: { store: schedules, timeZone }, ui, control: opts.control, importer, exporter, superhub, modelDefaults, workspaceStore, staffStore, learning, assign: v2Routes.assign, follow: v2Routes.follow, orderFollowup: v2Routes.followup, groups: groupHost, inputAttachments,
+      activeLiaison: id => liaisonActive && id === hqSession(),
+      workspaceHistory,
+      workspaceDialogue: v2Routes.liaisonDialogue, workspaceDialogueStatus: v2Routes.liaisonDialogueStatus, workspaceDialogueCancel: v2Routes.liaisonDialogueCancel,
       liaisonSource: chat.source.bind(chat),
       groupTurn: agentId => {
         if (!dshMembers.isMemberSession(agentId)) return undefined
